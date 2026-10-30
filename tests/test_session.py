@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 import pytest
@@ -7,6 +8,7 @@ from qa_core_recon.spark import (
     ICEBERG_SPARK_PACKAGE,
     MAVEN_CENTRAL,
     IcebergRuntimeError,
+    SessionStartError,
     catalog_name_for,
     ivy_cache_dir,
     local_session,
@@ -50,22 +52,131 @@ def test_running_session_without_iceberg_cannot_gain_it(spark, monkeypatch):
 
 def test_missing_iceberg_runtime_is_a_clear_read_error(tmp_path):
     cache = tmp_path / "empty-ivy"
-    original = RuntimeError("JAVA_GATEWAY_EXITED")
-    failure = session_start_failure(original, iceberg=True, ivy=cache)
+    assert runtime_jar_cached(cache) is False
+    other = tmp_path / "wrong-jar"
+    other.mkdir()
+    (other / "some-other-library.jar").write_bytes(b"jar")
+    assert runtime_jar_cached(other) is False
+
+    resolution = RuntimeError(
+        "unresolved dependency: org.apache.iceberg#iceberg-spark-runtime-3.5_2.12;1.7.1: not found"
+    )
+    failure = session_start_failure(resolution, iceberg=True, ivy=cache)
     assert isinstance(failure, IcebergRuntimeError)
     assert str(failure) == missing_runtime_message(cache)
     assert ICEBERG_SPARK_PACKAGE in str(failure)
     assert "Maven Central" in str(failure)
     assert str(cache) in str(failure)
-    assert "JAVA_GATEWAY_EXITED" not in str(failure)
-    assert runtime_jar_cached(cache) is False
+    assert "unresolved dependency" not in str(failure)
+
+    ivy_failure = session_start_failure(
+        RuntimeError("Ivy resolution failed for the package"),
+        iceberg=True,
+        ivy=other,
+    )
+    assert isinstance(ivy_failure, IcebergRuntimeError)
+    assert str(ivy_failure) == missing_runtime_message(other)
 
     present = tmp_path / "warm-ivy"
     present.mkdir()
     (present / "org.apache.iceberg_iceberg-spark-runtime-3.5_2.12-1.7.1.jar").write_bytes(b"jar")
     assert runtime_jar_cached(present) is True
-    assert session_start_failure(original, iceberg=True, ivy=present) is original
-    assert session_start_failure(original, iceberg=False, ivy=cache) is original
+    cached = session_start_failure(resolution, iceberg=True, ivy=present)
+    assert isinstance(cached, SessionStartError)
+    assert not isinstance(cached, IcebergRuntimeError)
+    assert str(cached).startswith("cannot start the local Spark session")
+    assert session_start_failure(resolution, iceberg=False, ivy=cache) is resolution
+
+
+def test_other_session_start_failures_stay_generic(tmp_path):
+    cache = tmp_path / "empty-ivy"
+    original = RuntimeError("JAVA_GATEWAY_EXITED")
+    failure = session_start_failure(original, iceberg=True, ivy=cache)
+    assert isinstance(failure, SessionStartError)
+    assert not isinstance(failure, IcebergRuntimeError)
+    assert str(failure) == "cannot start the local Spark session: JAVA_GATEWAY_EXITED"
+    assert ICEBERG_SPARK_PACKAGE not in str(failure)
+
+
+def _call_local_session_with_failed_start(monkeypatch, cache: Path, message: str):
+    import qa_core_recon.spark as spark_mod
+
+    monkeypatch.setattr(spark_mod, "ivy_cache_dir", lambda: cache)
+    monkeypatch.setattr(spark_mod, "_session", None)
+    monkeypatch.setattr(spark_mod, "_warehouse", None)
+    monkeypatch.setattr(spark_mod, "_iceberg_ready", False)
+
+    def fail(_builder):
+        raise RuntimeError(message)
+
+    monkeypatch.setattr(spark_mod, "_start_quietly", fail)
+    return local_session(iceberg=True)
+
+
+def test_local_session_maps_an_unresolved_runtime(spark, monkeypatch, tmp_path):
+    cache = tmp_path / "empty-ivy"
+    with pytest.raises(IcebergRuntimeError) as caught:
+        _call_local_session_with_failed_start(
+            monkeypatch,
+            cache,
+            "unresolved dependency: org.apache.iceberg#iceberg-spark-runtime: not found",
+        )
+    assert str(caught.value) == missing_runtime_message(cache)
+
+
+def test_local_session_keeps_a_generic_start_error(spark, monkeypatch, tmp_path):
+    cache = tmp_path / "empty-ivy"
+    with pytest.raises(SessionStartError) as caught:
+        _call_local_session_with_failed_start(monkeypatch, cache, "JAVA_GATEWAY_EXITED")
+    assert not isinstance(caught.value, IcebergRuntimeError)
+    assert str(caught.value) == "cannot start the local Spark session: JAVA_GATEWAY_EXITED"
+
+
+def _failed_get_or_create(stderr: bytes):
+    def fail(_self):
+        os.write(2, stderr)
+        raise RuntimeError("[JAVA_GATEWAY_EXITED] Java gateway process exited")
+
+    return fail
+
+
+def _local_session_with_fake_start(monkeypatch, cache: Path, stderr: bytes):
+    from pyspark.sql import SparkSession
+
+    import qa_core_recon.spark as spark_mod
+
+    monkeypatch.setattr(spark_mod, "ivy_cache_dir", lambda: cache)
+    monkeypatch.setattr(spark_mod, "_session", None)
+    monkeypatch.setattr(spark_mod, "_warehouse", None)
+    monkeypatch.setattr(spark_mod, "_iceberg_ready", False)
+    monkeypatch.setattr(SparkSession.Builder, "getOrCreate", _failed_get_or_create(stderr))
+    return local_session(iceberg=True)
+
+
+def test_startup_log_marks_an_unresolved_runtime(spark, monkeypatch, tmp_path):
+    cache = tmp_path / "empty-ivy"
+    log = (
+        b":: UNRESOLVED DEPENDENCIES ::\n"
+        b"unresolved dependency: org.apache.iceberg#"
+        b"iceberg-spark-runtime-3.5_2.12;1.7.1: not found\n"
+    )
+    with pytest.raises(IcebergRuntimeError) as caught:
+        _local_session_with_fake_start(monkeypatch, cache, log)
+    assert str(caught.value) == missing_runtime_message(cache)
+    assert "UNRESOLVED" not in str(caught.value)
+    assert "JAVA_GATEWAY" not in str(caught.value)
+
+
+def test_startup_log_keeps_a_broken_java_home_generic(spark, monkeypatch, tmp_path):
+    cache = tmp_path / "empty-ivy"
+    log = b"Error: JAVA_HOME is set to an invalid directory\n"
+    with pytest.raises(SessionStartError) as caught:
+        _local_session_with_fake_start(monkeypatch, cache, log)
+    assert not isinstance(caught.value, IcebergRuntimeError)
+    assert str(caught.value) == (
+        "cannot start the local Spark session: [JAVA_GATEWAY_EXITED] Java gateway process exited"
+    )
+    assert "JAVA_HOME" not in str(caught.value)
 
 
 def test_session_leaves_no_hive_files_in_the_repo(spark):

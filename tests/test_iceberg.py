@@ -296,7 +296,12 @@ def test_three_part_iceberg_names_are_rejected(table):
         ("payments.snapshot_id_42", "snapshot_id_42"),
         ("payments.at_timestamp_1700000000000", "at_timestamp_1700000000000"),
         ("payments.branch_main", "branch_main"),
+        ("payments.branch_", "branch_"),
         ("payments.tag_x", "tag_x"),
+        ("payments.tag_", "tag_"),
+        ("payments.BRANCH_main", "BRANCH_main"),
+        ("payments.changes", "changes"),
+        ("payments.CHANGES", "CHANGES"),
     ],
 )
 def test_reserved_iceberg_names_are_rejected(table, part):
@@ -307,6 +312,7 @@ def test_reserved_iceberg_names_are_rejected(table, part):
 
 def test_reserved_iceberg_part_list_is_the_metadata_tables():
     assert _RESERVED_TABLE_PARTS == {
+        "changes",
         "entries",
         "files",
         "data_files",

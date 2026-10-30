@@ -55,7 +55,11 @@ _iceberg_ready: bool = False
 _RUNTIME_JAR_SUFFIX = f"iceberg-spark-runtime-3.5_2.12-{ICEBERG_VERSION}.jar"
 
 
-class IcebergRuntimeError(Exception):
+class SessionStartError(Exception):
+    """The local Spark session did not start. This is a read error."""
+
+
+class IcebergRuntimeError(SessionStartError):
     """The Iceberg Spark runtime jar is not available. This is a read error."""
 
 
@@ -115,15 +119,41 @@ def runtime_jar_cached(cache: Path) -> bool:
     )
 
 
-def session_start_failure(exc: BaseException, *, iceberg: bool, ivy: Path | None) -> BaseException:
-    """Map a failed session start to a read error when the runtime is missing.
+def _dependency_resolution_failure(exc: BaseException) -> bool:
+    """True when Spark's output says Ivy could not resolve a package.
 
-    A gateway exit while the jar is absent is the offline cache miss. A start
-    failure after the jar is cached is left unchanged.
+    Ivy writes ``:: UNRESOLVED DEPENDENCIES ::`` to the process stderr, not
+    into the exception text. ``_start_quietly`` keeps that text on
+    ``startup_log`` so it can be classified without being shown to the user.
     """
-    if iceberg and ivy is not None and not runtime_jar_cached(ivy):
+    parts = [str(exc)]
+    log = getattr(exc, "startup_log", None)
+    if isinstance(log, str) and log:
+        parts.append(log)
+    text = "\n".join(parts).lower()
+    return "unresolved dependency" in text or "ivy" in text
+
+
+def _generic_start_error(exc: BaseException) -> SessionStartError:
+    detail = " ".join(str(exc).split()) or exc.__class__.__name__
+    if detail.startswith("cannot start the local Spark session"):
+        return SessionStartError(detail)
+    return SessionStartError(f"cannot start the local Spark session: {detail}")
+
+
+def session_start_failure(exc: BaseException, *, iceberg: bool, ivy: Path | None) -> BaseException:
+    """Map a failed session start to a read error.
+
+    The Iceberg runtime is named only when the output points at dependency
+    resolution and the pinned jar is not in the Ivy cache. Any other start
+    failure keeps the generic session message. A session that was not asked
+    to load Iceberg is left unchanged.
+    """
+    if not iceberg:
+        return exc
+    if ivy is not None and not runtime_jar_cached(ivy) and _dependency_resolution_failure(exc):
         return IcebergRuntimeError(missing_runtime_message(ivy))
-    return exc
+    return _generic_start_error(exc)
 
 
 def local_session(warehouse: Path | None = None, *, iceberg: bool = False) -> SparkSession:
@@ -190,7 +220,7 @@ def local_session(warehouse: Path | None = None, *, iceberg: bool = False) -> Sp
     except Exception as exc:
         shutil.rmtree(root, ignore_errors=True)
         failure = session_start_failure(exc, iceberg=iceberg, ivy=ivy)
-        if isinstance(failure, IcebergRuntimeError):
+        if isinstance(failure, SessionStartError):
             raise failure from None
         raise
     _session = session
@@ -205,7 +235,8 @@ def _start_quietly(builder: SparkSession.Builder) -> SparkSession:
     The JVM writes its banner to file descriptor 2, and Ivy writes a settings
     line to file descriptor 1. Redirecting Python's ``sys`` streams does not
     catch either, so both descriptors are pointed at a temporary file for the
-    duration of startup and then restored.
+    duration of startup and then restored. On failure the captured text is
+    kept on the raised error for classification. It is not part of the message.
     """
     captured = tempfile.NamedTemporaryFile(prefix="qa-core-recon-spark-log-", delete=False)
     saved_out = os.dup(1)
@@ -218,8 +249,15 @@ def _start_quietly(builder: SparkSession.Builder) -> SparkSession:
         except Exception as exc:
             os.dup2(saved_out, 1)
             os.dup2(saved_err, 2)
+            captured.flush()
+            try:
+                startup_log = Path(captured.name).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                startup_log = ""
             detail = " ".join(str(exc).split()) or exc.__class__.__name__
-            raise RuntimeError(f"cannot start the local Spark session: {detail}") from None
+            error = RuntimeError(f"cannot start the local Spark session: {detail}")
+            error.startup_log = startup_log
+            raise error from None
     finally:
         os.dup2(saved_out, 1)
         os.dup2(saved_err, 2)

@@ -47,11 +47,13 @@ _SNAPSHOT_ID_MAX = (1 << 63) - 1
 # One directory name under the warehouse. A dot or a slash would add or climb
 # a directory. A leading digit is rejected so Spark can use the name unquoted.
 _IDENTIFIER_PART = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
-# Iceberg treats these as metadata tables, or as a snapshot, branch, or tag
-# selector, when they appear after the table name. Two-part names stop that
-# path; rejecting the names themselves covers a table part such as "snapshots".
+# Iceberg treats these as metadata tables or the changelog view (`changes`),
+# and the selector pattern below as a snapshot, branch, or tag, when they
+# appear as a name part. Two-part identifiers stop a third part. Rejecting
+# the names themselves covers a table or namespace such as "snapshots".
 _RESERVED_TABLE_PARTS = frozenset(
     {
+        "changes",
         "entries",
         "files",
         "data_files",
@@ -71,7 +73,7 @@ _RESERVED_TABLE_PARTS = frozenset(
     }
 )
 _SELECTOR_PART = re.compile(
-    r"(?:snapshot_id_\d+|at_timestamp_\d+|branch_.+|tag_.+)\Z",
+    r"(?:snapshot_id_\d+|at_timestamp_\d+|branch_.*|tag_.*)\Z",
     re.IGNORECASE,
 )
 
