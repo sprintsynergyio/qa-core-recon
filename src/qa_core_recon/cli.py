@@ -92,7 +92,7 @@ def _validate(args: argparse.Namespace) -> ExitCode:
         return ExitCode.REFUSED
 
     from qa_core_recon.spark import (
-        IcebergRuntimeError,
+        SessionStartError,
         local_session,
         local_session_active,
         stop_local_session,
@@ -102,7 +102,7 @@ def _validate(args: argparse.Namespace) -> ExitCode:
     created = not local_session_active()
     try:
         spark = local_session(iceberg=needs_iceberg)
-    except IcebergRuntimeError as exc:
+    except SessionStartError as exc:
         _print_error(str(exc))
         return ExitCode.REFUSED
     try:
