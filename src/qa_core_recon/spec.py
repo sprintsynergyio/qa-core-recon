@@ -20,9 +20,12 @@ the filesystem, so they do not resolve symlinks and they do not join paths to
 the current directory. An allowlist entry that normalises to an empty path,
 the filesystem root, or a path that still contains ".." is malformed. s3://
 URIs keep key segments as written. A "." segment, a ".." segment, an empty
-segment, a query, or a fragment is malformed rather than folded. One trailing
-slash is allowed on an s3:// path or allowlist entry and is not a segment.
-Bucket names must follow the S3 naming rules.
+segment, a query, or a fragment is malformed rather than folded. A key
+segment that contains a glob character (*, [, ], {, }, or \\) is malformed,
+because Spark would expand it. One trailing slash is allowed on an s3://
+path or allowlist entry and is not a segment. Bucket names must follow the
+S3 naming rules. A local path whose first segment contains ":" is malformed,
+so a value such as file:/etc/hosts cannot be read as a URI.
 
 ``format`` is ``csv``, ``parquet``, or ``iceberg``. An Iceberg dataset adds
 ``table`` and an optional ``snapshot_id``. Those keys are rejected on CSV and
@@ -84,6 +87,7 @@ _SELECTOR_PART = re.compile(
 # rejected in _require_bucket_name.
 _BUCKET_NAME = re.compile(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]\Z")
 _BUCKET_IP = re.compile(r"(?:\d{1,3}\.){3}\d{1,3}\Z")
+_BUCKET_FORBIDDEN_PREFIXES = ("xn--", "sthree-", "amzn-s3-demo-")
 _BUCKET_FORBIDDEN_SUFFIXES = (
     "-s3alias",
     "--ol-s3",
@@ -91,6 +95,8 @@ _BUCKET_FORBIDDEN_SUFFIXES = (
     "--x-s3",
     "--table-s3",
 )
+# Spark globs these characters when it opens a Parquet or CSV path.
+_S3_GLOB_CHARS = frozenset("*[]{}\\")
 
 _TOP_LEVEL = (
     "version",
@@ -475,7 +481,12 @@ def _require_location(path: str, label: str) -> _LocalPath | _S3Path:
         raise SpecError(f"{label} uses unsupported scheme {scheme!r}; use a local path or s3://")
     if path.startswith("s3:"):
         raise SpecError(f"{label} is not a valid s3:// URI")
-    return _parse_local(path)
+    location = _parse_local(path)
+    # file:/etc/hosts has no "://", so it is not caught as a scheme. Spark still
+    # treats a colon in the first segment as a URI and reads that absolute file.
+    if location.parts and ":" in location.parts[0]:
+        raise SpecError(f"{label} must not contain a colon in the first path segment")
+    return location
 
 
 def _parse_local(path: str) -> _LocalPath:
@@ -530,6 +541,9 @@ def _parse_s3(path: str, label: str) -> _S3Path:
             raise SpecError(f"{label} has an empty key segment")
         if piece in {".", ".."}:
             raise SpecError(f"{label} has a {piece!r} key segment")
+        for char in piece:
+            if char in _S3_GLOB_CHARS:
+                raise SpecError(f"{label} key segment {piece!r} contains glob character {char!r}")
         parts.append(piece)
     return _S3Path(bucket=bucket, parts=tuple(parts))
 
@@ -538,7 +552,7 @@ def _require_bucket_name(bucket: str, label: str) -> None:
     if (
         _BUCKET_NAME.fullmatch(bucket) is None
         or ".." in bucket
-        or bucket.startswith("xn--")
+        or any(bucket.startswith(prefix) for prefix in _BUCKET_FORBIDDEN_PREFIXES)
         or _BUCKET_IP.fullmatch(bucket) is not None
         or any(bucket.endswith(suffix) for suffix in _BUCKET_FORBIDDEN_SUFFIXES)
     ):

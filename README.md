@@ -158,15 +158,15 @@ After the table is open, Iceberg uses the same checks as Parquet. Decimal column
 
 ## S3
 
-An `s3://` path in the spec is read by Spark as `s3a://`. The spec keeps the `s3://` text. One trailing slash is allowed on a path and on an allowlist entry, because a Glue location often ends with `/`. That slash is not a path component. `s3://bucket/curated/` and `s3://bucket/curated` are the same location. A second slash is still an empty segment, and the spec is malformed. `.`, `..`, a query, and a fragment are still rejected.
+An `s3://` path in the spec is read by Spark as `s3a://`. The spec keeps the `s3://` text. One trailing slash is allowed on a path and on an allowlist entry, because a Glue location often ends with `/`. That slash is not a path component. `s3://bucket/curated/` and `s3://bucket/curated` are the same location. A second slash is still an empty segment, and the spec is malformed. `.`, `..`, a query, and a fragment are still rejected. A key segment must not contain a glob character (`*`, `[`, `]`, `{`, `}`, or `\`). Spark would expand it, so `s3://bucket/pq/*` could read every object under that prefix.
 
 The allowlist is checked before any read, on the path text, one whole component at a time. An `s3://` path matches only an `s3://` entry. A local entry does not cover a bucket, and a bucket entry does not cover a local path.
 
-Bucket names follow the S3 rules. A name is 3 to 63 characters. It uses lowercase letters, digits, dots, and hyphens, and it starts and ends with a letter or a digit. It cannot be an IP address, contain `..`, start with `xn--`, or use a reserved suffix such as `-s3alias`.
+Bucket names follow the S3 rules. A name is 3 to 63 characters. It uses lowercase letters, digits, dots, and hyphens, and it starts and ends with a letter or a digit. It cannot be an IP address, contain `..`, start with `xn--`, `sthree-`, or `amzn-s3-demo-`, or use a reserved suffix such as `-s3alias`.
 
 Credentials come from the standard AWS chain: environment variables, the shared credentials file, a container role, then an instance role. The spec file has no fields for a key or a secret. The tool does not copy credentials into the Spark configuration, and it does not print them. If Hadoop copies a key into its own configuration while a request is in flight, the tool removes that entry before it returns. If the chain finds no credentials, the read error says that none were found.
 
-Set `AWS_REGION` to the region of the bucket. If that variable is unset, `AWS_DEFAULT_REGION` is used. If neither is set and no endpoint override is set, the AWS SDK uses its own region chain, and that chain falls back to `us-east-1`. A bucket in another region needs `AWS_REGION`.
+Set `AWS_REGION` to the region of the bucket. If that variable is unset, `AWS_DEFAULT_REGION` is used. That value is copied to Hadoop as `fs.s3a.endpoint.region`. If neither variable is set, the property is left empty. Hadoop 3.3.4's DefaultS3ClientFactory then uses `us-east-1` and global bucket access. It does not ask the AWS SDK region chain. A bucket in another region needs `AWS_REGION`.
 
 For moto, or another S3-compatible store, set `QA_CORE_RECON_S3_ENDPOINT` to the store URL, for example `http://127.0.0.1:5000`. When that variable is set, requests use path-style access. An `http://` URL turns TLS off. An `https://` URL leaves TLS on. If the endpoint override is set and neither region variable is set, the client uses `us-east-1`.
 
@@ -217,7 +217,7 @@ Unknown keys are rejected. Column names are non-empty single-line strings. Forma
 
 `tolerance.value` is a monetary amount. It must be a quoted string, parsed with `decimal.Decimal`. A YAML float is an error and is never converted. A YAML integer is an error too, because only a quoted string keeps the exact digits. The value must be finite and zero or greater. Zero may have an empty reason. A value above zero needs a reason that contains something other than whitespace.
 
-Paths are local paths or `s3://bucket/key` URIs. Any other scheme is a malformed spec, which exits 2 with `qa-core-recon: error:`, and is not a `path-not-allowed` refusal.
+Paths are local paths or `s3://bucket/key` URIs. Any other scheme is a malformed spec, which exits 2 with `qa-core-recon: error:`, and is not a `path-not-allowed` refusal. A local path whose first segment contains a colon is malformed too. `file:/etc/hosts` has no `://`, but Spark would still open that absolute file.
 
 ## Allowlist Matching
 
@@ -236,6 +236,6 @@ Matching compares normalised whole path components. It reads the path text in th
 | `s3://demo-bucket/curated/payments/` | `s3://demo-bucket/curated/` | Allowed. One trailing slash is not a component. |
 | `/data/x.csv` | `./data` | Outside. An absolute path matches only an absolute entry. |
 
-An `s3://` path matches only an `s3://` entry, by bucket and then by key components. Key segments are literal. A segment that is `.` or `..`, an empty segment, a query (`?`), or a fragment (`#`) makes the spec malformed. One trailing slash is allowed and is not an empty segment. A second slash, as in `s3://bucket/key//`, is an empty segment and is rejected. Comparison is case sensitive. Bucket names must follow the S3 naming rules. See S3.
+An `s3://` path matches only an `s3://` entry, by bucket and then by key components. Key segments are literal. A segment that is `.` or `..`, an empty segment, a query (`?`), a fragment (`#`), or a glob character (`*`, `[`, `]`, `{`, `}`, or `\`) makes the spec malformed. One trailing slash is allowed and is not an empty segment. A second slash, as in `s3://bucket/key//`, is an empty segment and is rejected. Comparison is case sensitive. Bucket names must follow the S3 naming rules. See S3.
 
 An allowlist entry that normalises to an empty path (`.` or `./data/..`), the filesystem root (`/`), or a path that still contains `..` is a malformed spec. A source or target path may still use `..`; that path is normalised and then compared with the allowlist.

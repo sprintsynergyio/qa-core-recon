@@ -444,6 +444,8 @@ def test_s3_bucket_names_follow_s3_rules():
         "s3://my.mrap/key",
         "s3://my--x-s3/key",
         "s3://my--table-s3/key",
+        "s3://sthree-bucket/key",
+        "s3://amzn-s3-demo-bucket/key",
         "a" * 64,
     )
     for path in rejected:
@@ -462,6 +464,36 @@ def test_s3_bucket_names_follow_s3_rules():
         data["target"]["path"] = "s3://abc/file.csv"
 
     assert _ok(short_ok).target.path == "s3://abc/file.csv"
+
+
+def test_s3_glob_characters_are_rejected_on_paths_and_allowlist_entries():
+    cases = (
+        ("s3://demo-bucket/pq/*", "*"),
+        ("s3://demo-bucket/pq/a[1].csv", "["),
+        ("s3://demo-bucket/pq/a].csv", "]"),
+        ("s3://demo-bucket/pq/{a,b}.csv", "{"),
+        ("s3://demo-bucket/pq/a}.csv", "}"),
+        ("s3://demo-bucket/pq/a\\b.csv", "\\"),
+    )
+    for path, char in cases:
+        message = _error(lambda data, path=path: data["target"].__setitem__("path", path))
+        assert f"contains glob character {char!r}" in message
+
+    def allow(data):
+        data["allowlist"] = ["./data", "s3://demo-bucket/pq/*"]
+
+    message = _error(allow)
+    assert message.startswith("allowlist[1] key segment '*' contains glob character '*'")
+
+
+def test_local_path_with_a_colon_in_the_first_segment_is_rejected():
+    message = _error(lambda data: data["source"].__setitem__("path", "file:/etc/hosts"))
+    assert message == "source.path must not contain a colon in the first path segment"
+
+    def allow(data):
+        data["allowlist"] = ["./data", "file:"]
+
+    assert _error(allow) == "allowlist[1] must not contain a colon in the first path segment"
 
 
 def test_credentials_are_not_a_spec_field():

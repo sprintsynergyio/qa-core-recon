@@ -176,9 +176,13 @@ def s3_hadoop_settings() -> dict[str, str]:
     Credentials are not included. The default AWS chain reads them from the
     environment, a profile, or an instance role when a request is sent.
     ``QA_CORE_RECON_S3_ENDPOINT`` switches on path-style access. An ``http://``
-    endpoint also turns TLS off. With that override and no region variable,
-    the client uses ``us-east-1``. With no override and no region variable,
-    the region key is left unset so the AWS SDK region chain can run.
+    endpoint also turns TLS off, and retries are limited to one attempt after
+    200ms so a dead endpoint fails quickly. With that override and no region
+    variable, the client uses ``us-east-1``. With no override, ``AWS_REGION``
+    or ``AWS_DEFAULT_REGION`` is copied to ``fs.s3a.endpoint.region`` when
+    set. When neither is set the property is left empty. Hadoop 3.3.4's
+    DefaultS3ClientFactory then uses ``us-east-1`` and global bucket access.
+    It does not consult the AWS SDK region chain.
     """
     settings = {
         "fs.s3a.impl": "org.apache.hadoop.fs.s3a.S3AFileSystem",
@@ -197,6 +201,8 @@ def s3_hadoop_settings() -> dict[str, str]:
         settings["fs.s3a.connection.establish.timeout"] = "5000"
         settings["fs.s3a.connection.timeout"] = "10000"
         settings["fs.s3a.attempts.maximum"] = "2"
+        settings["fs.s3a.retry.limit"] = "1"
+        settings["fs.s3a.retry.interval"] = "200ms"
         settings["fs.s3a.multiobjectdelete.enable"] = "false"
     region = resolve_s3_region()
     if region is None and endpoint:

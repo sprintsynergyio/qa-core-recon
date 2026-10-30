@@ -45,6 +45,17 @@ def test_session_is_local_and_fixed(spark):
     assert local_session() is spark
 
 
+def test_running_session_without_s3_cannot_gain_it(spark, monkeypatch):
+    import qa_core_recon.spark as spark_mod
+
+    monkeypatch.setattr(spark_mod, "_s3_ready", False)
+    with pytest.raises(RuntimeError) as caught:
+        local_session(s3=True)
+    assert str(caught.value) == (
+        "the local Spark session is already running without the S3 runtime"
+    )
+
+
 def test_running_session_without_iceberg_cannot_gain_it(spark, monkeypatch):
     import qa_core_recon.spark as spark_mod
 

@@ -342,6 +342,16 @@ def _classify_s3_error(
         "s3afilesystem" in lowered or "com.amazonaws" in lowered or "hadoop.fs.s3a" in lowered
     ):
         return missing_s3_runtime_message(ivy_cache_dir())
+    # Hadoop wraps a missing chain as AccessDeniedException caused by
+    # NoAuthWithAWSException. The credential check has to win, or the wrapper
+    # is reported as access denied.
+    if (
+        "noauthwithawsexception" in lowered
+        or "noauthwithaws" in lowered
+        or "no aws credentials" in lowered
+        or "unable to load aws credentials" in lowered
+    ):
+        return f"no AWS credentials found for {side} path {path}"
     if (
         "accessdenied" in lowered
         or "access denied" in lowered
@@ -349,12 +359,6 @@ def _classify_s3_error(
         or "allaccessdisabled" in lowered
     ):
         return f"access denied reading {side} path {path}"
-    if (
-        "no aws credentials" in lowered
-        or "unable to load aws credentials" in lowered
-        or "noauthwithaws" in lowered
-    ):
-        return f"no AWS credentials found for {side} path {path}"
     if "nosuchbucket" in lowered or "specified bucket does not exist" in lowered:
         return f"{side} bucket not found: {path}"
     if (
@@ -371,6 +375,8 @@ def _classify_s3_error(
         or "no such file" in lowered
         or "status code: 404" in lowered
         or "404 not found" in lowered
+        or "path does not exist" in lowered
+        or "path_not_found" in lowered
     ):
         return f"{side} path not found: {path}"
     return None
@@ -504,11 +510,26 @@ def _csv_s3_uris(spark: SparkSession, uri: str, side: str) -> list[str]:
     for item in filesystem.listStatus(path):
         name = str(item.getPath().getName())
         if item.isFile() and name and not name.startswith(".") and not name.startswith("_"):
+            _reject_listed_glob(name, side)
             found.append((name, str(item.getPath().toString())))
+    # Sort so the header comparison names files in a stable order. S3 listing
+    # order is not part of the result.
     found.sort(key=lambda pair: pair[0])
     if not found:
         raise ReadError(f"{side} csv has no data files")
     return [item[1] for item in found]
+
+
+def _reject_listed_glob(name: str, side: str) -> None:
+    """Refuse an object whose name Spark would treat as a glob.
+
+    The spec path is already free of glob characters. A listed object can
+    still be named ``a[1].csv``. Passing that URI back to Spark expands it
+    and the failure does not name the object.
+    """
+    for char in name:
+        if char in "*?[]{}\\":
+            raise ReadError(f"{side} csv object {name!r} contains glob character {char!r}")
 
 
 def _first_s3_line(spark: SparkSession, uri: str, side: str) -> str:

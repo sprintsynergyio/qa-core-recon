@@ -14,9 +14,15 @@ from pyspark.sql.types import DecimalType, DoubleType, StringType, StructField, 
 
 from qa_core_recon.cli import main
 from qa_core_recon.exit_codes import ExitCode
-from qa_core_recon.readers import ReadError, _classify_s3_error, check_data
+from qa_core_recon.readers import (
+    ReadError,
+    _classify_s3_error,
+    _read_csv_s3,
+    check_data,
+    read_datasets,
+)
 from qa_core_recon.refusals import RefusalCode, RefusalError
-from qa_core_recon.spark import s3_hadoop_settings
+from qa_core_recon.spark import _holds_credential, s3_hadoop_settings
 from qa_core_recon.spec import to_s3a
 from tests.support import parse_data, spec_data, write_csv, write_spec_file
 
@@ -46,7 +52,11 @@ def _bucket(label: str) -> str:
 
 
 def _put_csv(bucket: str, key: str, text: str) -> None:
-    _client().put_object(Bucket=bucket, Key=key, Body=text.encode("utf-8"))
+    _put_bytes(bucket, key, text.encode("utf-8"))
+
+
+def _put_bytes(bucket: str, key: str, body: bytes) -> None:
+    _client().put_object(Bucket=bucket, Key=key, Body=body)
 
 
 def _spec(tmp_path: Path, source: dict, target: dict, allow: list[str]) -> dict:
@@ -319,18 +329,24 @@ def test_s3_error_lines_name_the_side_and_hide_secrets():
     missing = RuntimeError("java.io.FileNotFoundException: No such file or directory")
     absent = RuntimeError("Error Code: NoSuchBucket; Status Code: 404; " + secret)
     creds = RuntimeError("Unable to load AWS credentials from any provider in the chain " + secret)
+    wrapped = RuntimeError(
+        "java.nio.file.AccessDeniedException: "
+        "org.apache.hadoop.fs.s3a.auth.NoAuthWithAWSException: No AWS Credentials provided"
+    )
     lines = (
         _classify_s3_error(denied, "source", path, missing_key=True),
         _classify_s3_error(unreachable, "target", path, missing_key=True),
         _classify_s3_error(missing, "source", path, missing_key=True),
         _classify_s3_error(absent, "target", path, missing_key=True),
         _classify_s3_error(creds, "source", path, missing_key=True),
+        _classify_s3_error(wrapped, "source", path, missing_key=True),
     )
     assert lines == (
         f"access denied reading source path {path}",
         f"cannot reach S3 for target path {path}",
         f"source path not found: {path}",
         f"target bucket not found: {path}",
+        f"no AWS credentials found for source path {path}",
         f"no AWS credentials found for source path {path}",
     )
     assert all(secret not in line for line in lines)
@@ -373,6 +389,8 @@ def test_s3_settings_follow_the_endpoint_and_region(monkeypatch):
     assert settings["fs.s3a.path.style.access"] == "true"
     assert settings["fs.s3a.connection.ssl.enabled"] == "false"
     assert settings["fs.s3a.endpoint.region"] == "eu-west-1"
+    assert settings["fs.s3a.retry.limit"] == "1"
+    assert settings["fs.s3a.retry.interval"] == "200ms"
     assert "DefaultAWSCredentialsProviderChain" in settings["fs.s3a.aws.credentials.provider"]
 
     monkeypatch.setenv("QA_CORE_RECON_S3_ENDPOINT", "https://store.example.test")
@@ -388,6 +406,8 @@ def test_s3_settings_follow_the_endpoint_and_region(monkeypatch):
     plain = s3_hadoop_settings()
     assert "fs.s3a.endpoint" not in plain
     assert "fs.s3a.path.style.access" not in plain
+    assert "fs.s3a.retry.limit" not in plain
+    assert "fs.s3a.retry.interval" not in plain
     assert plain["fs.s3a.endpoint.region"] == "eu-central-1"
 
 
@@ -461,6 +481,202 @@ def test_cli_requests_the_s3_runtime_only_when_a_path_is_s3(monkeypatch, tmp_pat
     assert capsys.readouterr().out == "data ok\ndata ok\ndata ok\n"
 
 
+def test_s3_glob_path_does_not_read(spark, tmp_path, capsys):
+    bucket = _bucket("glob")
+    _upload_parquet(
+        spark,
+        bucket,
+        "pq/east",
+        [("1", Decimal("10.50"), "2024-01-01", "a")],
+        DecimalType(10, 2),
+    )
+    _upload_parquet(
+        spark,
+        bucket,
+        "pq/west",
+        [("1", Decimal("11.00"), "2024-01-01", "b")],
+        DecimalType(10, 2),
+    )
+    source = _local_csv(tmp_path, "source.csv", CSV)
+    data = _spec(
+        tmp_path,
+        {"path": str(source), "format": "csv"},
+        {"path": f"s3://{bucket}/pq/*", "format": "parquet"},
+        [str(tmp_path), f"s3://{bucket}/pq"],
+    )
+    spec = write_spec_file(tmp_path, data)
+    code = main(["validate", "--spec", str(spec), "--check-data"])
+    captured = capsys.readouterr()
+    assert code is ExitCode.REFUSED
+    assert captured.out == ""
+    assert "contains glob character '*'" in captured.err
+    assert "data ok" not in captured.out
+
+
+def test_missing_parquet_prefix_names_the_target_path(spark, tmp_path):
+    bucket = _bucket("missing-pq")
+    source = _local_csv(tmp_path, "source.csv", CSV)
+    path = f"s3://{bucket}/pq/absent"
+    data = _spec(
+        tmp_path,
+        {"path": str(source), "format": "csv"},
+        {"path": path, "format": "parquet"},
+        [str(tmp_path), f"s3://{bucket}"],
+    )
+    with pytest.raises(ReadError) as caught:
+        check_data(spark, parse_data(data))
+    assert str(caught.value) == f"target path not found: {path}"
+
+
+def test_s3_csv_malformed_row_is_a_read_error(spark, tmp_path):
+    bucket = _bucket("bad-row")
+    _put_csv(bucket, "raw/payments.csv", "txn_id,amount,day,note\n1,10.50\n")
+    target = _local_csv(tmp_path, "target.csv", CSV)
+    data = _spec(
+        tmp_path,
+        {"path": f"s3://{bucket}/raw/payments.csv", "format": "csv"},
+        {"path": str(target), "format": "csv"},
+        [str(tmp_path), f"s3://{bucket}"],
+    )
+    with pytest.raises(ReadError) as caught:
+        check_data(spark, parse_data(data))
+    assert str(caught.value) == "source csv has a malformed row"
+
+
+def test_s3_csv_header_bom_is_stripped(spark, tmp_path):
+    bucket = _bucket("bom")
+    _put_bytes(bucket, "raw/payments.csv", b"\xef\xbb\xbf" + CSV.encode("utf-8"))
+    target = _local_csv(tmp_path, "target.csv", CSV)
+    data = _spec(
+        tmp_path,
+        {"path": f"s3://{bucket}/raw/payments.csv", "format": "csv"},
+        {"path": str(target), "format": "csv"},
+        [str(tmp_path), f"s3://{bucket}"],
+    )
+    loaded, _other = read_datasets(spark, parse_data(data))
+    assert "txn_id" in loaded.columns
+    assert all("\ufeff" not in name for name in loaded.columns)
+
+
+def test_s3_csv_header_that_is_not_utf8_is_a_read_error(spark, tmp_path):
+    bucket = _bucket("utf8")
+    _put_bytes(bucket, "raw/payments.csv", b"\xff\xfetxn_id,amount\n")
+    target = _local_csv(tmp_path, "target.csv", CSV)
+    data = _spec(
+        tmp_path,
+        {"path": f"s3://{bucket}/raw/payments.csv", "format": "csv"},
+        {"path": str(target), "format": "csv"},
+        [str(tmp_path), f"s3://{bucket}"],
+    )
+    with pytest.raises(ReadError) as caught:
+        check_data(spark, parse_data(data))
+    assert str(caught.value) == "source csv is not valid UTF-8"
+
+
+def test_s3_csv_files_with_different_headers_are_refused(spark, tmp_path):
+    bucket = _bucket("headers")
+    _put_csv(bucket, "dir/a.csv", CSV)
+    _put_csv(bucket, "dir/b.csv", "txn_id,amount,day,other\n1,10.50,2024-01-01,a\n")
+    target = _local_csv(tmp_path, "target.csv", CSV)
+    data = _spec(
+        tmp_path,
+        {"path": f"s3://{bucket}/dir", "format": "csv"},
+        {"path": str(target), "format": "csv"},
+        [str(tmp_path), f"s3://{bucket}"],
+    )
+    with pytest.raises(ReadError) as caught:
+        check_data(spark, parse_data(data))
+    assert str(caught.value) == "source csv header in 'b.csv' does not match 'a.csv'"
+
+
+def test_s3_csv_object_name_with_a_glob_character_is_a_read_error(spark, tmp_path):
+    bucket = _bucket("brackets")
+    _put_csv(bucket, "dir/a[1].csv", CSV)
+    target = _local_csv(tmp_path, "target.csv", CSV)
+    data = _spec(
+        tmp_path,
+        {"path": f"s3://{bucket}/dir", "format": "csv"},
+        {"path": str(target), "format": "csv"},
+        [str(tmp_path), f"s3://{bucket}"],
+    )
+    with pytest.raises(ReadError) as caught:
+        check_data(spark, parse_data(data))
+    assert str(caught.value) == "source csv object 'a[1].csv' contains glob character '['"
+
+
+def test_s3_csv_files_are_compared_in_sorted_name_order(spark, monkeypatch):
+    class _Path:
+        def __init__(self, name: str) -> None:
+            self._name = name
+
+        def getName(self) -> str:
+            return self._name
+
+        def toString(self) -> str:
+            return f"s3a://bucket/dir/{self._name}"
+
+    class _Status:
+        def __init__(self, name: str, *, is_file: bool = True) -> None:
+            self._path = _Path(name)
+            self._file = is_file
+
+        def isFile(self) -> bool:
+            return self._file
+
+        def getPath(self) -> _Path:
+            return self._path
+
+    class _FS:
+        def getFileStatus(self, _path: object) -> _Status:
+            return _Status("dir", is_file=False)
+
+        def listStatus(self, _path: object) -> list[_Status]:
+            # Deliberately not sorted. The reader must sort before it compares.
+            return [_Status("z.csv"), _Status("m.csv"), _Status("a.csv")]
+
+    monkeypatch.setattr(
+        "qa_core_recon.readers._hadoop_file",
+        lambda _spark, _uri: (_FS(), object()),
+    )
+
+    def line(_spark: object, uri: str, _side: str) -> str:
+        if uri.endswith("/z.csv"):
+            return "id,amount"
+        return "txn_id,amount"
+
+    monkeypatch.setattr("qa_core_recon.readers._first_s3_line", line)
+    with pytest.raises(ReadError) as caught:
+        _read_csv_s3(spark, "s3a://bucket/dir", "source")
+    assert str(caught.value) == "source csv header in 'z.csv' does not match 'a.csv'"
+
+
+def test_s3_read_unsets_an_access_key(spark, tmp_path):
+    conf = spark.sparkContext._jsc.hadoopConfiguration()
+    conf.set("fs.s3a.access.key", "qa-core-recon-test-access-key")
+    bucket = _bucket("scrub-key")
+    target = _local_csv(tmp_path, "target.csv", CSV)
+    path = f"s3://{bucket}/raw/missing.csv"
+    data = _spec(
+        tmp_path,
+        {"path": path, "format": "csv"},
+        {"path": str(target), "format": "csv"},
+        [str(tmp_path), f"s3://{bucket}"],
+    )
+    with pytest.raises(ReadError):
+        check_data(spark, parse_data(data))
+    assert conf.get("fs.s3a.access.key") in (None, "")
+
+
+def test_holds_credential_matches_a_key_name_only():
+    assert _holds_credential("fs.s3n.awsSecretAccessKey", "plain", ()) is True
+
+
+def test_holds_credential_matches_a_value_only():
+    secret = "qa-core-recon-test-secret-key"
+    assert _holds_credential("com.example.note", secret, (secret,)) is True
+    assert _holds_credential("fs.s3a.endpoint", "http://127.0.0.1:9", (secret,)) is False
+
+
 def test_local_only_process_does_not_request_s3_packages(tmp_path):
     source = _local_csv(tmp_path, "source.csv", CSV)
     target = _local_csv(tmp_path, "target.csv", CSV)
@@ -514,3 +730,98 @@ def test_check_data_s3_process_prints_only_data_ok(tmp_path):
     assert "Traceback" not in result.stderr
     assert os.environ["AWS_SECRET_ACCESS_KEY"] not in result.stdout
     assert os.environ["AWS_SECRET_ACCESS_KEY"] not in result.stderr
+
+
+def test_no_aws_credentials_names_the_source_path(tmp_path):
+    path = "s3://recon-absent-bucket/raw/payments.csv"
+    target = _local_csv(tmp_path, "target.csv", CSV)
+    data = _spec(
+        tmp_path,
+        {"path": path, "format": "csv"},
+        {"path": str(target), "format": "csv"},
+        [str(tmp_path), "s3://recon-absent-bucket"],
+    )
+    spec = write_spec_file(tmp_path, data)
+    env = os.environ.copy()
+    for name in (
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_SECURITY_TOKEN",
+        "AWS_PROFILE",
+        "AWS_WEB_IDENTITY_TOKEN_FILE",
+        "AWS_ROLE_ARN",
+        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+    ):
+        env.pop(name, None)
+    home = tmp_path / "empty-home"
+    home.mkdir()
+    env["HOME"] = str(home)
+    env["AWS_SHARED_CREDENTIALS_FILE"] = str(tmp_path / "missing-credentials")
+    env["AWS_CONFIG_FILE"] = str(tmp_path / "missing-config")
+    env["AWS_EC2_METADATA_DISABLED"] = "true"
+    result = subprocess.run(
+        [sys.executable, "-m", "qa_core_recon", "validate", "--spec", str(spec), "--check-data"],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=180,
+        env=env,
+    )
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert f"no AWS credentials found for source path {path}" in result.stderr
+    assert "access denied" not in result.stderr
+    assert "Traceback" not in result.stderr
+
+
+_AUTH_DENIED = """\
+import os
+import sys
+
+os.environ["INITIAL_NO_AUTH_ACTION_COUNT"] = "0"
+from moto.server import ThreadedMotoServer
+
+server = ThreadedMotoServer(ip_address="127.0.0.1", port=0, verbose=False)
+server.start()
+host, port = server.get_host_and_port()
+os.environ["QA_CORE_RECON_S3_ENDPOINT"] = f"http://{host}:{port}"
+os.environ["AWS_ACCESS_KEY_ID"] = "qa-core-recon-test-access-key"
+os.environ["AWS_SECRET_ACCESS_KEY"] = "qa-core-recon-test-secret-key"
+os.environ["AWS_REGION"] = "us-east-1"
+os.environ.pop("AWS_SESSION_TOKEN", None)
+os.environ.pop("AWS_SECURITY_TOKEN", None)
+
+from qa_core_recon.cli import main
+
+raise SystemExit(int(main(["validate", "--spec", sys.argv[1], "--check-data"])))
+"""
+
+
+def test_moto_with_auth_required_is_access_denied(tmp_path):
+    path = "s3://recon-auth-bucket/raw/payments.csv"
+    target = _local_csv(tmp_path, "target.csv", CSV)
+    data = _spec(
+        tmp_path,
+        {"path": path, "format": "csv"},
+        {"path": str(target), "format": "csv"},
+        [str(tmp_path), "s3://recon-auth-bucket"],
+    )
+    spec = write_spec_file(tmp_path, data)
+    script = tmp_path / "auth_denied.py"
+    script.write_text(_AUTH_DENIED, encoding="utf-8")
+    env = os.environ.copy()
+    env["INITIAL_NO_AUTH_ACTION_COUNT"] = "0"
+    result = subprocess.run(
+        [sys.executable, str(script), str(spec)],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=180,
+        env=env,
+    )
+    assert result.returncode == 2, result.stderr
+    assert f"access denied reading source path {path}" in result.stderr
+    assert "no AWS credentials" not in result.stderr
+    assert "Traceback" not in result.stderr
