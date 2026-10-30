@@ -427,9 +427,9 @@ def test_check_data_s3_is_an_error_not_a_refusal(tmp_path, capsys):
     _assert_stderr_line(
         code,
         captured,
-        "qa-core-recon: error: s3 reads are not supported yet: "
-        "target path 's3://demo-bucket/curated/payments'\n",
+        "qa-core-recon: error: target bucket not found: s3://demo-bucket/curated/payments\n",
     )
+    assert "qa-core-recon-test-secret-key" not in captured.err
 
 
 def test_check_data_output_is_deterministic(tmp_path, capsys):
@@ -444,7 +444,7 @@ def test_check_data_output_is_deterministic(tmp_path, capsys):
     assert "9.001" not in first_captured.err
 
 
-def test_sample_only_and_s3_do_not_start_spark(monkeypatch, tmp_path, capsys):
+def test_sample_only_does_not_start_spark(monkeypatch, tmp_path, capsys):
     def fail(*_args, **_kwargs):
         raise AssertionError("spark started")
 
@@ -462,23 +462,6 @@ def test_sample_only_and_s3_do_not_start_spark(monkeypatch, tmp_path, capsys):
         code,
         captured,
         "refused: sample-only: the spec declares sampling, so a full recon cannot be claimed\n",
-    )
-
-    source_file = tmp_path / "source.csv"
-    from tests.support import write_csv
-
-    write_csv(source_file, "1,10.00,2024-01-01,a\n")
-    remote = spec_data(tmp_path, source_file, tmp_path / "unused.csv")
-    remote["target"] = {"path": "s3://demo-bucket/curated/payments", "format": "parquet"}
-    remote["allowlist"] = [str(tmp_path), "s3://demo-bucket"]
-    spec = write_spec_file(tmp_path, remote)
-    code = main(["validate", "--spec", str(spec), "--check-data"])
-    captured = capsys.readouterr()
-    _assert_stderr_line(
-        code,
-        captured,
-        "qa-core-recon: error: s3 reads are not supported yet: "
-        "target path 's3://demo-bucket/curated/payments'\n",
     )
 
 

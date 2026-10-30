@@ -21,6 +21,15 @@ is set. The cache is not inside the session temp directory, so stopping the
 session does not delete it. A Hadoop catalog for one warehouse is registered
 later, and only when a spec reads Iceberg.
 
+S3 reads use that same cache and Maven Central. The jars are
+``org.apache.hadoop:hadoop-aws:3.3.4`` and
+``com.amazonaws:aws-java-sdk-bundle:1.12.262``. PySpark 3.5 ships Hadoop
+3.3.4, and hadoop-aws 3.3.4 is built against that SDK bundle. They are added
+only when the caller asks for S3, so a local spec does not download them.
+Credentials stay on the AWS default chain. They are not copied into the Spark
+configuration. ``QA_CORE_RECON_S3_ENDPOINT``, when set, points s3a at that
+endpoint and turns on path-style access.
+
 Spark prints a startup banner on the process stderr before Python can change
 its log level, and that banner contains a timestamp. Ivy prints a settings
 line on stdout when the Iceberg runtime is resolved. Both are captured and
@@ -47,12 +56,23 @@ os.environ.setdefault("SPARK_LOCAL_IP", "127.0.0.1")
 # with Spark 3.5.4 and Scala 2.12.
 ICEBERG_VERSION = "1.7.1"
 ICEBERG_SPARK_PACKAGE = f"org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:{ICEBERG_VERSION}"
+# PySpark 3.5.0 through 3.5.9 set hadoop.version to 3.3.4. The hadoop-aws
+# 3.3.4 POM depends on aws-java-sdk-bundle 1.12.262.
+HADOOP_VERSION = "3.3.4"
+AWS_SDK_BUNDLE_VERSION = "1.12.262"
+HADOOP_AWS_PACKAGE = f"org.apache.hadoop:hadoop-aws:{HADOOP_VERSION}"
+AWS_SDK_BUNDLE_PACKAGE = f"com.amazonaws:aws-java-sdk-bundle:{AWS_SDK_BUNDLE_VERSION}"
+S3_ENDPOINT_ENV = "QA_CORE_RECON_S3_ENDPOINT"
+_DEFAULT_S3_REGION = "us-east-1"
 MAVEN_CENTRAL = "https://repo1.maven.org/maven2"
 
 _session: SparkSession | None = None
 _warehouse: Path | None = None
 _iceberg_ready: bool = False
+_s3_ready: bool = False
 _RUNTIME_JAR_SUFFIX = f"iceberg-spark-runtime-3.5_2.12-{ICEBERG_VERSION}.jar"
+_HADOOP_AWS_JAR_SUFFIX = f"hadoop-aws-{HADOOP_VERSION}.jar"
+_AWS_SDK_JAR_SUFFIX = f"aws-java-sdk-bundle-{AWS_SDK_BUNDLE_VERSION}.jar"
 
 
 class SessionStartError(Exception):
@@ -61,6 +81,10 @@ class SessionStartError(Exception):
 
 class IcebergRuntimeError(SessionStartError):
     """The Iceberg Spark runtime jar is not available. This is a read error."""
+
+
+class S3RuntimeError(SessionStartError):
+    """The Hadoop AWS jars are not available. This is a read error."""
 
 
 def local_session_active() -> bool:
@@ -110,12 +134,152 @@ def missing_runtime_message(cache: Path) -> str:
     )
 
 
-def runtime_jar_cached(cache: Path) -> bool:
-    """Return True when the pinned runtime jar is already in ``cache``."""
+def _jar_named(cache: Path, suffix: str) -> bool:
     if not cache.is_dir():
         return False
-    return any(
-        path.is_file() and path.name.endswith(_RUNTIME_JAR_SUFFIX) for path in cache.rglob("*.jar")
+    return any(path.is_file() and path.name.endswith(suffix) for path in cache.rglob("*.jar"))
+
+
+def runtime_jar_cached(cache: Path) -> bool:
+    """Return True when the pinned Iceberg runtime jar is already in ``cache``."""
+    return _jar_named(cache, _RUNTIME_JAR_SUFFIX)
+
+
+def s3_jars_cached(cache: Path) -> bool:
+    """Return True when both pinned S3 jars are already in ``cache``."""
+    return _jar_named(cache, _HADOOP_AWS_JAR_SUFFIX) and _jar_named(cache, _AWS_SDK_JAR_SUFFIX)
+
+
+def jars_packages(*, iceberg: bool = False, s3: bool = False) -> str:
+    """Return the Maven coordinates Spark should resolve, or an empty string."""
+    parts: list[str] = []
+    if iceberg:
+        parts.append(ICEBERG_SPARK_PACKAGE)
+    if s3:
+        parts.append(HADOOP_AWS_PACKAGE)
+        parts.append(AWS_SDK_BUNDLE_PACKAGE)
+    return ",".join(parts)
+
+
+def resolve_s3_region() -> str | None:
+    """Return ``AWS_REGION``, else ``AWS_DEFAULT_REGION``, else None."""
+    for name in ("AWS_REGION", "AWS_DEFAULT_REGION"):
+        value = os.environ.get(name, "").strip()
+        if value:
+            return value
+    return None
+
+
+def s3_hadoop_settings() -> dict[str, str]:
+    """Return Hadoop s3a settings for this process.
+
+    Credentials are not included. The default AWS chain reads them from the
+    environment, a profile, or an instance role when a request is sent.
+    ``QA_CORE_RECON_S3_ENDPOINT`` switches on path-style access. An ``http://``
+    endpoint also turns TLS off. With that override and no region variable,
+    the client uses ``us-east-1``. With no override and no region variable,
+    the region key is left unset so the AWS SDK region chain can run.
+    """
+    settings = {
+        "fs.s3a.impl": "org.apache.hadoop.fs.s3a.S3AFileSystem",
+        "fs.s3a.aws.credentials.provider": "com.amazonaws.auth.DefaultAWSCredentialsProviderChain",
+    }
+    endpoint = os.environ.get(S3_ENDPOINT_ENV, "").strip()
+    if endpoint:
+        settings["fs.s3a.endpoint"] = endpoint
+        settings["fs.s3a.path.style.access"] = "true"
+        settings["fs.s3a.connection.ssl.enabled"] = (
+            "false" if endpoint.lower().startswith("http://") else "true"
+        )
+        # Moto and some compatible stores do not return stable object etags.
+        settings["fs.s3a.change.detection.mode"] = "none"
+        settings["fs.s3a.change.detection.version.required"] = "false"
+        settings["fs.s3a.connection.establish.timeout"] = "5000"
+        settings["fs.s3a.connection.timeout"] = "10000"
+        settings["fs.s3a.attempts.maximum"] = "2"
+        settings["fs.s3a.multiobjectdelete.enable"] = "false"
+    region = resolve_s3_region()
+    if region is None and endpoint:
+        region = _DEFAULT_S3_REGION
+    if region:
+        settings["fs.s3a.endpoint.region"] = region
+    return settings
+
+
+def apply_s3_config(spark: SparkSession) -> None:
+    """Apply :func:`s3_hadoop_settings` to the live Hadoop configuration."""
+    conf = spark.sparkContext._jsc.hadoopConfiguration()
+    for key, value in s3_hadoop_settings().items():
+        conf.set(key, value)
+    scrub_s3_credentials(spark)
+
+
+_CREDENTIAL_ENV = (
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_SECURITY_TOKEN",
+)
+# Old s3n keys and the s3a keys. The provider class name is not in this list.
+_CREDENTIAL_KEY_MARKERS = (
+    "access.key",
+    "secret.key",
+    "session.token",
+    "awsaccesskeyid",
+    "awssecretaccesskey",
+    "awssessiontoken",
+)
+
+
+def _credential_values() -> tuple[str, ...]:
+    values = []
+    for name in _CREDENTIAL_ENV:
+        value = os.environ.get(name, "").strip()
+        if len(value) >= 8:
+            values.append(value)
+    return tuple(values)
+
+
+def _holds_credential(key: str, text: str, secrets: tuple[str, ...]) -> bool:
+    lowered = key.lower()
+    if any(marker in lowered for marker in _CREDENTIAL_KEY_MARKERS):
+        return True
+    return any(secret in text for secret in secrets)
+
+
+def scrub_s3_credentials(spark: SparkSession) -> None:
+    """Drop credentials Hadoop copied into its configuration.
+
+    The AWS chain still supplies them on the next request. They are not left
+    where a later log line or config dump could print them. This covers the
+    s3a keys and the older s3n keys Hadoop fills from the environment.
+    """
+    secrets = _credential_values()
+    conf = spark.sparkContext._jsc.hadoopConfiguration()
+    names: list[str] = []
+    iterator = conf.iterator()
+    while iterator.hasNext():
+        entry = iterator.next()
+        key = str(entry.getKey())
+        value = entry.getValue()
+        text = "" if value is None else str(value)
+        if _holds_credential(key, text, secrets):
+            names.append(key)
+    for name in names:
+        conf.unset(name)
+    for key, value in spark.sparkContext.getConf().getAll():
+        if _holds_credential(key, value, secrets):
+            try:
+                spark.conf.unset(key)
+            except Exception:
+                continue
+
+
+def missing_s3_runtime_message(cache: Path) -> str:
+    """Return the read error used when the S3 jars cannot be resolved."""
+    return (
+        f"the S3 runtime {HADOOP_AWS_PACKAGE} and {AWS_SDK_BUNDLE_PACKAGE} "
+        f"could not be fetched from Maven Central or found in the Ivy cache at {cache}"
     )
 
 
@@ -141,34 +305,44 @@ def _generic_start_error(exc: BaseException) -> SessionStartError:
     return SessionStartError(f"cannot start the local Spark session: {detail}")
 
 
-def session_start_failure(exc: BaseException, *, iceberg: bool, ivy: Path | None) -> BaseException:
+def session_start_failure(
+    exc: BaseException, *, iceberg: bool, ivy: Path | None, s3: bool = False
+) -> BaseException:
     """Map a failed session start to a read error.
 
-    The Iceberg runtime is named only when the output points at dependency
-    resolution and the pinned jar is not in the Ivy cache. Any other start
-    failure keeps the generic session message. A session that was not asked
-    to load Iceberg is left unchanged.
+    A runtime is named only when the output points at dependency resolution
+    and the pinned jar is not in the Ivy cache. S3 is checked first, then
+    Iceberg. Any other start failure keeps the generic session message. A
+    session that was not asked to load either runtime is left unchanged.
     """
-    if not iceberg:
+    if not iceberg and not s3:
         return exc
-    if ivy is not None and not runtime_jar_cached(ivy) and _dependency_resolution_failure(exc):
-        return IcebergRuntimeError(missing_runtime_message(ivy))
+    if ivy is not None and _dependency_resolution_failure(exc):
+        if s3 and not s3_jars_cached(ivy):
+            return S3RuntimeError(missing_s3_runtime_message(ivy))
+        if iceberg and not runtime_jar_cached(ivy):
+            return IcebergRuntimeError(missing_runtime_message(ivy))
     return _generic_start_error(exc)
 
 
-def local_session(warehouse: Path | None = None, *, iceberg: bool = False) -> SparkSession:
+def local_session(
+    warehouse: Path | None = None, *, iceberg: bool = False, s3: bool = False
+) -> SparkSession:
     """Return the process-wide local session, creating it on the first call.
 
-    ``iceberg`` loads the Iceberg runtime. Spark accepts jars only while the
-    session is created, so a session that was started without it cannot gain
+    ``iceberg`` loads the Iceberg runtime. ``s3`` loads the Hadoop AWS client
+    and the AWS SDK bundle. Spark accepts jars only while the session is
+    created, so a session that was started without one of them cannot gain
     it later.
     """
-    global _session, _warehouse, _iceberg_ready
+    global _session, _warehouse, _iceberg_ready, _s3_ready
     if _session is not None:
         if iceberg and not _iceberg_ready:
             raise RuntimeError(
                 "the local Spark session is already running without the Iceberg runtime"
             )
+        if s3 and not _s3_ready:
+            raise RuntimeError("the local Spark session is already running without the S3 runtime")
         return _session
 
     root = warehouse if warehouse is not None else Path(tempfile.mkdtemp(prefix="qa-core-recon-"))
@@ -206,27 +380,45 @@ def local_session(warehouse: Path | None = None, *, iceberg: bool = False) -> Sp
         .config("spark.pyspark.driver.python", sys.executable)
     )
     ivy: Path | None = None
-    if iceberg:
+    if iceberg or s3:
         ivy = ivy_cache_dir()
         ivy.mkdir(parents=True, exist_ok=True)
         builder = (
-            builder.config("spark.jars.packages", ICEBERG_SPARK_PACKAGE)
+            builder.config("spark.jars.packages", jars_packages(iceberg=iceberg, s3=s3))
             .config("spark.jars.ivy", str(ivy))
             .config("spark.jars.repositories", MAVEN_CENTRAL)
         )
+    if s3:
+        for key, value in s3_hadoop_settings().items():
+            builder = builder.config(f"spark.hadoop.{key}", value)
     try:
         session = _start_quietly(builder)
         session.sparkContext.setLogLevel("ERROR")
+        if s3:
+            apply_s3_config(session)
+            _quiet_s3_logs(session)
     except Exception as exc:
         shutil.rmtree(root, ignore_errors=True)
-        failure = session_start_failure(exc, iceberg=iceberg, ivy=ivy)
+        failure = session_start_failure(exc, iceberg=iceberg, ivy=ivy, s3=s3)
         if isinstance(failure, SessionStartError):
             raise failure from None
         raise
     _session = session
     _warehouse = root
     _iceberg_ready = iceberg
+    _s3_ready = s3
     return session
+
+
+def _quiet_s3_logs(session: SparkSession) -> None:
+    """Keep the S3 client from writing request lines to the process stderr."""
+    try:
+        configurator = session._jvm.org.apache.logging.log4j.core.config.Configurator
+        level = session._jvm.org.apache.logging.log4j.Level.ERROR
+        for name in ("org.apache.hadoop.fs.s3a", "com.amazonaws", "com.amazonaws.auth"):
+            configurator.setLevel(name, level)
+    except Exception:
+        return
 
 
 def _start_quietly(builder: SparkSession.Builder) -> SparkSession:
@@ -269,12 +461,13 @@ def _start_quietly(builder: SparkSession.Builder) -> SparkSession:
 
 def stop_local_session() -> None:
     """Stop the session and delete its temporary directory."""
-    global _session, _warehouse, _iceberg_ready
+    global _session, _warehouse, _iceberg_ready, _s3_ready
     session = _session
     root = _warehouse
     _session = None
     _warehouse = None
     _iceberg_ready = False
+    _s3_ready = False
     if session is not None:
         session.stop()
     if root is not None:

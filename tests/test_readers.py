@@ -376,21 +376,20 @@ def test_reader_rechecks_the_allowlist_before_opening(spark, tmp_path):
     assert "not found" not in refusal.message
 
 
-def test_allowlisted_s3_is_not_opened(spark, tmp_path):
+def test_allowlisted_missing_s3_bucket_is_a_read_error(spark, tmp_path):
     source, _target = _pair(tmp_path)
     data = spec_data(tmp_path, source, tmp_path / "unused.csv", target_format="parquet")
     data["target"] = {"path": "s3://demo-bucket/curated/payments", "format": "parquet"}
     data["allowlist"] = [str(tmp_path), "s3://demo-bucket"]
     with pytest.raises(ReadError) as caught:
         check_data(spark, parse_data(data))
-    assert str(caught.value) == (
-        "s3 reads are not supported yet: target path 's3://demo-bucket/curated/payments'"
-    )
+    assert str(caught.value) == "target bucket not found: s3://demo-bucket/curated/payments"
+    assert "Traceback" not in str(caught.value)
 
     data["source"] = {"path": "s3://demo-bucket/raw/payments.csv", "format": "csv"}
     with pytest.raises(ReadError) as caught:
         check_data(spark, parse_data(data))
-    assert str(caught.value).startswith("s3 reads are not supported yet: source path ")
+    assert str(caught.value) == "source bucket not found: s3://demo-bucket/raw/payments.csv"
 
 
 def test_s3_outside_the_allowlist_stays_path_not_allowed(spark, tmp_path):

@@ -8,7 +8,7 @@ from pathlib import Path
 from qa_core_recon import __version__
 from qa_core_recon.exit_codes import ExitCode
 from qa_core_recon.refusals import RefusalError
-from qa_core_recon.spec import SpecError, load_spec
+from qa_core_recon.spec import SpecError, load_spec, uses_s3
 
 PROG = "qa-core-recon"
 DEFAULT_SPEC_PATH = "recon.yaml"
@@ -81,8 +81,9 @@ def _validate(args: argparse.Namespace) -> ExitCode:
         print("spec ok")
         return ExitCode.MATCH
     # Imported here so init and a spec-only validate do not load PySpark.
-    # sample-only and s3 are decided before the session, so they do not start a JVM.
-    # The Iceberg runtime is requested only when the spec uses Iceberg.
+    # sample-only is decided before the session, so it does not start a JVM.
+    # Iceberg jars load only when the spec uses Iceberg. S3 jars load only
+    # when a path uses s3://.
     from qa_core_recon.readers import ReadError, check_before_session, check_data
 
     try:
@@ -101,7 +102,7 @@ def _validate(args: argparse.Namespace) -> ExitCode:
     needs_iceberg = spec.source.format == "iceberg" or spec.target.format == "iceberg"
     created = not local_session_active()
     try:
-        spark = local_session(iceberg=needs_iceberg)
+        spark = local_session(iceberg=needs_iceberg, s3=uses_s3(spec))
     except SessionStartError as exc:
         _print_error(str(exc))
         return ExitCode.REFUSED

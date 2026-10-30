@@ -6,7 +6,7 @@ import pytest
 import yaml
 
 from qa_core_recon.refusals import RefusalCode, RefusalError
-from qa_core_recon.spec import SpecError, _parts_cover, load_spec, parse_spec
+from qa_core_recon.spec import SpecError, _parts_cover, load_spec, parse_spec, to_s3a
 
 TEMPLATE = (files("qa_core_recon") / "templates" / "recon.yaml").read_text(encoding="utf-8")
 TARGET = "s3://demo-bucket/curated/payments"
@@ -401,7 +401,8 @@ def test_s3_dot_empty_query_and_fragment_are_malformed():
     cases = (
         ("s3://demo-bucket/./curated/x", "target.path has a '.' key segment"),
         ("s3://demo-bucket/curated//x", "target.path has an empty key segment"),
-        ("s3://demo-bucket/curated/payments/", "target.path has an empty key segment"),
+        ("s3://demo-bucket/curated/payments//", "target.path has an empty key segment"),
+        ("s3://demo-bucket//curated", "target.path has an empty key segment"),
         (
             "s3://demo-bucket/curated/x?versionId=1",
             "target.path must not include a query or fragment",
@@ -410,6 +411,64 @@ def test_s3_dot_empty_query_and_fragment_are_malformed():
     )
     for path, message in cases:
         assert _error(lambda data, path=path: data["target"].__setitem__("path", path)) == message
+
+
+def test_s3_one_trailing_slash_matches_and_maps_to_s3a():
+    def mutate(data):
+        data["allowlist"] = ["./data", "s3://demo-bucket/curated/"]
+        data["target"]["path"] = "s3://demo-bucket/curated/payments/"
+
+    spec = _ok(mutate)
+    assert spec.target.path == "s3://demo-bucket/curated/payments/"
+    assert to_s3a(spec.target.path) == "s3a://demo-bucket/curated/payments"
+    assert to_s3a("s3://demo-bucket/") == "s3a://demo-bucket"
+
+    def bucket_root(data):
+        data["allowlist"] = ["./data", "s3://demo-bucket/"]
+        data["target"]["path"] = "s3://demo-bucket/curated/payments"
+
+    assert _ok(bucket_root).target.path == "s3://demo-bucket/curated/payments"
+
+
+def test_s3_bucket_names_follow_s3_rules():
+    rejected = (
+        "s3://Demo/key",
+        "s3://ab/key",
+        "s3://demo_bucket/key",
+        "s3://192.168.0.1/key",
+        "s3://demo..bucket/key",
+        "s3://-demo/key",
+        "s3://xn--bucket/key",
+        "s3://my-bucket-s3alias/key",
+        "s3://my--ol-s3/key",
+        "s3://my.mrap/key",
+        "s3://my--x-s3/key",
+        "s3://my--table-s3/key",
+        "a" * 64,
+    )
+    for path in rejected:
+        full = path if path.startswith("s3://") else f"s3://{path}/key"
+        message = _error(lambda data, full=full: data["target"].__setitem__("path", full))
+        assert message.startswith("target.path bucket ")
+        assert message.endswith(" is not a valid S3 bucket name")
+
+    def allow(data):
+        data["allowlist"] = ["./data", "s3://AB"]
+
+    assert _error(allow) == "allowlist[1] bucket 'AB' is not a valid S3 bucket name"
+
+    def short_ok(data):
+        data["allowlist"] = ["./data", "s3://abc"]
+        data["target"]["path"] = "s3://abc/file.csv"
+
+    assert _ok(short_ok).target.path == "s3://abc/file.csv"
+
+
+def test_credentials_are_not_a_spec_field():
+    assert (
+        _error(lambda data: data["source"].__setitem__("secret", "x"))
+        == "source has unknown key: 'secret'"
+    )
 
 
 def test_nested_unknown_keys_are_malformed():

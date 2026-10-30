@@ -23,7 +23,7 @@ jobs:
       - uses: actions/cache@v5
         with:
           path: ~/.cache/qa-core-recon/ivy
-          key: iceberg-spark-runtime-3.5_2.12-1.7.1-${{ runner.os }}
+          key: ivy-iceberg-1.7.1-hadoop-aws-3.3.4-aws-sdk-1.12.262-${{ runner.os }}
       - run: pip install -e ".[dev]"
       - run: ruff check .
       - run: ruff format --check .

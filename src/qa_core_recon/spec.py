@@ -20,7 +20,9 @@ the filesystem, so they do not resolve symlinks and they do not join paths to
 the current directory. An allowlist entry that normalises to an empty path,
 the filesystem root, or a path that still contains ".." is malformed. s3://
 URIs keep key segments as written. A "." segment, a ".." segment, an empty
-segment, a query, or a fragment is malformed rather than folded.
+segment, a query, or a fragment is malformed rather than folded. One trailing
+slash is allowed on an s3:// path or allowlist entry and is not a segment.
+Bucket names must follow the S3 naming rules.
 
 ``format`` is ``csv``, ``parquet``, or ``iceberg``. An Iceberg dataset adds
 ``table`` and an optional ``snapshot_id``. Those keys are rejected on CSV and
@@ -75,6 +77,19 @@ _RESERVED_TABLE_PARTS = frozenset(
 _SELECTOR_PART = re.compile(
     r"(?:snapshot_id_\d+|at_timestamp_\d+|branch_.*|tag_.*)\Z",
     re.IGNORECASE,
+)
+# General-purpose bucket rules: 3 to 63 characters, lowercase letters, digits,
+# dots, and hyphens, starting and ending with a letter or digit. Adjacent
+# dots, an IP-shaped name, the punycode prefix, and reserved suffixes are
+# rejected in _require_bucket_name.
+_BUCKET_NAME = re.compile(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]\Z")
+_BUCKET_IP = re.compile(r"(?:\d{1,3}\.){3}\d{1,3}\Z")
+_BUCKET_FORBIDDEN_SUFFIXES = (
+    "-s3alias",
+    "--ol-s3",
+    ".mrap",
+    "--x-s3",
+    "--table-s3",
 )
 
 _TOP_LEVEL = (
@@ -496,13 +511,17 @@ def _require_allowlist_entry(path: str, label: str) -> None:
 
 def _parse_s3(path: str, label: str) -> _S3Path:
     # Key segments are literal. "." , ".." , and empty segments are not folded,
-    # and a query or fragment is not part of the key.
+    # and a query or fragment is not part of the key. One trailing slash is
+    # allowed, because a Glue location often ends with one. It is not a segment.
     if "?" in path or "#" in path:
         raise SpecError(f"{label} must not include a query or fragment")
     rest = path[len(_S3_SCHEME) :]
+    if rest.endswith("/") and not rest.endswith("//"):
+        rest = rest[:-1]
     bucket, separator, key = rest.partition("/")
     if bucket == "" or bucket in {".", ".."}:
         raise SpecError(f"{label} is missing an s3 bucket")
+    _require_bucket_name(bucket, label)
     if not separator:
         return _S3Path(bucket=bucket, parts=())
     parts: list[str] = []
@@ -513,6 +532,41 @@ def _parse_s3(path: str, label: str) -> _S3Path:
             raise SpecError(f"{label} has a {piece!r} key segment")
         parts.append(piece)
     return _S3Path(bucket=bucket, parts=tuple(parts))
+
+
+def _require_bucket_name(bucket: str, label: str) -> None:
+    if (
+        _BUCKET_NAME.fullmatch(bucket) is None
+        or ".." in bucket
+        or bucket.startswith("xn--")
+        or _BUCKET_IP.fullmatch(bucket) is not None
+        or any(bucket.endswith(suffix) for suffix in _BUCKET_FORBIDDEN_SUFFIXES)
+    ):
+        raise SpecError(f"{label} bucket {bucket!r} is not a valid S3 bucket name")
+
+
+def is_s3_path(path: str) -> bool:
+    """Return True when ``path`` uses the s3:// scheme."""
+    return path.startswith(_S3_SCHEME)
+
+
+def uses_s3(spec: Spec) -> bool:
+    """Return True when the source or the target is an s3:// path."""
+    return is_s3_path(spec.source.path) or is_s3_path(spec.target.path)
+
+
+def to_s3a(path: str) -> str:
+    """Map an s3:// spec path to the s3a:// URI Spark reads.
+
+    One trailing slash is removed so a Glue location and the same path
+    without the slash read the same object. The spec text itself is unchanged.
+    """
+    if not is_s3_path(path):
+        raise ValueError(f"not an s3 path: {path}")
+    body = path[len(_S3_SCHEME) :]
+    if body.endswith("/") and not body.endswith("//"):
+        body = body[:-1]
+    return "s3a://" + body
 
 
 def _path_allowed(path: str, allowlist: tuple[str, ...]) -> bool:

@@ -2,7 +2,7 @@
 
 Prove that a target dataset matches its source after a Glue or PySpark job, using deterministic checks. No AI model decides pass or fail.
 
-**Status: readers.** `--version`, `init`, and `validate` work. `validate --check-data` opens local CSV, Parquet, and Iceberg and runs the data-level refusals. `run` arrives in a later PR. Counts, sums, hashes, diffs, and reports are not in this release.
+**Status: readers.** `--version`, `init`, and `validate` work. `validate --check-data` opens CSV, Parquet, and Iceberg on local disk and on S3 and runs the data-level refusals. `run` arrives in a later PR. Counts, sums, hashes, diffs, and reports are not in this release.
 
 ## Install From Source
 
@@ -19,6 +19,8 @@ pip install -e ".[dev]"
 PySpark is pinned to the 3.5 line (`pyspark>=3.5,<3.6`), the Spark line in AWS Glue 5.0. `init` and `validate` do not start a JVM. `validate --check-data` does.
 
 A spec that uses Iceberg also needs the Iceberg Spark runtime `org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.7.1`. The first `validate --check-data` on that spec downloads it from Maven Central into `~/.cache/qa-core-recon/ivy`. Set `QA_CORE_RECON_IVY` to use another cache directory. A CSV or Parquet spec does not download it.
+
+A spec that uses an `s3://` path also needs `org.apache.hadoop:hadoop-aws:3.3.4` and `com.amazonaws:aws-java-sdk-bundle:1.12.262`. PySpark 3.5 ships Hadoop 3.3.4, and that `hadoop-aws` release is built against that SDK bundle. They download into the same Ivy cache, and only when the spec uses S3. A spec that stays on local disk does not download them.
 
 ## Commands
 
@@ -54,7 +56,7 @@ qa-core-recon validate --spec recon.yaml --check-data
 
 When those checks pass, the command prints `data ok` and exits with code 0. It does not compare the two datasets, so different amounts on the two sides still print `data ok`. Counts, sums, hashes, and diffs arrive with `run`.
 
-A refusal prints `refused: <code>: <message>` to stderr and exits with code 2. A malformed spec prints `qa-core-recon: error: <message>` to stderr and exits with code 2. A dataset that cannot be opened, including an allowlisted `s3://` path, prints `qa-core-recon: error: <message>` to stderr and exits with code 2.
+A refusal prints `refused: <code>: <message>` to stderr and exits with code 2. A malformed spec prints `qa-core-recon: error: <message>` to stderr and exits with code 2. A dataset that cannot be opened prints `qa-core-recon: error: <message>` to stderr and exits with code 2. That includes a missing file, a missing S3 bucket or key, access denied, and an S3 endpoint that cannot be reached.
 
 `run` arrives in a later PR.
 
@@ -115,11 +117,11 @@ Within `unmapped-column`, `float-amount`, and `inexact-amount`, source is checke
 
 ## Readers
 
-CSV, Parquet, and local Iceberg. S3 is a later PR. See Iceberg for the catalog, the table identifier, and the pinned runtime. An allowlisted `s3://` path remains a valid spec, and plain `validate` accepts the packaged template. `--check-data` on an `s3://` path prints `qa-core-recon: error: s3 reads are not supported yet: ...` and exits 2. That is a read error, not `path-not-allowed`, because the allowlist check already passed. Source is named before target.
+CSV, Parquet, and Iceberg, on local disk or on S3. See Iceberg for the catalog, the table identifier, and the pinned runtime. See S3 for paths, the allowlist, credentials, and the endpoint override. Plain `validate` accepts an allowlisted `s3://` path, including the packaged template. `--check-data` then reads it. A missing bucket or key is a read error, not `path-not-allowed`, because the allowlist check already passed. Source is named before target.
 
 Every path is checked against the allowlist again before it is opened. The check uses the path text, the same way `validate` does. It does not resolve symlinks, and it does not join a relative path to the spec file. A relative path is opened from the current directory.
 
-The Spark session is local mode on one thread (`local[1]`), with `spark.sql.shuffle.partitions` set to 1, the session time zone set to UTC, and the UI turned off. The driver binds to `127.0.0.1`. Arrow conversion is off. The session catalog is in memory, so Hive is not started. Warehouse, derby, and scratch directories are created under a temporary directory. A run does not leave `metastore_db`, `derby.log`, or `spark-warehouse` in the working directory or the repo root. Spark's startup banner is dropped, because it carries a timestamp and is not part of the tool's result. When the spec uses Iceberg, that session loads the Iceberg Spark runtime and registers a Hadoop catalog for the warehouse. A CSV or Parquet spec does not.
+The Spark session is local mode on one thread (`local[1]`), with `spark.sql.shuffle.partitions` set to 1, the session time zone set to UTC, and the UI turned off. The driver binds to `127.0.0.1`. Arrow conversion is off. The session catalog is in memory, so Hive is not started. Warehouse, derby, and scratch directories are created under a temporary directory. A run does not leave `metastore_db`, `derby.log`, or `spark-warehouse` in the working directory or the repo root. Spark's startup banner is dropped, because it carries a timestamp and is not part of the tool's result. When the spec uses Iceberg, that session loads the Iceberg Spark runtime and registers a Hadoop catalog for the warehouse. When the spec uses `s3://`, it also loads the Hadoop AWS client. A spec that stays on local disk loads neither.
 
 Column names are case sensitive. `Amount` does not satisfy a spec column named `amount`.
 
@@ -131,7 +133,7 @@ Readers read every row. They do not sample, limit, or keep a head. `sampled: tru
 
 Blank amount cells are null. They are not turned into zero. Null counts arrive with `run`.
 
-A missing path, a CSV file that is not UTF-8, a malformed CSV row, or a file that Spark cannot read is a read error (`qa-core-recon: error:`), exit 2. It is not a refusal code.
+A missing path, a missing S3 bucket or key, access denied, an S3 endpoint that cannot be reached, a CSV file that is not UTF-8, a malformed CSV row, or a file that Spark cannot read is a read error (`qa-core-recon: error:`), exit 2. It is not a refusal code. The message names the side and the path. It does not include a stack trace.
 
 ## Iceberg
 
@@ -150,9 +152,29 @@ The catalog is `org.apache.iceberg.spark.SparkCatalog` with `type` set to `hadoo
 
 The runtime jar is `org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.7.1` (Spark 3.5, Scala 2.12). AWS Glue 5.0 ships Iceberg 1.7.1 with Spark 3.5.4, as listed in the AWS Glue versions documentation. Spark downloads the jar from Maven Central the first time a session is started for an Iceberg spec, and stores it in the Ivy cache (`~/.cache/qa-core-recon/ivy`, or `QA_CORE_RECON_IVY`). Later runs reuse the cache. CSV and Parquet do not download it. When Spark reports an unresolved dependency or an Ivy failure, and the jar is not already in that cache, `--check-data` prints a read error that names the runtime and the cache directory, and exits 2. Any other failure to start the session prints `cannot start the local Spark session` and exits 2.
 
-Iceberg on a local warehouse is supported. An allowlisted `s3://` warehouse is still a valid spec. `--check-data` prints `s3 reads are not supported yet` and exits 2, before Spark starts. S3 and the Glue catalog are later PRs.
+Iceberg on a local warehouse is supported. An `s3://` warehouse is read through the same Hadoop catalog, with the path mapped to `s3a://`. See S3 for credentials and the endpoint. This is not the Glue catalog. The tool does not write to S3.
 
 After the table is open, Iceberg uses the same checks as Parquet. Decimal columns are typed to `decimal(38, scale)` and must already fit that scale. A float or double amount is `float-amount` unless the spec sets `cast`. A missing column is `unmapped-column`. A missing table, a missing warehouse, or a snapshot id that is not in the table is a read error (`qa-core-recon: error:`), exit 2.
+
+## S3
+
+An `s3://` path in the spec is read by Spark as `s3a://`. The spec keeps the `s3://` text. One trailing slash is allowed on a path and on an allowlist entry, because a Glue location often ends with `/`. That slash is not a path component. `s3://bucket/curated/` and `s3://bucket/curated` are the same location. A second slash is still an empty segment, and the spec is malformed. `.`, `..`, a query, and a fragment are still rejected.
+
+The allowlist is checked before any read, on the path text, one whole component at a time. An `s3://` path matches only an `s3://` entry. A local entry does not cover a bucket, and a bucket entry does not cover a local path.
+
+Bucket names follow the S3 rules. A name is 3 to 63 characters. It uses lowercase letters, digits, dots, and hyphens, and it starts and ends with a letter or a digit. It cannot be an IP address, contain `..`, start with `xn--`, or use a reserved suffix such as `-s3alias`.
+
+Credentials come from the standard AWS chain: environment variables, the shared credentials file, a container role, then an instance role. The spec file has no fields for a key or a secret. The tool does not copy credentials into the Spark configuration, and it does not print them. If Hadoop copies a key into its own configuration while a request is in flight, the tool removes that entry before it returns. If the chain finds no credentials, the read error says that none were found.
+
+Set `AWS_REGION` to the region of the bucket. If that variable is unset, `AWS_DEFAULT_REGION` is used. If neither is set and no endpoint override is set, the AWS SDK uses its own region chain, and that chain falls back to `us-east-1`. A bucket in another region needs `AWS_REGION`.
+
+For moto, or another S3-compatible store, set `QA_CORE_RECON_S3_ENDPOINT` to the store URL, for example `http://127.0.0.1:5000`. When that variable is set, requests use path-style access. An `http://` URL turns TLS off. An `https://` URL leaves TLS on. If the endpoint override is set and neither region variable is set, the client uses `us-east-1`.
+
+A missing bucket, a missing key, access denied, and an endpoint that cannot be reached are read errors. The message names the side and the path. The command exits 2 and does not print a stack trace.
+
+`org.apache.hadoop:hadoop-aws:3.3.4` and `com.amazonaws:aws-java-sdk-bundle:1.12.262` download only when a spec uses `s3://`. They use the same Ivy cache as the Iceberg runtime (`~/.cache/qa-core-recon/ivy`, or `QA_CORE_RECON_IVY`). A local CSV, Parquet, or Iceberg spec does not download them. If the jars cannot be fetched and they are not already in the cache, `--check-data` prints a read error that names both packages and the cache directory, and exits 2.
+
+These reads were tested with moto on `127.0.0.1`. The tests use fake credentials and do not call AWS. A run against real AWS comes later. This tool does not use the Glue Data Catalog, and it does not write to S3.
 
 ## Decimal Rules
 
@@ -174,7 +196,7 @@ A column type other than string, decimal, integer, float, or double (for example
 
 ## Spec File
 
-`recon.yaml` is parsed with PyYAML's safe loader. A repeated key at any level is a malformed spec: the error names the key and the line, and the last value is not kept. The packaged template is a valid example. `init` writes it, and `validate --spec` on that file exits 0, because both example paths sit inside the example allowlist. The template target is `s3://`, so `validate --check-data` on the unmodified template reports that S3 reads are not supported yet.
+`recon.yaml` is parsed with PyYAML's safe loader. A repeated key at any level is a malformed spec: the error names the key and the line, and the last value is not kept. The packaged template is a valid example. `init` writes it, and `validate --spec` on that file exits 0, because both example paths sit inside the example allowlist. The template target is an example `s3://` path. `validate --check-data` on that file reads the example bucket, so it needs credentials and a bucket you can access. The tests in this repository use moto and do not call AWS.
 
 | Field | Rule |
 | ----- | ---- |
@@ -189,7 +211,7 @@ A column type other than string, decimal, integer, float, or double (for example
 
 Unknown keys are rejected. Column names are non-empty single-line strings. Formats and the version number are exact: `csv`, `parquet`, `iceberg`, and integer `1`.
 
-`sampled` must be a real boolean. Write `true` or `false`. A string such as `"false"` is a malformed spec. A missing `sampled` is a malformed spec, so an omitted declaration cannot be treated as a full reconciliation. A spec written by an earlier `init`, before this field existed, must add `sampled: false` before it will validate. `sampled: true` loads successfully. `validate` prints `spec ok`. `validate --check-data` refuses with `sample-only` and does not start Spark. An allowlisted `s3://` path is also reported before Spark starts.
+`sampled` must be a real boolean. Write `true` or `false`. A string such as `"false"` is a malformed spec. A missing `sampled` is a malformed spec, so an omitted declaration cannot be treated as a full reconciliation. A spec written by an earlier `init`, before this field existed, must add `sampled: false` before it will validate. `sampled: true` loads successfully. `validate` prints `spec ok`. `validate --check-data` refuses with `sample-only` and does not start Spark. An allowlisted `s3://` path is read after Spark starts. See S3.
 
 `amounts[].cast`, when present, must be the string `half-even` or `half-up`. Null, a number, or any other string is a malformed spec. Omitting the key means there is no cast rule.
 
@@ -211,8 +233,9 @@ Matching compares normalised whole path components. It reads the path text in th
 | `s3://demo-bucket/curated/payments` | `s3://demo-bucket` | Allowed. The bucket matches, then the key sits under it. |
 | `s3://demo-bucket-other/file.csv` | `s3://demo-bucket` | Outside. The bucket name differs by a whole component. |
 | `s3://demo-bucket/curated2/file.csv` | `s3://demo-bucket/curated` | Outside. `curated2` and `curated` are different key components. |
+| `s3://demo-bucket/curated/payments/` | `s3://demo-bucket/curated/` | Allowed. One trailing slash is not a component. |
 | `/data/x.csv` | `./data` | Outside. An absolute path matches only an absolute entry. |
 
-An `s3://` path matches only an `s3://` entry, by bucket and then by key components. Key segments are literal. A segment that is `.` or `..`, an empty segment (including a trailing slash), a query (`?`), or a fragment (`#`) makes the spec malformed. Comparison is case sensitive.
+An `s3://` path matches only an `s3://` entry, by bucket and then by key components. Key segments are literal. A segment that is `.` or `..`, an empty segment, a query (`?`), or a fragment (`#`) makes the spec malformed. One trailing slash is allowed and is not an empty segment. A second slash, as in `s3://bucket/key//`, is an empty segment and is rejected. Comparison is case sensitive. Bucket names must follow the S3 naming rules. See S3.
 
 An allowlist entry that normalises to an empty path (`.` or `./data/..`), the filesystem root (`/`), or a path that still contains `..` is a malformed spec. A source or target path may still use `..`; that path is normalised and then compared with the allowlist.
