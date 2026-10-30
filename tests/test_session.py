@@ -85,7 +85,10 @@ def test_missing_iceberg_runtime_is_a_clear_read_error(tmp_path):
     assert isinstance(cached, SessionStartError)
     assert not isinstance(cached, IcebergRuntimeError)
     assert str(cached).startswith("cannot start the local Spark session")
-    assert session_start_failure(resolution, iceberg=False, ivy=cache) is resolution
+    plain = session_start_failure(resolution, iceberg=False, ivy=cache)
+    assert isinstance(plain, SessionStartError)
+    assert not isinstance(plain, IcebergRuntimeError)
+    assert str(plain).startswith("cannot start the local Spark session")
 
 
 def test_other_session_start_failures_stay_generic(tmp_path):

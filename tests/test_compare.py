@@ -1,16 +1,19 @@
 """Comparison and exit-code rules. These do not read a dataset."""
 
+import math
 from decimal import Decimal
 
 import pytest
 
 from qa_core_recon.compare import (
+    GROUP_NAN,
     absolute_difference,
     add_exact,
     decimal_fits,
     exit_code_for,
     format_decimal,
     format_tolerance,
+    normalize_group_value,
     overall_status,
     sort_token,
     sums_match,
@@ -76,6 +79,20 @@ def test_format_decimal_uses_the_full_scale():
     assert format_decimal(Decimal("0"), 0) == "0"
     assert format_tolerance(Decimal("0.010")) == "0.010"
     assert format_tolerance(Decimal("0")) == "0"
+
+
+def test_float_nan_and_negative_zero_share_group_keys():
+    assert normalize_group_value(float("nan")) is GROUP_NAN
+    assert normalize_group_value(float("-nan")) is GROUP_NAN
+    zero = normalize_group_value(-0.0)
+    assert zero == 0.0
+    assert str(zero) == "0.0"
+    ordered = sorted([GROUP_NAN, -2.5, -0.0, 3.0, float("nan")], key=sort_token)
+    assert ordered[0] == -2.5
+    assert ordered[1] == 0.0
+    assert ordered[2] == 3.0
+    assert ordered[3] is GROUP_NAN
+    assert math.isnan(ordered[4])
 
 
 def test_sort_token_orders_nulls_first():

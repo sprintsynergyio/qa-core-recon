@@ -66,7 +66,7 @@ qa-core-recon run --spec recon.yaml --out out
 
 The command prints `match` or `mismatch` on stdout. A refusal prints the same `refused:` line as `validate` and still writes both report files, with status `refused`. A read error, a malformed spec, an unusable `--out`, and a sum that does not fit `decimal(38, scale)` print `qa-core-recon: error:` and write no report file.
 
-`--out` is a local directory. It is created when it is missing. It is not checked against the allowlist. `s3://` is rejected. If the directory already contains any file, the command exits 2 and writes nothing, unless you pass `--force`. `--force` replaces `report.json` and `report.md` and leaves every other file in place. Both report files are written to temporary names in that directory and then renamed into place.
+`--out` is a local directory. It is created when it is missing. It is not checked against the allowlist. `s3://` is rejected. It must not equal a local source or target path, sit inside one, or contain one, or the next read can pick up `report.json` as a data file. If the directory already contains any file, the command exits 2 and writes nothing, unless you pass `--force`. A leftover `.report.*.tmp` file from a crashed publish is removed and does not count as content. When the directory already exists, any previous `report.json` and `report.md` are removed before the spec is read, so a read error does not leave the old report in place. `--force` still leaves every other file alone. Both report files are written to temporary names in that directory and then renamed into place. If either rename fails, both report files are removed.
 
 Nothing in pass or fail calls a model. Two runs on the same inputs write byte-identical files. The report has no timestamp. It does not add a path of its own. `spec_sha256` is the SHA-256 of the spec file bytes.
 
@@ -105,7 +105,7 @@ allowlist: ["./data"]
 
 All four checks run inside Spark. Only the aggregates come back to the driver: one total per side, one row per group, the null-key counts, the duplicate-key count, and at most 20 example keys. A mismatch does not skip the later checks. The report lists them in this order.
 
-**Row Count.** Total rows on each side. When `group_by` is set, also the rows in each group. Groups are sorted. A group that is missing on either side is a mismatch and is listed. A count of 0 on one side means that group was not present.
+**Row Count.** Total rows on each side. When `group_by` is set, also the rows in each group. Groups are sorted. A group that is missing on either side is a mismatch and is listed. A count of 0 on one side means that group was not present. Group values compare by value across types, so an int 1 and a decimal 1.00 are the same group. Every float NaN is one shared group, shown as NaN, and it sorts after every other float. -0.0 is the same group as 0.0.
 
 **Amount Sum.** For each amount column, the exact sum on each side, stored as `decimal(38, scale)`, for the whole side and for each group. Decimals are written as strings with the full scale, so scale 2 renders `10.50`. Null amounts are left out of the sum. They are not added as zero. A side or a group with no non-null amount has a null sum. Two null sums match. A null sum against a number, including zero, is a mismatch.
 

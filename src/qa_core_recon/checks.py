@@ -46,6 +46,7 @@ from qa_core_recon.compare import (
     decimal_fits,
     format_decimal,
     format_tolerance,
+    normalize_group_value,
     overall_status,
     quantize_exact,
     render_value,
@@ -136,7 +137,9 @@ def _aggregate_groups(frame: DataFrame, spec: Spec, side: str) -> list[_GroupSum
 
     def to_pair(row):
         values = tuple(row)
-        return values[:width], values[width:]
+        # NaN is not equal to itself, so each raw NaN would be its own group.
+        key = tuple(normalize_group_value(value) for value in values[:width])
+        return key, values[width:]
 
     def create(amounts):
         return _merge_row(_empty_state(len(amount_names)), tuple(amounts))

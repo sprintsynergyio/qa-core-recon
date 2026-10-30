@@ -86,6 +86,11 @@ def _run(args: argparse.Namespace) -> ExitCode:
     except OutputError as exc:
         _print_error(str(exc))
         return ExitCode.REFUSED
+    # Drop any previous report before the spec is read. A later read error,
+    # overflow, or session failure then leaves no report behind.
+    if out.is_dir():
+        (out / "report.json").unlink(missing_ok=True)
+        (out / "report.md").unlink(missing_ok=True)
     try:
         return _execute_run(Path(args.spec), out)
     except OutputError as exc:
@@ -111,6 +116,7 @@ def _execute_run(spec_path: Path, out: Path) -> ExitCode:
     from qa_core_recon.report import (
         build_result_report,
         publish,
+        reject_output_overlap,
         render_markdown,
         spec_sha256,
     )
@@ -118,6 +124,7 @@ def _execute_run(spec_path: Path, out: Path) -> ExitCode:
 
     try:
         spec = load_spec(spec_path)
+        reject_output_overlap(out, spec.source.path, spec.target.path)
         # sample-only and s3 are decided here, before a JVM starts.
         check_before_session(spec)
     except RefusalError as exc:

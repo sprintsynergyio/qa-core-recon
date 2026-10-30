@@ -11,10 +11,11 @@ Two runs on the same inputs therefore write byte-identical files.
 ``--out`` is a local directory. It is created when it is missing. It is not
 checked against the input allowlist. ``s3://`` is rejected. An existing
 directory that already holds files is rejected unless ``--force`` is set.
-Files are written to temporary names in that directory, flushed, and then
-renamed into place. A failure before the rename leaves no report file. When
-this command created the directory and the write fails, the empty directory
-is removed.
+A leftover ``.report.*.tmp`` file from this tool is removed and does not
+count as content. Files are written to temporary names in that directory,
+flushed, and then renamed into place. If either rename fails, both final
+report files are removed. When this command created the directory and the
+write fails, the empty directory is removed.
 """
 
 import hashlib
@@ -44,11 +45,23 @@ def spec_sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _is_report_temp(name: str) -> bool:
+    """True for a temporary report file left by a crashed publish."""
+    return name.startswith(".report.") and name.endswith(".tmp")
+
+
+def _clear_report_temps(directory: Path) -> None:
+    for child in directory.iterdir():
+        if child.is_file() and _is_report_temp(child.name):
+            child.unlink(missing_ok=True)
+
+
 def ensure_output_available(path_text: str, *, force: bool) -> Path:
     """Return the local output directory, or raise OutputError without creating it.
 
     A missing directory is accepted here and created later, when the report is
-    published. The parent must already exist.
+    published. The parent must already exist. Leftover ``.report.*.tmp`` files
+    are removed and do not make the directory count as non-empty.
     """
     if path_text.startswith("s3://") or path_text.startswith("s3:"):
         raise OutputError(f"s3 output is not supported: {path_text}")
@@ -63,6 +76,7 @@ def ensure_output_available(path_text: str, *, force: bool) -> Path:
         if not path.is_dir():
             raise OutputError(f"{path} is a file")
         try:
+            _clear_report_temps(path)
             occupied = any(path.iterdir())
         except OSError as exc:
             raise OutputError(_cannot_use(path, exc)) from None
@@ -183,10 +197,36 @@ def render_markdown(report: dict) -> str:
     return "\n".join(lines).rstrip("\n") + "\n"
 
 
+def reject_output_overlap(out: Path, source_path: str, target_path: str) -> None:
+    """Raise when ``out`` equals, contains, or sits inside a local dataset path.
+
+    Writing the report into a dataset directory makes the next read treat
+    ``report.json`` as another data file. ``s3://`` paths are not local, so
+    they do not overlap a local output directory.
+    """
+    for side, dataset_path in (("source", source_path), ("target", target_path)):
+        if _local_paths_overlap(out, dataset_path):
+            raise OutputError(f"output path {out} overlaps {side} path {dataset_path}")
+
+
+def _local_paths_overlap(out: Path, dataset_path: str) -> bool:
+    if _has_scheme(dataset_path) or dataset_path.startswith("s3:"):
+        return False
+    left = out.absolute().parts
+    right = Path(dataset_path).absolute().parts
+    return left == right or _is_prefix(left, right) or _is_prefix(right, left)
+
+
+def _is_prefix(prefix: tuple[str, ...], path: tuple[str, ...]) -> bool:
+    return len(path) > len(prefix) and path[: len(prefix)] == prefix
+
+
 def publish(directory: Path, report: dict, markdown: str) -> None:
     """Create ``directory`` if needed and publish both report files.
 
     Both temporary files are written before either final name is replaced.
+    If either rename fails, both final report files are removed so a failed
+    publish never leaves one new file beside one old file.
     """
     created = not directory.exists()
     try:
@@ -205,6 +245,8 @@ def publish(directory: Path, report: dict, markdown: str) -> None:
     except OSError as exc:
         tmp_json.unlink(missing_ok=True)
         tmp_md.unlink(missing_ok=True)
+        final_json.unlink(missing_ok=True)
+        final_md.unlink(missing_ok=True)
         if created:
             _remove_if_empty(directory)
         raise OutputError(_cannot_use(directory, exc)) from None

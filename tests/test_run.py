@@ -2,9 +2,16 @@
 
 import hashlib
 import json
+import os
 from decimal import Decimal
 
-from pyspark.sql.types import DecimalType
+from pyspark.sql.types import (
+    DecimalType,
+    DoubleType,
+    StringType,
+    StructField,
+    StructType,
+)
 
 from qa_core_recon import __version__
 from qa_core_recon.cli import main
@@ -668,3 +675,204 @@ def test_exit_codes_through_main(tmp_path):
         main(["run", "--spec", str(refused), "--out", str(tmp_path / "refused")])
         is ExitCode.REFUSED
     )
+
+
+def test_nan_groups_match_across_repartitions(spark, tmp_path):
+    schema = StructType(
+        [
+            StructField("txn_id", StringType(), True),
+            StructField("amount", DecimalType(10, 2), True),
+            StructField("bucket", DoubleType(), True),
+            StructField("note", StringType(), True),
+        ]
+    )
+    nan = float("nan")
+    source_rows = [
+        ("1", Decimal("1.00"), nan, "a"),
+        ("2", Decimal("2.00"), nan, "b"),
+        ("3", Decimal("3.00"), -0.0, "c"),
+    ]
+    target_rows = [
+        ("1", Decimal("1.00"), nan, "a"),
+        ("2", Decimal("2.00"), nan, "b"),
+        ("3", Decimal("3.00"), 0.0, "c"),
+    ]
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    spark.createDataFrame(source_rows, schema).repartition(2).write.mode("overwrite").parquet(
+        str(source)
+    )
+    spark.createDataFrame(target_rows, schema).repartition(4).write.mode("overwrite").parquet(
+        str(target)
+    )
+    data = spec_data(tmp_path, source, target, source_format="parquet", target_format="parquet")
+    data["group_by"] = ["bucket"]
+    spec = write_spec_file(tmp_path, data)
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    assert _invoke(spec, first) is ExitCode.MATCH
+    assert _invoke(spec, second) is ExitCode.MATCH
+    assert (first / "report.json").read_bytes() == (second / "report.json").read_bytes()
+    assert (first / "report.md").read_bytes() == (second / "report.md").read_bytes()
+    groups = _load(first)[0]["checks"][0]["details"]["groups"]
+    assert [group["group"]["bucket"] for group in groups] == ["0.0", "NaN"]
+    assert [group["status"] for group in groups] == ["match", "match"]
+    assert groups[1]["source"] == 2
+    assert groups[1]["target"] == 2
+
+
+def test_force_read_error_removes_the_previous_report(tmp_path, capsys):
+    spec, source, _target = _pair(tmp_path, ROW, ROW)
+    out = tmp_path / "out"
+    assert _invoke(spec, out) is ExitCode.MATCH
+    source.unlink()
+    code = _invoke(spec, out, force=True)
+    captured = capsys.readouterr()
+    assert code is ExitCode.REFUSED
+    assert "path not found" in captured.err
+    assert "unexpected error" not in captured.err
+    assert not (out / "report.json").exists()
+    assert not (out / "report.md").exists()
+
+
+def test_force_overflow_removes_the_previous_report(tmp_path, capsys):
+    spec, source, target = _pair(tmp_path, ROW, ROW)
+    out = tmp_path / "out"
+    assert _invoke(spec, out) is ExitCode.MATCH
+    big = "9" * 36 + ".99"
+    body = f"1,{big},2024-01-01,a\n2,0.01,2024-01-01,b\n"
+    write_csv(source, body)
+    write_csv(target, body)
+    code = _invoke(spec, out, force=True)
+    captured = capsys.readouterr()
+    assert code is ExitCode.REFUSED
+    assert "does not fit decimal(38, 2)" in captured.err
+    assert not (out / "report.json").exists()
+    assert not (out / "report.md").exists()
+
+
+def test_failed_rename_leaves_neither_report(monkeypatch, tmp_path, capsys):
+    original_replace = os.replace
+
+    def fail_on_markdown(src, dst):
+        if os.path.basename(os.fspath(dst)) == "report.md":
+            raise OSError(28, "No space left on device")
+        return original_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", fail_on_markdown)
+    spec, _source, _target = _pair(tmp_path, ROW, ROW)
+    out = tmp_path / "out"
+    code = _invoke(spec, out)
+    captured = capsys.readouterr()
+    assert code is ExitCode.REFUSED
+    assert captured.out == ""
+    assert "unexpected error" not in captured.err
+    assert not (out / "report.json").exists()
+    assert not (out / "report.md").exists()
+
+
+def test_group_sums_outside_tolerance_mismatch_when_the_total_matches(tmp_path):
+    spec, _source, _target = _pair(
+        tmp_path,
+        "1,10.00,a,n\n2,10.00,b,n\n",
+        "1,10.02,a,n\n2,9.98,b,n\n",
+        tolerance={"value": "0.01", "reason": "penny rounding"},
+    )
+    out = tmp_path / "out"
+    assert _invoke(spec, out) is ExitCode.MISMATCH
+    amount = _load(out)[0]["checks"][1]["details"]["columns"][0]
+    assert amount["difference"] == "0.00"
+    assert [group["group"]["day"] for group in amount["groups"]] == ["a", "b"]
+    assert [group["difference"] for group in amount["groups"]] == ["0.02", "0.02"]
+    assert [group["status"] for group in amount["groups"]] == ["mismatch", "mismatch"]
+    assert amount["status"] == "mismatch"
+
+
+def test_sum_wider_than_28_digits_keeps_the_cent(tmp_path):
+    big = "100000000000000000000000000000.01"
+    spec, _source, _target = _pair(
+        tmp_path,
+        f"1,{big},2024-01-01,a\n2,0.01,2024-01-01,b\n",
+        f"1,{big},2024-01-01,a\n2,0.02,2024-01-01,b\n",
+    )
+    out = tmp_path / "out"
+    assert _invoke(spec, out) is ExitCode.MISMATCH
+    amount = _load(out)[0]["checks"][1]["details"]["columns"][0]
+    assert amount["source"] == "100000000000000000000000000000.02"
+    assert amount["target"] == "100000000000000000000000000000.03"
+    assert amount["difference"] == "0.01"
+
+
+def test_output_must_not_overlap_a_local_dataset(tmp_path, capsys):
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    write_csv(source_dir / "part.csv", ROW)
+    target = tmp_path / "target.csv"
+    write_csv(target, ROW)
+    data = spec_data(tmp_path, source_dir, target, source_format="csv", target_format="csv")
+    spec = write_spec_file(tmp_path, data)
+    code = main(["run", "--spec", str(spec), "--out", str(source_dir), "--force"])
+    captured = capsys.readouterr()
+    _assert_error(code, captured, f"output path {source_dir} overlaps source path {source_dir}")
+    assert (source_dir / "part.csv").is_file()
+    assert not (source_dir / "report.json").exists()
+
+    nested = source_dir / "nested"
+    code = main(["run", "--spec", str(spec), "--out", str(nested)])
+    captured = capsys.readouterr()
+    _assert_error(code, captured, f"output path {nested} overlaps source path {source_dir}")
+    assert not nested.exists()
+
+    parent = tmp_path / "holder"
+    parent.mkdir()
+    held = parent / "payments.csv"
+    write_csv(held, ROW)
+    other = parent / "other.csv"
+    write_csv(other, ROW)
+    held_spec = write_spec_file(
+        parent,
+        spec_data(parent, held, other, source_format="csv", target_format="csv"),
+    )
+    # write_spec_file always uses tmp_path name recon.yaml inside parent, and the
+    # allowlist is parent, which contains the datasets. out == parent contains them.
+    code = main(["run", "--spec", str(held_spec), "--out", str(parent), "--force"])
+    captured = capsys.readouterr()
+    _assert_error(code, captured, f"output path {parent} overlaps source path {held}")
+    assert held.is_file()
+    assert not (parent / "report.json").exists()
+
+
+def test_leftover_report_temps_do_not_block_a_run(tmp_path):
+    spec, _source, _target = _pair(tmp_path, ROW, ROW)
+    out = tmp_path / "out"
+    out.mkdir()
+    leftover = out / ".report.json.999.tmp"
+    leftover.write_text("partial", encoding="utf-8")
+    (out / ".report.md.999.tmp").write_text("partial", encoding="utf-8")
+    assert _invoke(spec, out) is ExitCode.MATCH
+    assert not leftover.exists()
+    assert (out / "report.json").is_file()
+    assert (out / "report.md").is_file()
+
+
+def test_csv_session_start_failure_is_a_read_error(monkeypatch, tmp_path, capsys):
+    import qa_core_recon.spark as spark_mod
+
+    monkeypatch.setattr(spark_mod, "_session", None)
+    monkeypatch.setattr(spark_mod, "_warehouse", None)
+    monkeypatch.setattr(spark_mod, "_iceberg_ready", False)
+
+    def fail(_builder):
+        raise RuntimeError("JAVA_GATEWAY_EXITED")
+
+    monkeypatch.setattr(spark_mod, "_start_quietly", fail)
+    spec, _source, _target = _pair(tmp_path, ROW, ROW)
+    out = tmp_path / "out"
+    code = main(["run", "--spec", str(spec), "--out", str(out)])
+    captured = capsys.readouterr()
+    _assert_error(code, captured, "cannot start the local Spark session: JAVA_GATEWAY_EXITED")
+    assert not (out / "report.json").exists()
+
+    code = main(["validate", "--spec", str(spec), "--check-data"])
+    captured = capsys.readouterr()
+    _assert_error(code, captured, "cannot start the local Spark session: JAVA_GATEWAY_EXITED")

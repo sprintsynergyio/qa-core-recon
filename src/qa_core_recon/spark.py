@@ -145,13 +145,16 @@ def session_start_failure(exc: BaseException, *, iceberg: bool, ivy: Path | None
     """Map a failed session start to a read error.
 
     The Iceberg runtime is named only when the output points at dependency
-    resolution and the pinned jar is not in the Ivy cache. Any other start
-    failure keeps the generic session message. A session that was not asked
-    to load Iceberg is left unchanged.
+    resolution and the pinned jar is not in the Ivy cache. Every other start
+    failure, including a CSV or Parquet session, is a generic
+    ``SessionStartError`` so the CLI can print it as a read error.
     """
-    if not iceberg:
-        return exc
-    if ivy is not None and not runtime_jar_cached(ivy) and _dependency_resolution_failure(exc):
+    if (
+        iceberg
+        and ivy is not None
+        and not runtime_jar_cached(ivy)
+        and _dependency_resolution_failure(exc)
+    ):
         return IcebergRuntimeError(missing_runtime_message(ivy))
     return _generic_start_error(exc)
 

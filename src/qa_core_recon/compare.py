@@ -10,8 +10,13 @@ Sums are formed at a precision well above 38 digits and then checked against
 ``decimal(38, scale)``. A number that needs more than 38 digits does not fit.
 Rounding it to fit would publish a wrong total, so the caller turns that into
 a read error instead.
+
+Group keys compare by value, so an int ``1`` and a decimal ``1.00`` are one
+group. Float NaN is not equal to itself, so every NaN is replaced with one
+shared key before grouping. ``-0.0`` is replaced with ``0.0``.
 """
 
+import math
 from collections.abc import Iterable
 from decimal import Context, Decimal, localcontext
 
@@ -24,6 +29,53 @@ from qa_core_recon.exit_codes import ExitCode
 SUM_PRECISION = 200
 
 DUPLICATE_EXAMPLE_LIMIT = 20
+
+
+class GroupNaN:
+    """The one group key used for every float NaN.
+
+    Float NaN is not equal to itself, so each raw NaN would be its own group
+    and two runs could pair them differently. Every instance compares equal
+    and renders as ``NaN``.
+    """
+
+    def __hash__(self) -> int:
+        return hash(("qa-core-recon", "NaN"))
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, GroupNaN)
+
+    def __repr__(self) -> str:
+        return "NaN"
+
+    def __str__(self) -> str:
+        return "NaN"
+
+    def __reduce__(self) -> tuple:
+        return (group_nan, ())
+
+
+def group_nan() -> GroupNaN:
+    """Return the shared NaN group key. Used when a worker unpickles one."""
+    return GROUP_NAN
+
+
+GROUP_NAN = GroupNaN()
+
+
+def normalize_group_value(value: object) -> object:
+    """Return a hashable group key.
+
+    Every float NaN becomes :data:`GROUP_NAN`. ``-0.0`` becomes ``0.0``.
+    Other values are unchanged, so an int and an equal decimal still match.
+    """
+    if isinstance(value, float):
+        if math.isnan(value):
+            return GROUP_NAN
+        if value == 0.0:
+            return 0.0
+    return value
+
 
 _STATUS_CODES = {
     "match": ExitCode.MATCH,
@@ -137,11 +189,17 @@ def render_value(value: object) -> object:
         return value
     if isinstance(value, int):
         return value
+    if isinstance(value, GroupNaN):
+        return "NaN"
     if isinstance(value, Decimal):
         exponent = value.as_tuple().exponent
         scale = -exponent if isinstance(exponent, int) and exponent < 0 else 0
         return format_decimal(value, scale)
     if isinstance(value, float):
+        if math.isnan(value):
+            return "NaN"
+        if value == 0.0:
+            return "0.0"
         return repr(value)
     iso = getattr(value, "isoformat", None)
     if callable(iso):
@@ -163,6 +221,13 @@ def sort_token(value: object) -> tuple:
         return (3, value)
     if isinstance(value, str):
         return (4, value)
+    if isinstance(value, GroupNaN) or (isinstance(value, float) and math.isnan(value)):
+        # NaN sorts after every finite float.
+        return (5, "float", 1, 0.0)
+    if isinstance(value, float):
+        # -0.0 sorts with 0.0.
+        number = 0.0 if value == 0.0 else value
+        return (5, "float", 0, number)
     return (5, type(value).__name__, str(render_value(value)))
 
 
