@@ -79,7 +79,7 @@ Shape is checked before refusals. The first problem wins, in a fixed order, so t
 
 ## Spec File
 
-`recon.yaml` is loaded with `yaml.safe_load`. A duplicate key keeps the last value, which is YAML's usual rule. The packaged template is a valid example. `init` writes it, and `validate --spec` on that file exits 0, because both example paths sit inside the example allowlist.
+`recon.yaml` is parsed with PyYAML's safe loader. A repeated key at any level is a malformed spec: the error names the key and the line, and the last value is not kept. The packaged template is a valid example. `init` writes it, and `validate --spec` on that file exits 0, because both example paths sit inside the example allowlist.
 
 | Field | Rule |
 | ----- | ---- |
@@ -108,9 +108,11 @@ Matching compares normalised whole path components. It reads the path text in th
 | `./data/../data/x.csv` | `./data` | Allowed. Normalisation folds this back to `data/x.csv`. |
 | `./data/../../secret.csv` | `./data` | Outside. `..` climbs out of `data`. |
 | `./data/x.csv` | `./data/` | Allowed. A trailing slash does not add a component. |
-| `s3://demo-bucket/curated/payments/` | `s3://demo-bucket` | Allowed. The bucket matches, then the key sits under it. |
+| `s3://demo-bucket/curated/payments` | `s3://demo-bucket` | Allowed. The bucket matches, then the key sits under it. |
 | `s3://demo-bucket-other/file.csv` | `s3://demo-bucket` | Outside. The bucket name differs by a whole component. |
 | `s3://demo-bucket/curated2/file.csv` | `s3://demo-bucket/curated` | Outside. `curated2` and `curated` are different key components. |
 | `/data/x.csv` | `./data` | Outside. An absolute path matches only an absolute entry. |
 
-An `s3://` path matches only an `s3://` entry, by bucket and then by key components. A `..` component that climbs out of the bucket matches nothing. Comparison is case sensitive.
+An `s3://` path matches only an `s3://` entry, by bucket and then by key components. Key segments are literal. A segment that is `.` or `..`, an empty segment (including a trailing slash), a query (`?`), or a fragment (`#`) makes the spec malformed. Comparison is case sensitive.
+
+An allowlist entry that normalises to an empty path (`.` or `./data/..`), the filesystem root (`/`), or a path that still contains `..` is a malformed spec. A source or target path may still use `..`; that path is normalised and then compared with the allowlist.

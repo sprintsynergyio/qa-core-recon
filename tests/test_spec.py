@@ -6,10 +6,10 @@ import pytest
 import yaml
 
 from qa_core_recon.refusals import RefusalCode, RefusalError
-from qa_core_recon.spec import SpecError, parse_spec
+from qa_core_recon.spec import SpecError, _parts_cover, load_spec, parse_spec
 
 TEMPLATE = (files("qa_core_recon") / "templates" / "recon.yaml").read_text(encoding="utf-8")
-TARGET = "s3://demo-bucket/curated/payments/"
+TARGET = "s3://demo-bucket/curated/payments"
 ALLOW = ["./data", "s3://demo-bucket"]
 
 
@@ -129,7 +129,8 @@ def test_path_not_allowed_checks_source_before_target():
         data["source"]["path"] = "./database/x.csv"
         data["target"]["path"] = "s3://other-bucket/file.csv"
 
-    _code, message = _refusal(mutate)
+    code, message = _refusal(mutate)
+    assert code is RefusalCode.PATH_NOT_ALLOWED
     assert message.startswith("source path ")
 
 
@@ -164,7 +165,7 @@ def test_allowlist_traversal_that_returns_is_allowed():
 
 def test_allowlist_trailing_slash_still_matches():
     def mutate(data):
-        data["allowlist"] = ["./data/", "s3://demo-bucket/"]
+        data["allowlist"] = ["./data/", "s3://demo-bucket"]
         data["source"]["path"] = "./data/x.csv"
         data["target"]["path"] = "s3://demo-bucket/curated/payments"
 
@@ -174,7 +175,7 @@ def test_allowlist_trailing_slash_still_matches():
 
 def test_allowlist_s3_bucket_lookalike_is_refused():
     lookalikes = (
-        "s3://demo-bucket-other/curated/payments/",
+        "s3://demo-bucket-other/curated/payments",
         "s3://demo-bucket2/file.csv",
         "s3://demo-bucket.evil/file.csv",
     )
@@ -184,10 +185,9 @@ def test_allowlist_s3_bucket_lookalike_is_refused():
         assert message == f"target path {path!r} is outside the allowlist"
 
 
-def test_allowlist_s3_child_and_trailing_slash_are_allowed():
-    _ok(lambda data: data["target"].__setitem__("path", "s3://demo-bucket"))
-    _ok(lambda data: data["target"].__setitem__("path", "s3://demo-bucket/"))
-    _ok(lambda data: data["target"].__setitem__("path", "s3://demo-bucket/curated/../curated/a"))
+def test_s3_bucket_root_allows_a_child():
+    spec = _ok(lambda data: data["target"].__setitem__("path", "s3://demo-bucket/curated/payments"))
+    assert spec.target.path == "s3://demo-bucket/curated/payments"
 
 
 def test_allowlist_s3_key_lookalike_is_refused():
@@ -200,11 +200,12 @@ def test_allowlist_s3_key_lookalike_is_refused():
     assert "curated2/file.csv" in message
 
 
-def test_allowlist_s3_traversal_out_of_bucket_is_refused():
-    code, _message = _refusal(
-        lambda data: data["target"].__setitem__("path", "s3://demo-bucket/../other/file.csv")
-    )
-    assert code is RefusalCode.PATH_NOT_ALLOWED
+def test_s3_dotdot_segment_is_not_folded_into_the_allowlist():
+    def mutate(data):
+        data["allowlist"] = ["./data", "s3://demo-bucket/curated"]
+        data["target"]["path"] = "s3://demo-bucket/other/../curated/x"
+
+    assert _error(mutate) == "target.path has a '..' key segment"
 
 
 def test_empty_allowlist_refuses_every_path():
@@ -314,3 +315,172 @@ def _catch(text: str) -> str:
     with pytest.raises(RefusalError) as caught:
         parse_spec(text)
     return str(caught.value)
+
+
+def _parse_error(text: str) -> str:
+    with pytest.raises(SpecError) as caught:
+        parse_spec(text)
+    return str(caught.value)
+
+
+def test_duplicate_allowlist_is_malformed_and_does_not_widen_access():
+    extra = 'allowlist: ["/", "s3://demo-bucket"]\n'
+    text = TEMPLATE.replace("path: ./data/raw/payments.csv", "path: /etc/passwd", 1) + extra
+    line = text.count("\n")
+    assert _parse_error(text) == f"duplicate key 'allowlist' at line {line}"
+
+
+def test_duplicate_tolerance_is_malformed():
+    extra = 'tolerance:\n  value: "0.01"\n  reason: "fx rounding"\n'
+    text = TEMPLATE + extra
+    line = [index for index, row in enumerate(text.splitlines()) if row == "tolerance:"][1] + 1
+    assert _parse_error(text) == f"duplicate key 'tolerance' at line {line}"
+
+
+def test_duplicate_nested_format_is_malformed():
+    text = TEMPLATE.replace(
+        "  format: csv  # csv or parquet\n",
+        "  format: json\n  format: csv\n",
+        1,
+    )
+    line = text.splitlines().index("  format: csv") + 1
+    assert _parse_error(text) == f"duplicate key 'format' at line {line}"
+
+
+def test_python_object_tag_is_rejected():
+    message = _parse_error("!!python/object/apply:os.system\n- 'true'\n")
+    assert message.startswith("invalid YAML:")
+
+
+def test_empty_allowlist_entry_is_malformed():
+    entries = (".", "./data/..", "./.")
+    for entry in entries:
+        message = _error(
+            lambda data, entry=entry: data.__setitem__("allowlist", [entry, "s3://demo-bucket"])
+        )
+        assert message == "allowlist[0] must not be an empty path"
+
+
+def test_root_allowlist_entry_is_malformed():
+    def mutate(data):
+        data["source"]["path"] = "/etc/passwd"
+        data["allowlist"] = ["/", "s3://demo-bucket"]
+
+    assert _error(mutate) == "allowlist[0] must not be the filesystem root"
+
+
+def test_allowlist_entry_that_still_contains_dotdot_is_malformed():
+    def mutate(data):
+        data["source"]["path"] = "../secret.csv"
+        data["allowlist"] = ["../secret.csv", "s3://demo-bucket"]
+
+    assert _error(mutate) == "allowlist[0] must not contain '..'"
+
+
+def test_allowlist_dotdot_that_normalises_inside_is_ok():
+    def mutate(data):
+        data["allowlist"] = ["./data/../data", "s3://demo-bucket"]
+        data["source"]["path"] = "./data/x.csv"
+
+    assert _ok(mutate).source.path == "./data/x.csv"
+
+
+def test_dotdot_after_a_matching_prefix_is_outside():
+    assert _parts_cover(("data",), ("data", "..", "etc")) is False
+    assert _parts_cover((), ("..", "etc")) is False
+    assert _parts_cover(("data",), ("data", "x.csv")) is True
+
+
+def test_s3_dot_empty_query_and_fragment_are_malformed():
+    cases = (
+        ("s3://demo-bucket/./curated/x", "target.path has a '.' key segment"),
+        ("s3://demo-bucket/curated//x", "target.path has an empty key segment"),
+        ("s3://demo-bucket/curated/payments/", "target.path has an empty key segment"),
+        (
+            "s3://demo-bucket/curated/x?versionId=1",
+            "target.path must not include a query or fragment",
+        ),
+        ("s3://demo-bucket/curated/x#part", "target.path must not include a query or fragment"),
+    )
+    for path, message in cases:
+        assert _error(lambda data, path=path: data["target"].__setitem__("path", path)) == message
+
+
+def test_nested_unknown_keys_are_malformed():
+    assert (
+        _error(lambda data: data["source"].__setitem__("extra", 1))
+        == "source has unknown key: 'extra'"
+    )
+    assert (
+        _error(lambda data: data["target"].__setitem__("extra", 1))
+        == "target has unknown key: 'extra'"
+    )
+    assert (
+        _error(lambda data: data["amounts"][0].__setitem__("extra", 1))
+        == "amounts[0] has unknown key: 'extra'"
+    )
+
+
+def test_negative_scale_is_malformed():
+    message = _error(lambda data: data["amounts"][0].__setitem__("scale", -1))
+    assert message == "amounts[0].scale must be zero or greater"
+
+
+def test_multiline_name_is_malformed():
+    message = _error(lambda data: data.__setitem__("keys", ["txn\nid"]))
+    assert message == "keys[0] must be a single line"
+
+
+def test_spec_file_must_be_utf8(tmp_path):
+    path = tmp_path / "recon.yaml"
+    path.write_bytes(b"\xff")
+    with pytest.raises(SpecError) as caught:
+        load_spec(path)
+    assert str(caught.value) == f"spec file is not valid UTF-8: {path}"
+
+
+def test_non_finite_tolerance_is_malformed():
+    assert (
+        _error(lambda data: data["tolerance"].__setitem__("value", "NaN"))
+        == "tolerance.value must be a finite decimal of zero or greater"
+    )
+
+    def mutate(data):
+        data["tolerance"]["value"] = "Infinity"
+        data["tolerance"]["reason"] = "not a number"
+
+    assert _error(mutate) == "tolerance.value must be a finite decimal of zero or greater"
+
+
+def test_invalid_yaml_is_a_spec_error():
+    message = _parse_error(":\n  - [\n")
+    assert message.startswith("invalid YAML:")
+    assert "\n" not in message
+
+
+def test_spec_must_be_a_mapping():
+    assert _parse_error("- just\n- a\n- list\n") == "spec must be a mapping"
+    assert _error(lambda data: data.__setitem__("source", ["nope"])) == "source must be a mapping"
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "version",
+        "source",
+        "target",
+        "amounts",
+        "group_by",
+        "hash_columns",
+        "tolerance",
+        "allowlist",
+    ],
+)
+def test_missing_required_field_is_malformed(field):
+    assert _error(lambda data: data.pop(field)) == f"missing {field}"
+
+
+def test_deeply_nested_yaml_is_malformed():
+    lines = [f"{'  ' * level}a:" for level in range(1200)]
+    lines.append(f"{'  ' * 1200}1")
+    assert _parse_error("\n".join(lines) + "\n") == "YAML is nested too deeply"

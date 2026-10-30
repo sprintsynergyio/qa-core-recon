@@ -7,11 +7,15 @@ decides that two datasets differ, so it never uses exit code 1.
 Monetary amounts are parsed with Decimal from quoted strings. A YAML float is
 rejected and is never converted.
 
-Allowlist checks compare normalised path components. They do not touch the
-filesystem, so they do not resolve symlinks and they do not join paths to the
-current directory. Local paths use POSIX components. s3:// URIs use the bucket
-and then the key components. "." and ".." are folded before the comparison, and
-a path that climbs out of an allowlist entry does not match it.
+Parsing uses PyYAML's safe loader. A duplicate key at any level is a malformed
+spec: the error names the key and its line. The last value is not kept.
+
+Allowlist checks compare normalised local path components. They do not touch
+the filesystem, so they do not resolve symlinks and they do not join paths to
+the current directory. An allowlist entry that normalises to an empty path,
+the filesystem root, or a path that still contains ".." is malformed. s3://
+URIs keep key segments as written. A "." segment, a ".." segment, an empty
+segment, a query, or a fragment is malformed rather than folded.
 """
 
 from dataclasses import dataclass
@@ -85,7 +89,38 @@ class _LocalPath:
 class _S3Path:
     bucket: str
     parts: tuple[str, ...]
-    escaped: bool
+
+
+class _SafeUniqueKeyLoader(yaml.SafeLoader):
+    """Safe loader that rejects a repeated key instead of keeping the last one."""
+
+
+def _construct_unique_mapping(loader: yaml.SafeLoader, node: yaml.Node, deep: bool = False) -> dict:
+    if not isinstance(node, yaml.MappingNode):
+        raise yaml.constructor.ConstructorError(
+            None,
+            None,
+            f"expected a mapping node, but found {node.id}",
+            node.start_mark,
+        )
+    seen: set[object] = set()
+    for key_node, _value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        try:
+            repeated = key in seen
+        except TypeError:
+            continue
+        if repeated:
+            line = key_node.start_mark.line + 1
+            raise SpecError(f"duplicate key {key!r} at line {line}")
+        seen.add(key)
+    return yaml.constructor.SafeConstructor.construct_mapping(loader, node, deep)
+
+
+_SafeUniqueKeyLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    _construct_unique_mapping,
+)
 
 
 def load_spec(path: Path | str) -> Spec:
@@ -133,7 +168,7 @@ def parse_spec(text: str) -> Spec:
     _require_location(source.path, "source.path")
     _require_location(target.path, "target.path")
     for index, entry in enumerate(allowlist):
-        _require_location(entry, f"allowlist[{index}]")
+        _require_allowlist_entry(entry, f"allowlist[{index}]")
 
     if keys is None:
         raise RefusalError(Refusal(RefusalCode.MISSING_KEY, "the spec has no business key"))
@@ -168,7 +203,10 @@ def parse_spec(text: str) -> Spec:
 
 def _load_mapping(text: str) -> dict:
     try:
-        loaded = yaml.safe_load(text)
+        # SafeLoader subclass: Python object tags stay rejected, duplicate keys do not.
+        loaded = yaml.load(text, Loader=_SafeUniqueKeyLoader)
+    except RecursionError:
+        raise SpecError("YAML is nested too deeply") from None
     except yaml.YAMLError as exc:
         detail = " ".join(str(exc).split())
         raise SpecError(f"invalid YAML: {detail}") from None
@@ -325,26 +363,37 @@ def _parse_local(path: str) -> _LocalPath:
     return _LocalPath(absolute=absolute, parts=tuple(parts))
 
 
+def _require_allowlist_entry(path: str, label: str) -> None:
+    location = _require_location(path, label)
+    if not isinstance(location, _LocalPath):
+        return
+    if location.absolute and not location.parts:
+        raise SpecError(f"{label} must not be the filesystem root")
+    if not location.parts:
+        raise SpecError(f"{label} must not be an empty path")
+    if ".." in location.parts:
+        raise SpecError(f"{label} must not contain '..'")
+
+
 def _parse_s3(path: str, label: str) -> _S3Path:
+    # Key segments are literal. "." , ".." , and empty segments are not folded,
+    # and a query or fragment is not part of the key.
+    if "?" in path or "#" in path:
+        raise SpecError(f"{label} must not include a query or fragment")
     rest = path[len(_S3_SCHEME) :]
     bucket, separator, key = rest.partition("/")
     if bucket == "" or bucket in {".", ".."}:
         raise SpecError(f"{label} is missing an s3 bucket")
+    if not separator:
+        return _S3Path(bucket=bucket, parts=())
     parts: list[str] = []
-    escaped = False
-    if separator:
-        for piece in key.split("/"):
-            if piece in ("", "."):
-                continue
-            if piece == "..":
-                if parts:
-                    parts.pop()
-                else:
-                    escaped = True
-                    break
-                continue
-            parts.append(piece)
-    return _S3Path(bucket=bucket, parts=tuple(parts), escaped=escaped)
+    for piece in key.split("/"):
+        if piece == "":
+            raise SpecError(f"{label} has an empty key segment")
+        if piece in {".", ".."}:
+            raise SpecError(f"{label} has a {piece!r} key segment")
+        parts.append(piece)
+    return _S3Path(bucket=bucket, parts=tuple(parts))
 
 
 def _path_allowed(path: str, allowlist: tuple[str, ...]) -> bool:
@@ -357,7 +406,7 @@ def _path_allowed(path: str, allowlist: tuple[str, ...]) -> bool:
 
 def _covers(prefix: _LocalPath | _S3Path, path: _LocalPath | _S3Path) -> bool:
     if isinstance(prefix, _S3Path) and isinstance(path, _S3Path):
-        if prefix.escaped or path.escaped or prefix.bucket != path.bucket:
+        if prefix.bucket != path.bucket:
             return False
         return _parts_cover(prefix.parts, path.parts)
     if isinstance(prefix, _LocalPath) and isinstance(path, _LocalPath):

@@ -24,23 +24,36 @@ def _print_error(message: str) -> None:
     print(f"{PROG}: error: {line}", file=sys.stderr)
 
 
+def _reject_if_directory(path: Path) -> ExitCode | None:
+    try:
+        is_directory = path.is_dir()
+    except OSError as exc:
+        detail = exc.strerror or str(exc)
+        _print_error(f"cannot use {path}: {detail}")
+        return ExitCode.REFUSED
+    if is_directory:
+        _print_error(f"{path} is a directory")
+        return ExitCode.REFUSED
+    return None
+
+
 def _init(args: argparse.Namespace) -> ExitCode:
     path = Path(args.path)
     # Exclusive create reports an existing directory as "already exists". --force
     # only replaces a file, so a directory has to be rejected before the open.
-    if path.is_dir():
-        _print_error(f"{path} is a directory")
-        return ExitCode.REFUSED
+    rejected = _reject_if_directory(path)
+    if rejected is not None:
+        return rejected
     # "x" mode fails if the file exists, so the check and the write are one step.
     mode = "wb" if args.force else "xb"
     try:
         with path.open(mode) as fh:
             fh.write(load_template())
     except FileExistsError:
-        if path.is_dir():
-            _print_error(f"{path} is a directory")
-        else:
-            _print_error(f"{path} already exists; use --force to overwrite")
+        rejected = _reject_if_directory(path)
+        if rejected is not None:
+            return rejected
+        _print_error(f"{path} already exists; use --force to overwrite")
         return ExitCode.REFUSED
     except IsADirectoryError:
         _print_error(f"{path} is a directory")

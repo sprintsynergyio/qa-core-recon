@@ -1,8 +1,10 @@
+import os
 import subprocess
 import sys
 from importlib.metadata import version
 from importlib.resources import files
 
+import pytest
 import yaml
 
 from qa_core_recon import __version__
@@ -114,6 +116,7 @@ def test_init_parent_is_file_exits_refused(tmp_path, capsys):
     assert "Traceback" not in captured.err
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses directory mode bits")
 def test_init_permission_denied_exits_refused(tmp_path, capsys):
     parent = tmp_path / "locked"
     parent.mkdir()
@@ -217,7 +220,7 @@ def test_validate_path_not_allowed_exits_refused(tmp_path, capsys):
     )
 
 
-def test_validate_float_tolerance_exits_refused(tmp_path, capsys):
+def test_validate_float_tolerance_is_malformed(tmp_path, capsys):
     text = TEMPLATE.replace(b'value: "0"', b"value: 0.01", 1)
     target = _write_spec(tmp_path, text)
     code = main(["validate", "--spec", str(target)])
@@ -254,6 +257,40 @@ def test_init_directory_process_exits_refused(tmp_path):
     assert result.stdout == ""
     assert result.stderr == f"qa-core-recon: error: {target} is a directory\n"
     assert "Traceback" not in result.stderr
+
+
+def test_init_overlong_path_is_a_clean_error(tmp_path, capsys):
+    target = tmp_path / ("n" * 300)
+    code = main(["init", "--path", str(target)])
+    captured = capsys.readouterr()
+    _assert_stderr_line(
+        code, captured, f"qa-core-recon: error: cannot use {target}: File name too long\n"
+    )
+
+
+def test_validate_duplicate_allowlist_exits_refused(tmp_path, capsys):
+    text = (
+        TEMPLATE.replace(b"path: ./data/raw/payments.csv", b"path: /etc/passwd", 1)
+        + b'allowlist: ["/", "s3://demo-bucket"]\n'
+    )
+    target = _write_spec(tmp_path, text)
+    code = main(["validate", "--spec", str(target)])
+    captured = capsys.readouterr()
+    assert code is ExitCode.REFUSED
+    assert captured.out == ""
+    assert captured.err.startswith("qa-core-recon: error: duplicate key 'allowlist' at line ")
+    assert "Traceback" not in captured.err
+    assert "unexpected error" not in captured.err
+    assert captured.err.count("\n") == 1
+
+
+def test_validate_deeply_nested_yaml_is_malformed(tmp_path, capsys):
+    lines = [f"{'  ' * level}a:" for level in range(1200)]
+    lines.append(f"{'  ' * 1200}1")
+    target = _write_spec(tmp_path, ("\n".join(lines) + "\n").encode())
+    code = main(["validate", "--spec", str(target)])
+    captured = capsys.readouterr()
+    _assert_stderr_line(code, captured, "qa-core-recon: error: YAML is nested too deeply\n")
 
 
 def test_validate_missing_file_exits_refused(tmp_path, capsys):
