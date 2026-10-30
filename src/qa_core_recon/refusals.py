@@ -7,6 +7,7 @@ from enum import StrEnum
 class RefusalCode(StrEnum):
     MISSING_KEY = "missing-key"
     FLOAT_AMOUNT = "float-amount"
+    INEXACT_AMOUNT = "inexact-amount"
     TOLERANCE_WITHOUT_REASON = "tolerance-without-reason"
     UNMAPPED_COLUMN = "unmapped-column"
     PATH_NOT_ALLOWED = "path-not-allowed"

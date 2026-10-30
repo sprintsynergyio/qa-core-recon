@@ -46,6 +46,8 @@ def test_default_template_is_valid():
     assert spec.keys == ("txn_id",)
     assert spec.amounts[0].column == "amount"
     assert spec.amounts[0].scale == 2
+    assert spec.amounts[0].cast is None
+    assert spec.sampled is False
     assert spec.tolerance.value == Decimal("0")
     assert spec.tolerance.reason == ""
     assert spec.allowlist == ("./data", "s3://demo-bucket")
@@ -473,6 +475,7 @@ def test_spec_must_be_a_mapping():
         "group_by",
         "hash_columns",
         "tolerance",
+        "sampled",
         "allowlist",
     ],
 )
@@ -484,3 +487,50 @@ def test_deeply_nested_yaml_is_malformed():
     lines = [f"{'  ' * level}a:" for level in range(1200)]
     lines.append(f"{'  ' * 1200}1")
     assert _parse_error("\n".join(lines) + "\n") == "YAML is nested too deeply"
+
+
+def test_sampled_true_is_loaded_without_a_refusal():
+    spec = _ok(lambda data: data.__setitem__("sampled", True))
+    assert spec.sampled is True
+
+
+def test_sampled_must_be_a_boolean():
+    assert _error(lambda data: data.__setitem__("sampled", "false")) == "sampled must be a boolean"
+    assert _error(lambda data: data.__setitem__("sampled", 0)) == "sampled must be a boolean"
+
+
+def test_sampled_shape_wins_over_missing_key():
+    def mutate(data):
+        data.pop("keys")
+        data["sampled"] = "false"
+
+    assert _error(mutate) == "sampled must be a boolean"
+
+
+def test_cast_modes_are_stored():
+    for mode in ("half-even", "half-up"):
+        spec = _ok(lambda data, mode=mode: data["amounts"][0].__setitem__("cast", mode))
+        assert spec.amounts[0].cast == mode
+
+
+def test_unknown_cast_is_malformed():
+    message = _error(lambda data: data["amounts"][0].__setitem__("cast", "half-down"))
+    assert message == "amounts[0].cast must be one of 'half-even', 'half-up'"
+
+
+def test_cast_must_be_a_string():
+    assert (
+        _error(lambda data: data["amounts"][0].__setitem__("cast", True))
+        == "amounts[0].cast must be a string"
+    )
+    assert (
+        _error(lambda data: data["amounts"][0].__setitem__("cast", None))
+        == "amounts[0].cast must be a string"
+    )
+
+
+def test_scale_38_is_valid_and_39_is_malformed():
+    spec = _ok(lambda data: data["amounts"][0].__setitem__("scale", 38))
+    assert spec.amounts[0].scale == 38
+    message = _error(lambda data: data["amounts"][0].__setitem__("scale", 39))
+    assert message == "amounts[0].scale must be at most 38"

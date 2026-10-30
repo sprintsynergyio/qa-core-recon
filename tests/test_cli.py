@@ -160,6 +160,7 @@ def test_template_keys_in_order_and_tolerance_is_a_string():
         "group_by",
         "hash_columns",
         "tolerance",
+        "sampled",
         "allowlist",
     ]
     assert spec["tolerance"] == {"value": "0", "reason": ""}
@@ -298,3 +299,214 @@ def test_validate_missing_file_exits_refused(tmp_path, capsys):
     code = main(["validate", "--spec", str(missing)])
     captured = capsys.readouterr()
     _assert_stderr_line(code, captured, f"qa-core-recon: error: spec file not found: {missing}\n")
+
+
+def test_validate_without_check_data_does_not_open_datasets(monkeypatch, tmp_path, capsys):
+    def fail(*_args, **_kwargs):
+        raise AssertionError("datasets were opened")
+
+    monkeypatch.setattr("qa_core_recon.readers.check_data", fail)
+    target = _write_spec(tmp_path, TEMPLATE)
+    assert main(["validate", "--spec", str(target)]) is ExitCode.MATCH
+    assert capsys.readouterr().out == "spec ok\n"
+
+
+def _local_spec(tmp_path, source_body: str, target_body: str | None = None, **changes):
+    from tests.support import spec_data, write_csv, write_spec_file
+
+    source = tmp_path / "source.csv"
+    target = tmp_path / "target.csv"
+    write_csv(source, source_body)
+    write_csv(target, source_body if target_body is None else target_body)
+    data = spec_data(tmp_path, source, target, target_format="csv")
+    data.update(changes)
+    return write_spec_file(tmp_path, data)
+
+
+def test_check_data_prints_data_ok(tmp_path, capsys):
+    spec = _local_spec(tmp_path, "1,10.50,2024-01-01,a\n", "1,99.00,2024-01-01,b\n")
+    assert main(["validate", "--spec", str(spec), "--check-data"]) is ExitCode.MATCH
+    captured = capsys.readouterr()
+    assert captured.out == "data ok\n"
+    assert captured.err == ""
+
+
+def test_check_data_refuses_inexact_amount(tmp_path, capsys):
+    spec = _local_spec(tmp_path, "1,10.005,2024-01-01,a\n")
+    code = main(["validate", "--spec", str(spec), "--check-data"])
+    captured = capsys.readouterr()
+    _assert_stderr_line(
+        code,
+        captured,
+        "refused: inexact-amount: source amount column 'amount' value '10.005' "
+        "is not an exact decimal at scale 2\n",
+    )
+
+
+def test_check_data_refuses_sample_only_without_reading(tmp_path, capsys):
+    from tests.support import spec_data, write_spec_file
+
+    source = tmp_path / "absent-source.csv"
+    target = tmp_path / "absent-target.csv"
+    data = spec_data(tmp_path, source, target, target_format="csv")
+    data["sampled"] = True
+    spec = write_spec_file(tmp_path, data)
+    assert main(["validate", "--spec", str(spec)]) is ExitCode.MATCH
+    assert capsys.readouterr().out == "spec ok\n"
+    code = main(["validate", "--spec", str(spec), "--check-data"])
+    captured = capsys.readouterr()
+    _assert_stderr_line(
+        code,
+        captured,
+        "refused: sample-only: the spec declares sampling, so a full recon cannot be claimed\n",
+    )
+
+
+def test_check_data_refuses_unmapped_column(tmp_path, capsys):
+    from tests.support import spec_data, write_csv, write_spec_file
+
+    source = tmp_path / "source.csv"
+    target = tmp_path / "target.csv"
+    write_csv(source, "1,10.00,2024-01-01\n", header="txn_id,amount,day\n")
+    write_csv(target, "1,10.00,2024-01-01,a\n")
+    spec = write_spec_file(tmp_path, spec_data(tmp_path, source, target, target_format="csv"))
+    code = main(["validate", "--spec", str(spec), "--check-data"])
+    captured = capsys.readouterr()
+    _assert_stderr_line(
+        code,
+        captured,
+        "refused: unmapped-column: source is missing column 'note'\n",
+    )
+
+
+def test_check_data_refuses_float_amount(spark, tmp_path, capsys):
+    from pyspark.sql.types import DoubleType
+
+    from tests.support import spec_data, write_csv, write_spec_file
+    from tests.test_readers import _write_parquet
+
+    source = tmp_path / "source.csv"
+    target = tmp_path / "target"
+    write_csv(source, "1,10.00,2024-01-01,a\n")
+    _write_parquet(spark, target, [("1", 1.5, "2024-01-01", "a")], DoubleType())
+    spec = write_spec_file(tmp_path, spec_data(tmp_path, source, target))
+    code = main(["validate", "--spec", str(spec), "--check-data"])
+    captured = capsys.readouterr()
+    _assert_stderr_line(
+        code,
+        captured,
+        "refused: float-amount: target amount column 'amount' is double "
+        "and the spec has no cast rule\n",
+    )
+
+
+def test_check_data_path_not_allowed_wins_over_sample_only(tmp_path, capsys):
+    text = TEMPLATE.replace(b"path: ./data/raw/payments.csv", b"path: ./database/x.csv", 1)
+    text = text.replace(b"sampled: false", b"sampled: true", 1)
+    target = _write_spec(tmp_path, text)
+    code = main(["validate", "--spec", str(target), "--check-data"])
+    captured = capsys.readouterr()
+    _assert_stderr_line(
+        code,
+        captured,
+        "refused: path-not-allowed: source path './database/x.csv' is outside the allowlist\n",
+    )
+
+
+def test_check_data_s3_is_an_error_not_a_refusal(tmp_path, capsys):
+    from tests.support import spec_data, write_csv, write_spec_file
+
+    source = tmp_path / "source.csv"
+    write_csv(source, "1,10.00,2024-01-01,a\n")
+    data = spec_data(tmp_path, source, tmp_path / "unused.csv")
+    data["target"] = {"path": "s3://demo-bucket/curated/payments", "format": "parquet"}
+    data["allowlist"] = [str(tmp_path), "s3://demo-bucket"]
+    spec = write_spec_file(tmp_path, data)
+    code = main(["validate", "--spec", str(spec), "--check-data"])
+    captured = capsys.readouterr()
+    _assert_stderr_line(
+        code,
+        captured,
+        "qa-core-recon: error: s3 reads are not supported yet: "
+        "target path 's3://demo-bucket/curated/payments'\n",
+    )
+
+
+def test_check_data_output_is_deterministic(tmp_path, capsys):
+    spec = _local_spec(tmp_path, "1,10.005,2024-01-01,a\n2,9.001,2024-01-01,b\n")
+    first = main(["validate", "--spec", str(spec), "--check-data"])
+    first_captured = capsys.readouterr()
+    second = main(["validate", "--spec", str(spec), "--check-data"])
+    second_captured = capsys.readouterr()
+    assert first is second is ExitCode.REFUSED
+    assert first_captured.err == second_captured.err
+    assert "10.005" in first_captured.err
+    assert "9.001" not in first_captured.err
+
+
+def test_sample_only_and_s3_do_not_start_spark(monkeypatch, tmp_path, capsys):
+    def fail(*_args, **_kwargs):
+        raise AssertionError("spark started")
+
+    monkeypatch.setattr("qa_core_recon.spark.local_session", fail)
+    from tests.support import spec_data, write_spec_file
+
+    source = tmp_path / "absent-source.csv"
+    target = tmp_path / "absent-target.csv"
+    sampled = spec_data(tmp_path, source, target, target_format="csv")
+    sampled["sampled"] = True
+    spec = write_spec_file(tmp_path, sampled)
+    code = main(["validate", "--spec", str(spec), "--check-data"])
+    captured = capsys.readouterr()
+    _assert_stderr_line(
+        code,
+        captured,
+        "refused: sample-only: the spec declares sampling, so a full recon cannot be claimed\n",
+    )
+
+    source_file = tmp_path / "source.csv"
+    from tests.support import write_csv
+
+    write_csv(source_file, "1,10.00,2024-01-01,a\n")
+    remote = spec_data(tmp_path, source_file, tmp_path / "unused.csv")
+    remote["target"] = {"path": "s3://demo-bucket/curated/payments", "format": "parquet"}
+    remote["allowlist"] = [str(tmp_path), "s3://demo-bucket"]
+    spec = write_spec_file(tmp_path, remote)
+    code = main(["validate", "--spec", str(spec), "--check-data"])
+    captured = capsys.readouterr()
+    _assert_stderr_line(
+        code,
+        captured,
+        "qa-core-recon: error: s3 reads are not supported yet: "
+        "target path 's3://demo-bucket/curated/payments'\n",
+    )
+
+
+def test_malformed_csv_exits_refused(tmp_path, capsys):
+    from tests.support import spec_data, write_csv, write_spec_file
+
+    source = tmp_path / "source.csv"
+    target = tmp_path / "target.csv"
+    write_csv(source, "1,10.00\n")
+    write_csv(target, "1,10.00,2024-01-01,a\n")
+    spec = write_spec_file(tmp_path, spec_data(tmp_path, source, target, target_format="csv"))
+    code = main(["validate", "--spec", str(spec), "--check-data"])
+    captured = capsys.readouterr()
+    assert code is ExitCode.REFUSED
+    assert "qa-core-recon: error: source csv has a malformed row" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_check_data_process_exits(tmp_path):
+    spec = _local_spec(tmp_path, "1,10.00,2024-01-01,a\n")
+    result = subprocess.run(
+        [sys.executable, "-m", "qa_core_recon", "validate", "--spec", str(spec), "--check-data"],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=180,
+    )
+    assert result.returncode == 0
+    assert result.stdout == "data ok\n"
+    assert result.stderr == ""
+    assert "Traceback" not in result.stderr

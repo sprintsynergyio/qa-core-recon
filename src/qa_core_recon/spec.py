@@ -7,6 +7,11 @@ decides that two datasets differ, so it never uses exit code 1.
 Monetary amounts are parsed with Decimal from quoted strings. A YAML float is
 rejected and is never converted.
 
+Amount ``scale`` is an integer from 0 through 38, Spark's maximum decimal
+precision. An optional per-amount ``cast`` is ``half-even`` or ``half-up``.
+``sampled`` is a required boolean. A true value is stored on the spec and is
+refused when datasets are opened, not while parsing.
+
 Parsing uses PyYAML's safe loader. A duplicate key at any level is a malformed
 spec: the error names the key and its line. The last value is not kept.
 
@@ -24,6 +29,7 @@ from pathlib import Path
 
 import yaml
 
+from qa_core_recon.decimals import CAST_MODE_NAMES, DECIMAL_PRECISION
 from qa_core_recon.refusals import Refusal, RefusalCode, RefusalError
 
 SUPPORTED_VERSION = 1
@@ -38,6 +44,7 @@ _TOP_LEVEL = (
     "group_by",
     "hash_columns",
     "tolerance",
+    "sampled",
     "allowlist",
 )
 _REQUIRED = tuple(key for key in _TOP_LEVEL if key != "keys")
@@ -58,6 +65,7 @@ class Dataset:
 class Amount:
     column: str
     scale: int
+    cast: str | None = None
 
 
 @dataclass(frozen=True)
@@ -76,6 +84,7 @@ class Spec:
     group_by: tuple[str, ...]
     hash_columns: tuple[str, ...]
     tolerance: Tolerance
+    sampled: bool
     allowlist: tuple[str, ...]
 
 
@@ -163,6 +172,7 @@ def parse_spec(text: str) -> Spec:
     group_by = _name_list(data["group_by"], "group_by")
     hash_columns = _name_list(data["hash_columns"], "hash_columns")
     tolerance = _tolerance(data["tolerance"])
+    sampled = _sampled(data["sampled"])
     allowlist = _name_list(data["allowlist"], "allowlist")
 
     _require_location(source.path, "source.path")
@@ -197,6 +207,7 @@ def parse_spec(text: str) -> Spec:
         group_by=group_by,
         hash_columns=hash_columns,
         tolerance=tolerance,
+        sampled=sampled,
         allowlist=allowlist,
     )
 
@@ -248,7 +259,7 @@ def _amounts(value: object) -> tuple[Amount, ...]:
     for index, item in enumerate(value):
         label = f"amounts[{index}]"
         mapping = _require_mapping(item, label)
-        _reject_unknown(mapping, ("column", "scale"), label)
+        _reject_unknown(mapping, ("column", "scale", "cast"), label)
         if "column" not in mapping:
             raise SpecError(f"missing {label}.column")
         if "scale" not in mapping:
@@ -257,8 +268,29 @@ def _amounts(value: object) -> tuple[Amount, ...]:
         scale = _require_int(mapping["scale"], f"{label}.scale")
         if scale < 0:
             raise SpecError(f"{label}.scale must be zero or greater")
-        amounts.append(Amount(column=column, scale=scale))
+        if scale > DECIMAL_PRECISION:
+            raise SpecError(f"{label}.scale must be at most {DECIMAL_PRECISION}")
+        cast = _optional_cast(mapping, label)
+        amounts.append(Amount(column=column, scale=scale, cast=cast))
     return tuple(amounts)
+
+
+def _optional_cast(mapping: dict, label: str) -> str | None:
+    if "cast" not in mapping:
+        return None
+    cast = _require_str(mapping["cast"], f"{label}.cast")
+    if cast not in CAST_MODE_NAMES:
+        allowed = ", ".join(repr(mode) for mode in CAST_MODE_NAMES)
+        raise SpecError(f"{label}.cast must be one of {allowed}")
+    return cast
+
+
+def _sampled(value: object) -> bool:
+    # A YAML boolean only. A string such as "false" must not count as false,
+    # or an omitted decision could be smuggled in as text.
+    if not isinstance(value, bool):
+        raise SpecError("sampled must be a boolean")
+    return value
 
 
 def _tolerance(value: object) -> Tolerance:
