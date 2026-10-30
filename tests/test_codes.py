@@ -18,6 +18,7 @@ def test_refusal_code_values_in_order():
     assert [code.value for code in RefusalCode] == [
         "missing-key",
         "float-amount",
+        "inexact-amount",
         "tolerance-without-reason",
         "unmapped-column",
         "path-not-allowed",

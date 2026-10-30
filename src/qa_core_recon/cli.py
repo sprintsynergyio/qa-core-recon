@@ -76,9 +76,27 @@ def _init(args: argparse.Namespace) -> ExitCode:
 
 
 def _validate(args: argparse.Namespace) -> ExitCode:
-    load_spec(Path(args.spec))
-    print("spec ok")
-    return ExitCode.MATCH
+    spec = load_spec(Path(args.spec))
+    if not args.check_data:
+        print("spec ok")
+        return ExitCode.MATCH
+    # Imported here so init and a spec-only validate do not load PySpark.
+    from qa_core_recon.readers import ReadError, check_data
+    from qa_core_recon.spark import local_session, local_session_active, stop_local_session
+
+    created = not local_session_active()
+    spark = local_session()
+    try:
+        check_data(spark, spec)
+    except ReadError as exc:
+        _print_error(str(exc))
+        return ExitCode.REFUSED
+    else:
+        print("data ok")
+        return ExitCode.MATCH
+    finally:
+        if created:
+            stop_local_session()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -97,6 +115,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     validate = commands.add_parser("validate", help="check that a recon.yaml spec is usable")
     validate.add_argument("--spec", required=True, help="path to the spec file")
+    validate.add_argument(
+        "--check-data",
+        action="store_true",
+        help="open both datasets and run the data-level refusals",
+    )
     validate.set_defaults(handler=_validate)
 
     return parser
