@@ -10,7 +10,7 @@ from qa_core_recon import __version__
 from qa_core_recon.cli import main
 from qa_core_recon.compare import DUPLICATE_EXAMPLE_LIMIT
 from qa_core_recon.exit_codes import ExitCode
-from qa_core_recon.spark import IcebergRuntimeError
+from qa_core_recon.spark import IcebergRuntimeError, SessionStartError
 from tests.support import spec_data, write_csv, write_spec_file
 from tests.test_iceberg import _schema, _write_iceberg
 from tests.test_readers import _write_parquet
@@ -608,6 +608,20 @@ def test_group_sum_overflow_is_a_read_error_even_when_the_total_cancels(tmp_path
         captured,
         "source amount column 'amount' group sum does not fit decimal(38, 2)",
     )
+    assert not out.exists()
+
+
+def test_session_start_error_writes_no_report(monkeypatch, tmp_path, capsys):
+    def boom(*_args, **_kwargs):
+        raise SessionStartError("cannot start the local Spark session: boom")
+
+    monkeypatch.setattr("qa_core_recon.spark.local_session", boom)
+    monkeypatch.setattr("qa_core_recon.spark.local_session_active", lambda: False)
+    spec, _source, _target = _pair(tmp_path, ROW, ROW)
+    out = tmp_path / "out"
+    code = _invoke(spec, out)
+    captured = capsys.readouterr()
+    _assert_error(code, captured, "cannot start the local Spark session: boom")
     assert not out.exists()
 
 

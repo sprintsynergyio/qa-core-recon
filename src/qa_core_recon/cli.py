@@ -79,7 +79,7 @@ def _run(args: argparse.Namespace) -> ExitCode:
     # Imported here so init and a spec-only validate do not load PySpark.
     from qa_core_recon.readers import ReadError
     from qa_core_recon.report import OutputError, ensure_output_available
-    from qa_core_recon.spark import IcebergRuntimeError
+    from qa_core_recon.spark import SessionStartError
 
     try:
         out = ensure_output_available(args.out, force=args.force)
@@ -94,7 +94,7 @@ def _run(args: argparse.Namespace) -> ExitCode:
     except ReadError as exc:
         _print_error(str(exc))
         return ExitCode.REFUSED
-    except IcebergRuntimeError as exc:
+    except SessionStartError as exc:
         _print_error(str(exc))
         return ExitCode.REFUSED
 
