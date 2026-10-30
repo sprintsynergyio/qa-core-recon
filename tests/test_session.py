@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 import pytest
@@ -129,6 +130,53 @@ def test_local_session_keeps_a_generic_start_error(spark, monkeypatch, tmp_path)
         _call_local_session_with_failed_start(monkeypatch, cache, "JAVA_GATEWAY_EXITED")
     assert not isinstance(caught.value, IcebergRuntimeError)
     assert str(caught.value) == "cannot start the local Spark session: JAVA_GATEWAY_EXITED"
+
+
+def _failed_get_or_create(stderr: bytes):
+    def fail(_self):
+        os.write(2, stderr)
+        raise RuntimeError("[JAVA_GATEWAY_EXITED] Java gateway process exited")
+
+    return fail
+
+
+def _local_session_with_fake_start(monkeypatch, cache: Path, stderr: bytes):
+    from pyspark.sql import SparkSession
+
+    import qa_core_recon.spark as spark_mod
+
+    monkeypatch.setattr(spark_mod, "ivy_cache_dir", lambda: cache)
+    monkeypatch.setattr(spark_mod, "_session", None)
+    monkeypatch.setattr(spark_mod, "_warehouse", None)
+    monkeypatch.setattr(spark_mod, "_iceberg_ready", False)
+    monkeypatch.setattr(SparkSession.Builder, "getOrCreate", _failed_get_or_create(stderr))
+    return local_session(iceberg=True)
+
+
+def test_startup_log_marks_an_unresolved_runtime(spark, monkeypatch, tmp_path):
+    cache = tmp_path / "empty-ivy"
+    log = (
+        b":: UNRESOLVED DEPENDENCIES ::\n"
+        b"unresolved dependency: org.apache.iceberg#"
+        b"iceberg-spark-runtime-3.5_2.12;1.7.1: not found\n"
+    )
+    with pytest.raises(IcebergRuntimeError) as caught:
+        _local_session_with_fake_start(monkeypatch, cache, log)
+    assert str(caught.value) == missing_runtime_message(cache)
+    assert "UNRESOLVED" not in str(caught.value)
+    assert "JAVA_GATEWAY" not in str(caught.value)
+
+
+def test_startup_log_keeps_a_broken_java_home_generic(spark, monkeypatch, tmp_path):
+    cache = tmp_path / "empty-ivy"
+    log = b"Error: JAVA_HOME is set to an invalid directory\n"
+    with pytest.raises(SessionStartError) as caught:
+        _local_session_with_fake_start(monkeypatch, cache, log)
+    assert not isinstance(caught.value, IcebergRuntimeError)
+    assert str(caught.value) == (
+        "cannot start the local Spark session: [JAVA_GATEWAY_EXITED] Java gateway process exited"
+    )
+    assert "JAVA_HOME" not in str(caught.value)
 
 
 def test_session_leaves_no_hive_files_in_the_repo(spark):

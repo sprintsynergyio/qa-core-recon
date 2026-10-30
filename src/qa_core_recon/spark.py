@@ -120,8 +120,17 @@ def runtime_jar_cached(cache: Path) -> bool:
 
 
 def _dependency_resolution_failure(exc: BaseException) -> bool:
-    """True when Spark's output says Ivy could not resolve a package."""
-    text = str(exc).lower()
+    """True when Spark's output says Ivy could not resolve a package.
+
+    Ivy writes ``:: UNRESOLVED DEPENDENCIES ::`` to the process stderr, not
+    into the exception text. ``_start_quietly`` keeps that text on
+    ``startup_log`` so it can be classified without being shown to the user.
+    """
+    parts = [str(exc)]
+    log = getattr(exc, "startup_log", None)
+    if isinstance(log, str) and log:
+        parts.append(log)
+    text = "\n".join(parts).lower()
     return "unresolved dependency" in text or "ivy" in text
 
 
@@ -226,7 +235,8 @@ def _start_quietly(builder: SparkSession.Builder) -> SparkSession:
     The JVM writes its banner to file descriptor 2, and Ivy writes a settings
     line to file descriptor 1. Redirecting Python's ``sys`` streams does not
     catch either, so both descriptors are pointed at a temporary file for the
-    duration of startup and then restored.
+    duration of startup and then restored. On failure the captured text is
+    kept on the raised error for classification. It is not part of the message.
     """
     captured = tempfile.NamedTemporaryFile(prefix="qa-core-recon-spark-log-", delete=False)
     saved_out = os.dup(1)
@@ -239,8 +249,15 @@ def _start_quietly(builder: SparkSession.Builder) -> SparkSession:
         except Exception as exc:
             os.dup2(saved_out, 1)
             os.dup2(saved_err, 2)
+            captured.flush()
+            try:
+                startup_log = Path(captured.name).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                startup_log = ""
             detail = " ".join(str(exc).split()) or exc.__class__.__name__
-            raise RuntimeError(f"cannot start the local Spark session: {detail}") from None
+            error = RuntimeError(f"cannot start the local Spark session: {detail}")
+            error.startup_log = startup_log
+            raise error from None
     finally:
         os.dup2(saved_out, 1)
         os.dup2(saved_err, 2)
