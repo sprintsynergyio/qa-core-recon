@@ -10,12 +10,20 @@ A value is exact at the spec scale when it equals the same number quantized to
 that scale. Trailing zeros are exact: ``10.500`` at scale 2 is ``10.50``.
 Extra non-zero fractional digits are not: ``10.005`` at scale 2 is refused.
 Equivalent spellings of the same number (``100`` and ``1e2``) are exact.
+A text amount must be ASCII: optional surrounding whitespace, an optional
+sign, digits with an optional fraction, and an optional exponent. Underscores
+and other digit scripts are refused.
 
 A cast rule does not relax this test for strings, integers, or decimals. It
 only authorizes rounding a float or double with ``half-even`` or ``half-up``.
+The float is taken from its shortest decimal spelling (``repr``), which is
+what Spark's ``cast`` uses. Rounding the exact binary value of ``2.675``
+with half-up would produce ``2.67``. ``Decimal(repr(2.675))`` half-up at
+scale 2 is ``2.68``.
 """
 
 import math
+import re
 from decimal import (
     ROUND_HALF_EVEN,
     ROUND_HALF_UP,
@@ -38,6 +46,14 @@ CAST_ROUNDING = {
 # context (28 digits) rounding it first. The digit check then refuses it.
 _CONTEXT = Context(prec=100)
 
+# ASCII only. ``re.ASCII`` keeps ``\\d`` and ``\\s`` off Unicode digits and
+# Unicode whitespace, so ``1_000``, Arabic-Indic digits, and fullwidth digits
+# fail closed. ``1e2`` and ``+10.5`` still match.
+_AMOUNT_TEXT = re.compile(
+    r"\s*[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?\s*\Z",
+    re.ASCII,
+)
+
 
 class InexactAmount(ValueError):
     """A cell cannot be represented at the spec scale without rounding."""
@@ -57,9 +73,11 @@ def to_decimal(raw: object, scale: int, cast: str | None) -> Decimal | None:
     if raw is None:
         return None
     if isinstance(raw, str):
-        text = raw.strip()
-        if text == "":
+        if raw.strip() == "":
             return None
+        if _AMOUNT_TEXT.fullmatch(raw) is None:
+            raise InexactAmount(raw.strip())
+        text = raw.strip()
         try:
             value = Decimal(text)
         except InvalidOperation:
@@ -98,7 +116,8 @@ def _from_float(raw: float, scale: int, cast: str | None, display: str) -> Decim
     quantum = Decimal(1).scaleb(-scale)
     with localcontext(_CONTEXT):
         try:
-            fitted = Decimal.from_float(raw).quantize(quantum, rounding=CAST_ROUNDING[cast])
+            # Shortest round-trip spelling, not the exact binary expansion.
+            fitted = Decimal(repr(raw)).quantize(quantum, rounding=CAST_ROUNDING[cast])
         except InvalidOperation:
             raise InexactAmount(display) from None
     return _fit_precision(fitted, display)

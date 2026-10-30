@@ -17,10 +17,11 @@ and dropped so the CLI's stderr stays limited to refusals and errors.
 
 The first call creates the session. Later calls in the same process return
 that session. Spark allows one context per JVM, so a stopped session is not
-replaced here.
+replaced here. Stopping the session deletes its temporary directory.
 """
 
 import os
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -30,6 +31,7 @@ from pyspark.sql import SparkSession
 os.environ.setdefault("SPARK_LOCAL_IP", "127.0.0.1")
 
 _session: SparkSession | None = None
+_warehouse: Path | None = None
 
 
 def local_session_active() -> bool:
@@ -39,7 +41,7 @@ def local_session_active() -> bool:
 
 def local_session(warehouse: Path | None = None) -> SparkSession:
     """Return the process-wide local session, creating it on the first call."""
-    global _session
+    global _session, _warehouse
     if _session is not None:
         return _session
 
@@ -73,14 +75,20 @@ def local_session(warehouse: Path | None = None) -> SparkSession:
         .config("spark.jars.ivy", str(ivy))
         .config("spark.sql.caseSensitive", "true")
         .config("spark.sql.execution.arrow.pyspark.enabled", "false")
+        .config("spark.sql.csv.parser.columnPruning.enabled", "false")
         .config("spark.driver.extraJavaOptions", java_options)
         .config("spark.executor.extraJavaOptions", java_options)
         .config("spark.pyspark.python", sys.executable)
         .config("spark.pyspark.driver.python", sys.executable)
     )
-    session = _start_quietly(builder)
-    session.sparkContext.setLogLevel("ERROR")
+    try:
+        session = _start_quietly(builder)
+        session.sparkContext.setLogLevel("ERROR")
+    except Exception:
+        shutil.rmtree(root, ignore_errors=True)
+        raise
     _session = session
+    _warehouse = root
     return session
 
 
@@ -109,9 +117,13 @@ def _start_quietly(builder: SparkSession.Builder) -> SparkSession:
 
 
 def stop_local_session() -> None:
-    """Stop the session created by :func:`local_session`, if there is one."""
-    global _session
+    """Stop the session and delete its temporary directory."""
+    global _session, _warehouse
     session = _session
+    root = _warehouse
     _session = None
+    _warehouse = None
     if session is not None:
         session.stop()
+    if root is not None:
+        shutil.rmtree(root, ignore_errors=True)

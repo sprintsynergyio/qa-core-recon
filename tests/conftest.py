@@ -22,3 +22,5 @@ def spark():
     session = local_session(warehouse)
     yield session
     stop_local_session()
+    if warehouse.exists():
+        raise AssertionError(f"spark temp dir was not removed: {warehouse}")

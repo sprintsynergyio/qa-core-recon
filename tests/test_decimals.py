@@ -14,6 +14,7 @@ def test_exact_strings_quantize_to_the_spec_scale():
     assert to_decimal("+10.00", 2, None) == Decimal("10.00")
     assert to_decimal("-1.20", 2, None) == Decimal("-1.20")
     assert to_decimal("1e2", 2, None) == Decimal("100.00")
+    assert to_decimal("+10.5", 2, None) == Decimal("10.50")
     assert to_decimal("1.005e1", 2, None) == Decimal("10.05")
     assert to_decimal("0", 0, None) == Decimal("0")
     assert to_decimal("10.0", 0, None) == Decimal("10")
@@ -70,6 +71,9 @@ def test_cast_does_not_round_a_string_or_a_decimal():
 def test_float_cast_uses_the_named_mode():
     assert to_decimal(2.5, 0, "half-even") == Decimal("2")
     assert to_decimal(2.5, 0, "half-up") == Decimal("3")
+    # Shortest spelling, matching Spark cast(2.675 as decimal(38, 2)).
+    assert to_decimal(2.675, 2, "half-up") == Decimal("2.68")
+    assert to_decimal(2.675, 2, "half-even") == Decimal("2.68")
     with pytest.raises(InexactAmount):
         to_decimal(2.5, 0, None)
     with pytest.raises(InexactAmount) as caught:
@@ -93,6 +97,20 @@ def test_precision_boundary_uses_38_digits():
     assert to_decimal("9" * 38, 0, None) == Decimal("9" * 38)
     with pytest.raises(InexactAmount):
         to_decimal("9" * 39, 0, None)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "1_000",
+        "\u0661",  # Arabic-Indic digit one
+        "\uff11",  # fullwidth digit one
+    ],
+)
+def test_underscore_and_non_ascii_digits_are_inexact(text):
+    with pytest.raises(InexactAmount) as caught:
+        to_decimal(text, 2, None)
+    assert caught.value.display == text
 
 
 def test_long_offending_text_is_clipped():

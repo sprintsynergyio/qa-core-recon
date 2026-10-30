@@ -74,7 +74,7 @@ A malformed spec, a refusal, an unreadable spec file, an unreadable dataset, and
 | ---- | ------- |
 | `missing-key` | the spec has no business key, or the key is not unique and no rule says how to handle that. |
 | `float-amount` | an amount column is float or double and the spec has no cast rule to a decimal scale. |
-| `inexact-amount` | an amount value is not an exact decimal at the spec scale, or the column type cannot be read as a decimal. |
+| `inexact-amount` | an amount value is not an exact decimal at the spec scale, or the column type is not a number type. |
 | `tolerance-without-reason` | a tolerance above zero is set with no written reason. |
 | `unmapped-column` | a column named in the spec is missing from the source or the target. |
 | `path-not-allowed` | a path is outside the allowlist (local disk and the moto S3 bucket in the MVP). |
@@ -101,7 +101,7 @@ These run only with `--check-data`, after the spec-level checks have passed.
 | `sample-only` | `sampled` is true. Decided before either dataset is opened. |
 | `unmapped-column` | A key, amount, `group_by`, or hash column is missing. The message names the side and the column. |
 | `float-amount` | A Parquet amount column is float or double and that amount has no `cast` rule. |
-| `inexact-amount` | An amount value is not an exact decimal at the spec scale, or the column type cannot be read as a decimal. |
+| `inexact-amount` | An amount value is not an exact decimal at the spec scale, or the column type is not a number type. |
 
 First match wins, in this order:
 
@@ -121,7 +121,7 @@ The Spark session is local mode on one thread (`local[1]`), with `spark.sql.shuf
 
 Column names are case sensitive. `Amount` does not satisfy a spec column named `amount`.
 
-CSV is read from a file, or from a directory of part files. Marker files whose names start with `.` or `_` are skipped, so a Spark `_SUCCESS` file is not treated as a header. Every part file must use the header of the first file in sorted name order. The header becomes an explicit string schema, and `inferSchema` is off. Amount columns are parsed from those strings. A CSV amount is never a float, so a CSV file does not produce `float-amount`.
+CSV is read from a file, or from a directory of part files. Marker files whose names start with `.` or `_` are skipped, so a Spark `_SUCCESS` file is not treated as a header. Every part file must use the header of the first file in sorted name order. A leading UTF-8 BOM is stripped from that header, so it does not rename the first column. The header becomes an explicit string schema, and `inferSchema` is off. The read uses `FAILFAST`, and `spark.sql.csv.parser.columnPruning.enabled` is false, so every field of every row is parsed. A short row or an unescaped multi-line field is a read error: `source csv has a malformed row`. Amount columns are parsed from those strings. A CSV amount is never a float, so a CSV file does not produce `float-amount`.
 
 Parquet is read from a file or a directory, with `mergeSchema` off. The file schema is kept until amount columns are retyped.
 
@@ -129,7 +129,7 @@ Readers read every row. They do not sample, limit, or keep a head. `sampled: tru
 
 Blank amount cells are null. They are not turned into zero. Null counts arrive with `run`.
 
-A missing path, a CSV file that is not UTF-8, or a file that Spark cannot read is a read error (`qa-core-recon: error:`), exit 2. It is not a refusal code.
+A missing path, a CSV file that is not UTF-8, a malformed CSV row, or a file that Spark cannot read is a read error (`qa-core-recon: error:`), exit 2. It is not a refusal code.
 
 ## Decimal Rules
 
@@ -137,15 +137,17 @@ Each amount column is read as Spark `decimal(38, scale)`. 38 is Spark's maximum 
 
 Parsing is exact. A value is accepted when it equals the same number quantized to the spec scale. At scale 2, `10`, `10.5`, `10.50`, and `10.500` are exact (`10.00` or `10.50`). `10.005` is refused. Trailing zeros add no new information. Extra non-zero fractional digits would have to be rounded, and this tool does not invent a rounded amount. Equivalent spellings of one number, such as `100` and `1e2`, are the same value.
 
+A text amount is ASCII only: optional surrounding whitespace, an optional sign, digits, an optional fraction, and an optional exponent such as `1e2` or `+10.5`. `1_000`, Arabic-Indic digits, and fullwidth digits are `inexact-amount`.
+
 That refusal is `inexact-amount`, exit 2. It is not a mismatch. A mismatch means the target differs from the source, and exit 1 is reserved for `run`. A value that does not fit the declared scale gives the tool no amount to compare.
 
-`amounts[].cast` is optional. The only values are `half-even` and `half-up`. When it is present, a Parquet float or double amount column is rounded to the spec scale with that mode. The rule does not authorize rounding a CSV string, an integer, or a Parquet decimal. `10.005` at scale 2 is still `inexact-amount` when `cast` is set. Without `cast`, a float or double amount column is `float-amount` and its values are not read.
+`amounts[].cast` is optional. The only values are `half-even` and `half-up`. When it is present, a Parquet float or double amount column is rounded to the spec scale with that mode. The value that is rounded is the shortest decimal spelling of the float (`repr`), which is the spelling Spark's `cast` uses. `2.675` at scale 2 is `2.68` for both `half-up` and `half-even`. The rule does not authorize rounding a CSV string, an integer, or a Parquet decimal. `10.005` at scale 2 is still `inexact-amount` when `cast` is set. Without `cast`, a float or double amount column is `float-amount` and its values are not read.
 
 Non-finite values (`NaN`, `Infinity`) are `inexact-amount` even when a cast rule is present. A rounding mode does not define a decimal for them.
 
 Integer Parquet columns are whole amounts. `1050` at scale 2 becomes `1050.00`. The reader does not treat an integer as minor units.
 
-A column type other than string, decimal, integer, float, or double (for example boolean) is `inexact-amount`. Float and double without `cast` are `float-amount` instead, because that refusal is more specific.
+A column type other than string, decimal, integer, float, or double (for example boolean) is `inexact-amount`. The message names the side, the column, and the type, and says that type is not a number type. Float and double without `cast` are `float-amount` instead, because that refusal is more specific.
 
 ## Spec File
 
@@ -164,7 +166,7 @@ A column type other than string, decimal, integer, float, or double (for example
 
 Unknown keys are rejected. Column names are non-empty single-line strings. Formats and the version number are exact: `csv`, `parquet`, and integer `1`.
 
-`sampled` must be a real boolean. Write `true` or `false`. A string such as `"false"` is a malformed spec. A missing `sampled` is a malformed spec, so an omitted declaration cannot be treated as a full reconciliation. `sampled: true` loads successfully. `validate` prints `spec ok`. `validate --check-data` refuses with `sample-only`.
+`sampled` must be a real boolean. Write `true` or `false`. A string such as `"false"` is a malformed spec. A missing `sampled` is a malformed spec, so an omitted declaration cannot be treated as a full reconciliation. A spec written by an earlier `init`, before this field existed, must add `sampled: false` before it will validate. `sampled: true` loads successfully. `validate` prints `spec ok`. `validate --check-data` refuses with `sample-only` and does not start Spark. An allowlisted `s3://` path is also reported before Spark starts.
 
 `amounts[].cast`, when present, must be the string `half-even` or `half-up`. Null, a number, or any other string is a malformed spec. Omitting the key means there is no cast rule.
 

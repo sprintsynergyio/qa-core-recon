@@ -73,6 +73,51 @@ def test_csv_amounts_are_exact_decimals_and_other_columns_stay_strings(spark, tm
     assert _amounts(loaded_target)["1"] == Decimal("10.10")
 
 
+def test_inexact_value_is_independent_of_row_order(spark, tmp_path):
+    target = tmp_path / "target.csv"
+    write_csv(target, ROW)
+    low_first = tmp_path / "low-first.csv"
+    high_first = tmp_path / "high-first.csv"
+    write_csv(low_first, "1,10.005,2024-01-01,a\n2,9.001,2024-01-01,b\n")
+    write_csv(high_first, "1,9.001,2024-01-01,a\n2,10.005,2024-01-01,b\n")
+    first = _refusal(spark, _spec(tmp_path, low_first, target, target_format="csv"))
+    second = _refusal(spark, _spec(tmp_path, high_first, target, target_format="csv"))
+    assert first == second
+    assert first.code is RefusalCode.INEXACT_AMOUNT
+    assert first.message == (
+        "source amount column 'amount' value '10.005' is not an exact decimal at scale 2"
+    )
+
+
+def test_csv_bom_does_not_rename_the_first_column(spark, tmp_path):
+    source = tmp_path / "source.csv"
+    target = tmp_path / "target.csv"
+    text = HEADER + ROW
+    source.write_bytes(b"\xef\xbb\xbf" + text.encode("utf-8"))
+    target.write_text(text, encoding="utf-8")
+    check_data(spark, _spec(tmp_path, source, target, target_format="csv"))
+
+
+def test_short_csv_row_is_a_read_error(spark, tmp_path):
+    source = tmp_path / "source.csv"
+    target = tmp_path / "target.csv"
+    write_csv(source, "1,10.00\n")
+    write_csv(target, ROW)
+    with pytest.raises(ReadError) as caught:
+        check_data(spark, _spec(tmp_path, source, target, target_format="csv"))
+    assert str(caught.value) == "source csv has a malformed row"
+
+
+def test_unescaped_multiline_csv_field_is_a_read_error(spark, tmp_path):
+    source = tmp_path / "source.csv"
+    target = tmp_path / "target.csv"
+    source.write_text('txn_id,amount,day,note\n1,10.00,"hello\nworld",a\n', encoding="utf-8")
+    write_csv(target, ROW)
+    with pytest.raises(ReadError) as caught:
+        check_data(spark, _spec(tmp_path, source, target, target_format="csv"))
+    assert str(caught.value) == "source csv has a malformed row"
+
+
 def test_csv_value_that_does_not_fit_the_scale_is_refused(spark, tmp_path):
     source, target = _pair(tmp_path, "1,10.005,2024-01-01,a\n")
     spec = _spec(tmp_path, source, target, target_format="csv")
@@ -228,7 +273,7 @@ def test_boolean_amount_cannot_be_read_as_a_decimal(spark, tmp_path):
     refusal = _refusal(spark, _spec(tmp_path, source, target))
     assert refusal.code is RefusalCode.INEXACT_AMOUNT
     assert refusal.message == (
-        "target amount column 'amount' has type boolean, which cannot be read as a decimal"
+        "target amount column 'amount' has type boolean, which is not a number type"
     )
 
 

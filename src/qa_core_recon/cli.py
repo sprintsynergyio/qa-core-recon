@@ -81,7 +81,15 @@ def _validate(args: argparse.Namespace) -> ExitCode:
         print("spec ok")
         return ExitCode.MATCH
     # Imported here so init and a spec-only validate do not load PySpark.
-    from qa_core_recon.readers import ReadError, check_data
+    # sample-only and s3 are decided before the session, so they do not start a JVM.
+    from qa_core_recon.readers import ReadError, check_before_session, check_data
+
+    try:
+        check_before_session(spec)
+    except ReadError as exc:
+        _print_error(str(exc))
+        return ExitCode.REFUSED
+
     from qa_core_recon.spark import local_session, local_session_active, stop_local_session
 
     created = not local_session_active()

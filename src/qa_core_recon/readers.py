@@ -18,8 +18,9 @@ keeps the file schema. ``mergeSchema`` is off.
 3. ``float-amount`` when a Parquet amount column is float or double and that
    amount has no cast rule. Source, then target, then spec order.
 4. ``inexact-amount`` when a value is not an exact decimal at the spec scale,
-   or the column type cannot be read as a decimal. The reported cell is the
-   lexicographically smallest offending text in that column.
+   or the column type is not a number type. The reported cell is the
+   lexicographically smallest offending text in that column. The scan runs
+   inside Spark and only that one value is returned to the driver.
 
 ``path-not-allowed`` is re-checked before those reads. An allowlisted ``s3://``
 path raises :class:`ReadError` instead, because the allowlist already passed.
@@ -30,6 +31,7 @@ from pathlib import Path
 
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql.functions import col, udf
+from pyspark.sql.functions import min as spark_min
 from pyspark.sql.types import (
     ByteType,
     DataType,
@@ -56,6 +58,18 @@ class ReadError(ValueError):
     """The dataset could not be opened. This is not a comparison result."""
 
 
+def check_before_session(spec: Spec) -> None:
+    """Raise sample-only or the S3 read error before a JVM is started."""
+    if spec.sampled:
+        raise RefusalError(
+            Refusal(
+                RefusalCode.SAMPLE_ONLY,
+                "the spec declares sampling, so a full recon cannot be claimed",
+            )
+        )
+    _reject_remote_or_unlisted(spec)
+
+
 def check_data(spark: SparkSession, spec: Spec) -> None:
     """Open both datasets and raise the first data-level refusal."""
     _prepare(spark, spec)
@@ -71,14 +85,7 @@ def read_datasets(spark: SparkSession, spec: Spec) -> tuple[DataFrame, DataFrame
 
 
 def _prepare(spark: SparkSession, spec: Spec) -> tuple[DataFrame, DataFrame]:
-    if spec.sampled:
-        raise RefusalError(
-            Refusal(
-                RefusalCode.SAMPLE_ONLY,
-                "the spec declares sampling, so a full recon cannot be claimed",
-            )
-        )
-    _reject_remote_or_unlisted(spec)
+    check_before_session(spec)
     source = _open(spark, spec.source, "source")
     target = _open(spark, spec.target, "target")
     _refuse_unmapped(source, "source", spec)
@@ -147,7 +154,7 @@ def _refuse_inexact(df: DataFrame, side: str, spec: Spec) -> None:
                     RefusalCode.INEXACT_AMOUNT,
                     (
                         f"{side} amount column {amount.column!r} has type "
-                        f"{dtype.simpleString()}, which cannot be read as a decimal"
+                        f"{dtype.simpleString()}, which is not a number type"
                     ),
                 )
             )
@@ -166,23 +173,26 @@ def _refuse_inexact(df: DataFrame, side: str, spec: Spec) -> None:
             )
 
 
+def _bad_text(scale: int, cast: str | None):
+    """Return the clipped text of a bad cell, or null when the cell is exact."""
+
+    def parse(value: object) -> str | None:
+        try:
+            to_decimal(value, scale, cast)
+        except InexactAmount as exc:
+            return exc.display
+        return None
+
+    return udf(parse, StringType())
+
+
 def _first_inexact(df: DataFrame, amount: Amount, kind: str, side: str, spec: Spec) -> str | None:
     use_cast = amount.cast if kind == "float" else None
-    best: str | None = None
-    for raw in _column_values(df, amount.column, side, spec):
-        try:
-            to_decimal(raw, amount.scale, use_cast)
-        except InexactAmount as exc:
-            if best is None or exc.display < best:
-                best = exc.display
-    return best
-
-
-def _column_values(df: DataFrame, column: str, side: str, spec: Spec):
+    marker = _bad_text(amount.scale, use_cast)(_column(amount.column))
     dataset = spec.source if side == "source" else spec.target
     try:
-        for row in df.select(_column(column)).toLocalIterator():
-            yield row[0]
+        # min ignores nulls, so only the smallest bad text reaches the driver.
+        return df.select(marker.alias("bad")).agg(spark_min("bad")).first()[0]
     except Exception:
         raise ReadError(f"cannot read {side} as {dataset.format}") from None
 
@@ -251,6 +261,7 @@ def _open(spark: SparkSession, dataset: Dataset, side: str) -> DataFrame:
     try:
         if dataset.format == "csv":
             frame = _read_csv(spark, location, side)
+            _parse_all_csv_rows(frame, side)
         else:
             frame = spark.read.option("mergeSchema", "false").parquet(dataset.path)
         # Touch the schema so a corrupt file fails here, with a stable message.
@@ -296,6 +307,17 @@ def _read_csv(spark: SparkSession, location: Path, side: str) -> DataFrame:
     )
 
 
+def _parse_all_csv_rows(df: DataFrame, side: str) -> None:
+    """Parse every field so a short or broken row cannot be skipped."""
+    columns = [_column(name) for name in df.columns]
+    if not columns:
+        return
+    try:
+        df.select(*columns).count()
+    except Exception:
+        raise ReadError(f"{side} csv has a malformed row") from None
+
+
 def _csv_files(location: Path, side: str) -> list[Path]:
     if location.is_file():
         return [location]
@@ -312,7 +334,7 @@ def _csv_files(location: Path, side: str) -> list[Path]:
 
 def _first_line(path: Path, side: str) -> str:
     try:
-        with path.open("r", encoding="utf-8", newline="") as handle:
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
             line = handle.readline()
     except UnicodeDecodeError:
         raise ReadError(f"{side} csv is not valid UTF-8") from None

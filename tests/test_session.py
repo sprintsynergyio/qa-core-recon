@@ -14,6 +14,7 @@ def test_session_is_local_and_fixed(spark):
     assert spark.conf.get("spark.driver.bindAddress") == "127.0.0.1"
     assert spark.conf.get("spark.sql.caseSensitive") == "true"
     assert spark.conf.get("spark.sql.execution.arrow.pyspark.enabled") == "false"
+    assert spark.conf.get("spark.sql.csv.parser.columnPruning.enabled") == "false"
     assert local_session() is spark
 
 
