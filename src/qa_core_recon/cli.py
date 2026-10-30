@@ -86,11 +86,6 @@ def _run(args: argparse.Namespace) -> ExitCode:
     except OutputError as exc:
         _print_error(str(exc))
         return ExitCode.REFUSED
-    # Drop any previous report before the spec is read. A later read error,
-    # overflow, or session failure then leaves no report behind.
-    if out.is_dir():
-        (out / "report.json").unlink(missing_ok=True)
-        (out / "report.md").unlink(missing_ok=True)
     try:
         return _execute_run(Path(args.spec), out)
     except OutputError as exc:
@@ -121,10 +116,16 @@ def _execute_run(spec_path: Path, out: Path) -> ExitCode:
         spec_sha256,
     )
     from qa_core_recon.spark import local_session, local_session_active, stop_local_session
+    from qa_core_recon.spec import enforce_spec_refusals, load_spec_shape
 
+    # Shape only. A malformed spec raises SpecError and leaves --out untouched.
+    spec = load_spec_shape(spec_path)
+    reject_output_overlap(out, spec.source.path, spec.target.path)
+    # Previous reports go away only after the path is accepted, so a data file
+    # named report.json inside a refused output directory is left in place.
+    _drop_previous_reports(out)
     try:
-        spec = load_spec(spec_path)
-        reject_output_overlap(out, spec.source.path, spec.target.path)
+        enforce_spec_refusals(spec)
         # sample-only and s3 are decided here, before a JVM starts.
         check_before_session(spec)
     except RefusalError as exc:
@@ -149,6 +150,19 @@ def _execute_run(spec_path: Path, out: Path) -> ExitCode:
     publish(out, report, render_markdown(report))
     print(report["status"])
     return exit_code_for(report["status"])
+
+
+def _drop_previous_reports(out: Path) -> None:
+    """Remove a previous report so a later failure cannot leave it behind."""
+    from qa_core_recon.report import OutputError, _cannot_use
+
+    if not out.is_dir():
+        return
+    try:
+        (out / "report.json").unlink(missing_ok=True)
+        (out / "report.md").unlink(missing_ok=True)
+    except OSError as exc:
+        raise OutputError(_cannot_use(out, exc)) from None
 
 
 def _publish_refused(spec_path: Path, out: Path, exc: RefusalError) -> None:

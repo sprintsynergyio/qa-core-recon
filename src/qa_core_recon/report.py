@@ -11,8 +11,10 @@ Two runs on the same inputs therefore write byte-identical files.
 ``--out`` is a local directory. It is created when it is missing. It is not
 checked against the input allowlist. ``s3://`` is rejected. An existing
 directory that already holds files is rejected unless ``--force`` is set.
-A leftover ``.report.*.tmp`` file from this tool is removed and does not
-count as content. Files are written to temporary names in that directory,
+A leftover ``.report.json.<pid>.tmp`` or ``.report.md.<pid>.tmp`` file from
+this tool is removed and does not count as content. Other names, and
+symlinks, are left in place. Files are written to temporary names in that
+directory,
 flushed, and then renamed into place. If either rename fails, both final
 report files are removed. When this command created the directory and the
 write fails, the empty directory is removed.
@@ -21,6 +23,7 @@ write fails, the empty directory is removed.
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 
 from qa_core_recon import __version__
@@ -45,23 +48,32 @@ def spec_sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+# publish writes ``.report.json.<pid>.tmp`` and ``.report.md.<pid>.tmp``.
+_REPORT_TEMP = re.compile(r"^\.report\.(json|md)\.\d+\.tmp$")
+
+
 def _is_report_temp(name: str) -> bool:
     """True for a temporary report file left by a crashed publish."""
-    return name.startswith(".report.") and name.endswith(".tmp")
+    return _REPORT_TEMP.fullmatch(name) is not None
 
 
 def _clear_report_temps(directory: Path) -> None:
     for child in directory.iterdir():
-        if child.is_file() and _is_report_temp(child.name):
-            child.unlink(missing_ok=True)
+        # is_file follows links. A symlink with this name is the user's file.
+        if child.is_symlink() or not _is_report_temp(child.name):
+            continue
+        if not child.is_file():
+            continue
+        child.unlink(missing_ok=True)
 
 
 def ensure_output_available(path_text: str, *, force: bool) -> Path:
     """Return the local output directory, or raise OutputError without creating it.
 
     A missing directory is accepted here and created later, when the report is
-    published. The parent must already exist. Leftover ``.report.*.tmp`` files
-    are removed and do not make the directory count as non-empty.
+    published. The parent must already exist. Leftover publish temp files
+    (``.report.json.<pid>.tmp`` and ``.report.md.<pid>.tmp``) are removed and
+    do not make the directory count as non-empty. Other names and symlinks stay.
     """
     if path_text.startswith("s3://") or path_text.startswith("s3:"):
         raise OutputError(f"s3 output is not supported: {path_text}")
@@ -212,8 +224,13 @@ def reject_output_overlap(out: Path, source_path: str, target_path: str) -> None
 def _local_paths_overlap(out: Path, dataset_path: str) -> bool:
     if _has_scheme(dataset_path) or dataset_path.startswith("s3:"):
         return False
-    left = out.absolute().parts
-    right = Path(dataset_path).absolute().parts
+    # resolve follows symlinks and folds "..". absolute() leaves both in place,
+    # so a link to the dataset, or "<data>/other/../src", would miss the check.
+    try:
+        left = out.resolve(strict=False).parts
+        right = Path(dataset_path).resolve(strict=False).parts
+    except OSError as exc:
+        raise OutputError(_cannot_use(out, exc)) from None
     return left == right or _is_prefix(left, right) or _is_prefix(right, left)
 
 

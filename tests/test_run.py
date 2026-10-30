@@ -855,6 +855,125 @@ def test_leftover_report_temps_do_not_block_a_run(tmp_path):
     assert (out / "report.md").is_file()
 
 
+def test_output_overlap_follows_symlinks_and_parent_segments(tmp_path, capsys):
+    root = tmp_path / "data"
+    source_dir = root / "src"
+    source_dir.mkdir(parents=True)
+    part = source_dir / "part.csv"
+    write_csv(part, ROW)
+    target = root / "target.csv"
+    write_csv(target, ROW)
+    spec = write_spec_file(
+        root,
+        spec_data(root, source_dir, target, source_format="csv", target_format="csv"),
+    )
+    link = root / "link"
+    link.symlink_to(source_dir, target_is_directory=True)
+    code = main(["run", "--spec", str(spec), "--out", str(link), "--force"])
+    captured = capsys.readouterr()
+    _assert_error(code, captured, f"output path {link} overlaps source path {source_dir}")
+    assert part.is_file()
+    assert not (source_dir / "report.json").exists()
+    assert not (source_dir / "report.md").exists()
+
+    (root / "other").mkdir()
+    dotted = root / "other" / ".." / "src"
+    assert ".." in dotted.parts
+    code = main(["run", "--spec", str(spec), "--out", str(dotted), "--force"])
+    captured = capsys.readouterr()
+    _assert_error(code, captured, f"output path {dotted} overlaps source path {source_dir}")
+    assert part.read_text(encoding="utf-8").startswith("txn_id")
+    assert not (source_dir / "report.json").exists()
+
+
+def test_overlap_does_not_delete_a_data_file_named_report_json(tmp_path, capsys):
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    data_file = source_dir / "report.json"
+    write_csv(data_file, ROW)
+    original = data_file.read_bytes()
+    target = tmp_path / "target.csv"
+    write_csv(target, ROW)
+    spec = write_spec_file(
+        tmp_path,
+        spec_data(tmp_path, source_dir, target, source_format="csv", target_format="csv"),
+    )
+    code = main(["run", "--spec", str(spec), "--out", str(source_dir), "--force"])
+    captured = capsys.readouterr()
+    _assert_error(code, captured, f"output path {source_dir} overlaps source path {source_dir}")
+    assert data_file.read_bytes() == original
+
+
+def test_malformed_spec_leaves_the_output_directory_untouched(tmp_path, capsys):
+    spec = tmp_path / "recon.yaml"
+    spec.write_text("version: 1\n", encoding="utf-8")
+    out = tmp_path / "out"
+    out.mkdir()
+    report = out / "report.json"
+    report.write_text("keep\n", encoding="utf-8")
+    notes = out / "notes.txt"
+    notes.write_text("notes\n", encoding="utf-8")
+    code = main(["run", "--spec", str(spec), "--out", str(out), "--force"])
+    captured = capsys.readouterr()
+    assert code is ExitCode.REFUSED
+    assert captured.err.startswith("qa-core-recon: error:")
+    assert "unexpected error" not in captured.err
+    assert report.read_text(encoding="utf-8") == "keep\n"
+    assert notes.read_text(encoding="utf-8") == "notes\n"
+
+
+def test_spec_refusal_does_not_write_into_an_overlapping_output(tmp_path, capsys):
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    part = source_dir / "part.csv"
+    write_csv(part, ROW)
+    target = tmp_path / "target.csv"
+    write_csv(target, ROW)
+    data = spec_data(tmp_path, source_dir, target, source_format="csv", target_format="csv")
+    data["tolerance"] = {"value": "0.01", "reason": ""}
+    spec = write_spec_file(tmp_path, data)
+    code = main(["run", "--spec", str(spec), "--out", str(source_dir), "--force"])
+    captured = capsys.readouterr()
+    _assert_error(code, captured, f"output path {source_dir} overlaps source path {source_dir}")
+    assert part.is_file()
+    assert not (source_dir / "report.json").exists()
+    assert not (source_dir / "report.md").exists()
+
+
+def test_lookalike_temp_names_and_symlinks_are_kept(tmp_path, capsys):
+    spec, _source, _target = _pair(tmp_path, ROW, ROW)
+    out = tmp_path / "out"
+    out.mkdir()
+    notes = out / ".report.notes.tmp"
+    notes.write_text("notes\n", encoding="utf-8")
+    kept = tmp_path / "kept.txt"
+    kept.write_text("target\n", encoding="utf-8")
+    link = out / ".report.json.123.tmp"
+    link.symlink_to(kept)
+    real_temp = out / ".report.json.5.tmp"
+    real_temp.write_text("partial\n", encoding="utf-8")
+    code = _invoke(spec, out)
+    captured = capsys.readouterr()
+    _assert_error(code, captured, f"{out} is not empty; use --force to overwrite")
+    assert not real_temp.exists()
+    assert notes.read_text(encoding="utf-8") == "notes\n"
+    assert link.is_symlink()
+    assert kept.read_text(encoding="utf-8") == "target\n"
+    assert not (out / "report.json").exists()
+
+
+def test_unlinking_a_report_directory_is_an_output_error(tmp_path, capsys):
+    spec, _source, _target = _pair(tmp_path, ROW, ROW)
+    out = tmp_path / "out"
+    out.mkdir()
+    report_dir = out / "report.md"
+    report_dir.mkdir()
+    code = _invoke(spec, out, force=True)
+    captured = capsys.readouterr()
+    _assert_error(code, captured, f"cannot write {out}: Is a directory")
+    assert report_dir.is_dir()
+
+
 def test_csv_session_start_failure_is_a_read_error(monkeypatch, tmp_path, capsys):
     import qa_core_recon.spark as spark_mod
 
