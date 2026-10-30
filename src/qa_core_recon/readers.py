@@ -1,12 +1,14 @@
 """Read source and target datasets for a recon spec.
 
-CSV and Parquet on local disk only. S3 is a later PR. Every path is checked
-with the spec allowlist before it is opened. The check uses the path text and
-does not resolve symlinks.
+CSV, Parquet, and Iceberg on local disk only. S3 is a later PR. Every path is
+checked with the spec allowlist before it is opened. The check uses the path
+text and does not resolve symlinks.
 
 CSV is read with an explicit string schema and ``inferSchema`` off. Amount
 columns are then parsed by :func:`qa_core_recon.decimals.to_decimal`. Parquet
-keeps the file schema. ``mergeSchema`` is off.
+and Iceberg keep the file schema. ``mergeSchema`` is off for Parquet. Iceberg
+is read through a Hadoop catalog on the warehouse in ``path``. The current
+snapshot is read, or ``snapshot_id`` when the spec sets one.
 
 ``check_data`` refuses, in this order:
 
@@ -15,8 +17,8 @@ keeps the file schema. ``mergeSchema`` is off.
    missing. Source is checked before target. On one side the roles are keys,
    amounts, ``group_by``, then hash columns, in spec order. A repeated name
    is checked once, at its first role.
-3. ``float-amount`` when a Parquet amount column is float or double and that
-   amount has no cast rule. Source, then target, then spec order.
+3. ``float-amount`` when a Parquet or Iceberg amount column is float or double
+   and that amount has no cast rule. Source, then target, then spec order.
 4. ``inexact-amount`` when a value is not an exact decimal at the spec scale,
    or the column type is not a number type. The reported cell is the
    lexicographically smallest offending text in that column. The scan runs
@@ -49,7 +51,15 @@ from pyspark.sql.types import (
 
 from qa_core_recon.decimals import DECIMAL_PRECISION, InexactAmount, to_decimal
 from qa_core_recon.refusals import Refusal, RefusalCode, RefusalError
+from qa_core_recon.spark import hadoop_catalog
 from qa_core_recon.spec import Amount, Dataset, Spec, _path_allowed
+
+_MISSING_TABLE_MARKERS = (
+    "NoSuchTableException",
+    "Table does not exist",
+    "TABLE_OR_VIEW_NOT_FOUND",
+    "Table or view not found",
+)
 
 _INTEGER_TYPES = (ByteType, ShortType, IntegerType, LongType)
 
@@ -257,13 +267,17 @@ def _amount_kind(dtype: DataType) -> str:
 
 
 def _open(spark: SparkSession, dataset: Dataset, side: str) -> DataFrame:
+    if dataset.format == "iceberg":
+        return _read_iceberg(spark, dataset, side)
     location = _require_local(dataset.path, side)
     try:
         if dataset.format == "csv":
             frame = _read_csv(spark, location, side)
             _parse_all_csv_rows(frame, side)
-        else:
+        elif dataset.format == "parquet":
             frame = spark.read.option("mergeSchema", "false").parquet(dataset.path)
+        else:
+            raise ReadError(f"cannot read {side} as {dataset.format}")
         # Touch the schema so a corrupt file fails here, with a stable message.
         if not isinstance(frame.schema, StructType):
             raise ReadError(f"cannot read {side} as {dataset.format}")
@@ -272,6 +286,63 @@ def _open(spark: SparkSession, dataset: Dataset, side: str) -> DataFrame:
     except Exception:
         raise ReadError(f"cannot read {side} as {dataset.format}") from None
     return frame
+
+
+def _read_iceberg(spark: SparkSession, dataset: Dataset, side: str) -> DataFrame:
+    _require_warehouse(dataset.path, side)
+    if not dataset.table:
+        raise ReadError(f"cannot read {side} as iceberg")
+    try:
+        catalog = hadoop_catalog(spark, dataset.path)
+        reader = spark.read.format("iceberg")
+        if dataset.snapshot_id is not None:
+            reader = reader.option("snapshot-id", str(dataset.snapshot_id))
+        frame = reader.load(f"{catalog}.{dataset.table}")
+        # load() resolves snapshot-id on Iceberg 1.7.1, so a missing snapshot
+        # fails here. Touching the schema still rejects a frame that is not a table.
+        if not isinstance(frame.schema, StructType):
+            raise ReadError(f"cannot read {side} as iceberg")
+    except ReadError:
+        raise
+    except Exception as exc:
+        raise _iceberg_read_error(exc, dataset, side) from None
+    return frame
+
+
+def _require_warehouse(path: str, side: str) -> Path:
+    location = _require_local(path, side)
+    if not location.is_dir():
+        raise ReadError(f"{side} iceberg warehouse is not a directory: {path}")
+    return location
+
+
+def _iceberg_read_error(exc: BaseException, dataset: Dataset, side: str) -> ReadError:
+    text = _exception_text(exc)
+    # A negative id is rewritten as a metadata table name, snapshot_id_-1, and
+    # Spark then reports that name as a missing table. It is still a snapshot miss.
+    snapshot_marker = f"snapshot_id_{dataset.snapshot_id}"
+    if dataset.snapshot_id is not None and (
+        "Cannot find snapshot" in text or snapshot_marker in text
+    ):
+        return ReadError(
+            f"{side} iceberg snapshot {dataset.snapshot_id} was not found "
+            f"for table {dataset.table!r}"
+        )
+    if any(marker in text for marker in _MISSING_TABLE_MARKERS):
+        return ReadError(f"{side} iceberg table {dataset.table!r} was not found in {dataset.path}")
+    return ReadError(f"cannot read {side} as iceberg")
+
+
+def _exception_text(exc: BaseException) -> str:
+    parts = [exc.__class__.__name__, str(exc)]
+    java = getattr(exc, "java_exception", None)
+    if java is not None:
+        try:
+            parts.append(str(java.getClass().getName()))
+        except Exception:
+            pass
+        parts.append(str(java))
+    return "\n".join(parts)
 
 
 def _require_local(path: str, side: str) -> Path:

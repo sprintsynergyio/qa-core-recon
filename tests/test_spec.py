@@ -41,8 +41,12 @@ def test_default_template_is_valid():
     assert spec.version == 1
     assert spec.source.path == "./data/raw/payments.csv"
     assert spec.source.format == "csv"
+    assert spec.source.table is None
+    assert spec.source.snapshot_id is None
     assert spec.target.path == TARGET
     assert spec.target.format == "parquet"
+    assert spec.target.table is None
+    assert spec.target.snapshot_id is None
     assert spec.keys == ("txn_id",)
     assert spec.amounts[0].column == "amount"
     assert spec.amounts[0].scale == 2
@@ -291,7 +295,7 @@ def test_unsupported_version_is_rejected():
 
 def test_unsupported_format_is_rejected():
     message = _error(lambda data: data["source"].__setitem__("format", "json"))
-    assert message == "unsupported source format 'json'; use csv or parquet"
+    assert message == "unsupported source format 'json'; use csv, parquet, or iceberg"
 
 
 def test_empty_amounts_and_groups_are_valid():
@@ -341,7 +345,7 @@ def test_duplicate_tolerance_is_malformed():
 
 def test_duplicate_nested_format_is_malformed():
     text = TEMPLATE.replace(
-        "  format: csv  # csv or parquet\n",
+        "  format: csv  # csv, parquet, or iceberg\n",
         "  format: json\n  format: csv\n",
         1,
     )

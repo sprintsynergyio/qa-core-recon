@@ -21,8 +21,16 @@ the current directory. An allowlist entry that normalises to an empty path,
 the filesystem root, or a path that still contains ".." is malformed. s3://
 URIs keep key segments as written. A "." segment, a ".." segment, an empty
 segment, a query, or a fragment is malformed rather than folded.
+
+``format`` is ``csv``, ``parquet``, or ``iceberg``. An Iceberg dataset adds
+``table`` and an optional ``snapshot_id``. Those keys are rejected on CSV and
+Parquet. ``path`` is still the location the allowlist checks: a file or
+directory for CSV and Parquet, and the Hadoop catalog warehouse for Iceberg.
+``table`` is exactly ``namespace.table``, two parts, not a filesystem path.
+Metadata table names and time-travel selectors are rejected.
 """
 
+import re
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -33,7 +41,41 @@ from qa_core_recon.decimals import CAST_MODE_NAMES, DECIMAL_PRECISION
 from qa_core_recon.refusals import Refusal, RefusalCode, RefusalError
 
 SUPPORTED_VERSION = 1
-SUPPORTED_FORMATS = frozenset({"csv", "parquet"})
+SUPPORTED_FORMATS = frozenset({"csv", "parquet", "iceberg"})
+_SNAPSHOT_ID_MIN = -1 << 63
+_SNAPSHOT_ID_MAX = (1 << 63) - 1
+# One directory name under the warehouse. A dot or a slash would add or climb
+# a directory. A leading digit is rejected so Spark can use the name unquoted.
+_IDENTIFIER_PART = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+# Iceberg treats these as metadata tables or the changelog view (`changes`),
+# and the selector pattern below as a snapshot, branch, or tag, when they
+# appear as a name part. Two-part identifiers stop a third part. Rejecting
+# the names themselves covers a table or namespace such as "snapshots".
+_RESERVED_TABLE_PARTS = frozenset(
+    {
+        "changes",
+        "entries",
+        "files",
+        "data_files",
+        "delete_files",
+        "history",
+        "metadata_log_entries",
+        "snapshots",
+        "refs",
+        "manifests",
+        "partitions",
+        "position_deletes",
+        "all_data_files",
+        "all_delete_files",
+        "all_files",
+        "all_manifests",
+        "all_entries",
+    }
+)
+_SELECTOR_PART = re.compile(
+    r"(?:snapshot_id_\d+|at_timestamp_\d+|branch_.*|tag_.*)\Z",
+    re.IGNORECASE,
+)
 
 _TOP_LEVEL = (
     "version",
@@ -59,6 +101,8 @@ class SpecError(ValueError):
 class Dataset:
     path: str
     format: str
+    table: str | None = None
+    snapshot_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -228,7 +272,13 @@ def _load_mapping(text: str) -> dict:
 
 def _dataset(value: object, label: str) -> Dataset:
     mapping = _require_mapping(value, label)
-    _reject_unknown(mapping, ("path", "format"), label)
+    # table and snapshot_id exist only on Iceberg. Any other format, including
+    # a missing or invalid one, treats them as unknown keys.
+    if mapping.get("format") == "iceberg":
+        allowed = ("path", "format", "table", "snapshot_id")
+    else:
+        allowed = ("path", "format")
+    _reject_unknown(mapping, allowed, label)
     if "path" not in mapping:
         raise SpecError(f"missing {label}.path")
     if "format" not in mapping:
@@ -236,8 +286,45 @@ def _dataset(value: object, label: str) -> Dataset:
     path = _require_text(mapping["path"], f"{label}.path")
     fmt = _require_str(mapping["format"], f"{label}.format")
     if fmt not in SUPPORTED_FORMATS:
-        raise SpecError(f"unsupported {label} format {fmt!r}; use csv or parquet")
-    return Dataset(path=path, format=fmt)
+        raise SpecError(f"unsupported {label} format {fmt!r}; use csv, parquet, or iceberg")
+    table = None
+    snapshot_id = None
+    if fmt == "iceberg":
+        if "table" not in mapping:
+            raise SpecError(f"missing {label}.table")
+        table = _require_table_identifier(mapping["table"], f"{label}.table")
+        snapshot_id = _optional_snapshot(mapping, label)
+    return Dataset(path=path, format=fmt, table=table, snapshot_id=snapshot_id)
+
+
+def _require_table_identifier(value: object, label: str) -> str:
+    text = _require_text(value, label)
+    parts = text.split(".")
+    # Exactly namespace.table. A third part is how Iceberg names metadata
+    # tables and time-travel selectors (table.snapshots, table.snapshot_id_1).
+    if len(parts) != 2 or any(part == "" for part in parts):
+        raise SpecError(f"{label} must be a namespace.table identifier, such as 'payments.txn'")
+    for part in parts:
+        if _IDENTIFIER_PART.fullmatch(part) is None:
+            raise SpecError(
+                f"{label} part {part!r} must start with a letter or underscore "
+                "and contain only letters, digits, and underscores"
+            )
+        if part.casefold() in _RESERVED_TABLE_PARTS or _SELECTOR_PART.fullmatch(part):
+            raise SpecError(
+                f"{label} part {part!r} is a reserved Iceberg name; "
+                "use snapshot_id to pick a snapshot"
+            )
+    return text
+
+
+def _optional_snapshot(mapping: dict, label: str) -> int | None:
+    if "snapshot_id" not in mapping:
+        return None
+    value = _require_int(mapping["snapshot_id"], f"{label}.snapshot_id")
+    if value < _SNAPSHOT_ID_MIN or value > _SNAPSHOT_ID_MAX:
+        raise SpecError(f"{label}.snapshot_id must fit in a 64-bit signed integer")
+    return value
 
 
 def _keys(data: dict) -> tuple[str, ...] | None:

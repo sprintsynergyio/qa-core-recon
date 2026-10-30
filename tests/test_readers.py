@@ -108,7 +108,7 @@ def test_short_csv_row_is_a_read_error(spark, tmp_path):
     assert str(caught.value) == "source csv has a malformed row"
 
 
-def test_unescaped_multiline_csv_field_is_a_read_error(spark, tmp_path):
+def test_multiline_csv_field_is_a_read_error(spark, tmp_path):
     source = tmp_path / "source.csv"
     target = tmp_path / "target.csv"
     source.write_text('txn_id,amount,day,note\n1,10.00,"hello\nworld",a\n', encoding="utf-8")
