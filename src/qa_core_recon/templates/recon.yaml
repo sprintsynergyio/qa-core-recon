@@ -11,7 +11,7 @@ source:
 
 # Dataset the job wrote.
 target:
-  path: s3://demo-bucket/curated/payments/
+  path: s3://demo-bucket/curated/payments
   format: parquet  # csv or parquet
 
 # Columns that together identify one row in both datasets.
