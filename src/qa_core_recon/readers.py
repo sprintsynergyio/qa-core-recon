@@ -298,10 +298,10 @@ def _read_iceberg(spark: SparkSession, dataset: Dataset, side: str) -> DataFrame
         if dataset.snapshot_id is not None:
             reader = reader.option("snapshot-id", str(dataset.snapshot_id))
         frame = reader.load(f"{catalog}.{dataset.table}")
-        # Schema alone does not resolve snapshot-id. An empty action does.
+        # load() resolves snapshot-id on Iceberg 1.7.1, so a missing snapshot
+        # fails here. Touching the schema still rejects a frame that is not a table.
         if not isinstance(frame.schema, StructType):
             raise ReadError(f"cannot read {side} as iceberg")
-        frame.limit(0).collect()
     except ReadError:
         raise
     except Exception as exc:

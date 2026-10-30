@@ -135,7 +135,7 @@ A missing path, a CSV file that is not UTF-8, a malformed CSV row, or a file tha
 
 ## Iceberg
 
-`format: iceberg` reads an Iceberg table through a Hadoop catalog. `path` is the warehouse directory. `table` is the identifier, written `namespace.table`. More than one namespace level is allowed, as in `finance.payments.txn`. `snapshot_id` is optional. Leave it out to read the current snapshot. Set it to read that snapshot only.
+`format: iceberg` reads an Iceberg table through a Hadoop catalog. `path` is the warehouse directory. `table` is exactly `namespace.table`, two parts, the same shape as a Glue Data Catalog name (`database.table`). A third part is rejected, so a name cannot open a metadata table or time-travel (`payments.txn.snapshots`, `payments.txn.snapshot_id_1`). A part that is itself a metadata table name, such as `snapshots`, or a selector such as `branch_main`, is rejected. Use `snapshot_id` to choose a snapshot. `snapshot_id` is optional. Leave it out to read the current snapshot. Set it to read that snapshot only.
 
 ```yaml
 target:
@@ -144,11 +144,11 @@ target:
   table: payments.txn
 ```
 
-`path` goes through the allowlist before any read, in the same way as a CSV or Parquet path. The identifier is not a path. Each part must start with a letter or underscore and then use only letters, digits, and underscores. That keeps the Hadoop catalog from turning the identifier into a directory outside the warehouse. `table` and `snapshot_id` on a CSV or Parquet dataset are unknown keys. A missing `table`, a bad identifier, a snapshot id that is not an integer, and a snapshot id outside a 64-bit signed integer are a malformed spec.
+`path` goes through the allowlist before any read. The allowlist matches path text and does not resolve symlinks, for Iceberg and for every other format. The identifier is not a path. Each part must start with a letter or underscore and then use only letters, digits, and underscores. That keeps the Hadoop catalog from turning the identifier into a directory outside the warehouse. `table` and `snapshot_id` on a CSV or Parquet dataset are unknown keys. A missing `table`, a bad identifier, a snapshot id that is not an integer, and a snapshot id outside a 64-bit signed integer are a malformed spec.
 
 The catalog is `org.apache.iceberg.spark.SparkCatalog` with `type` set to `hadoop`. It is registered for that warehouse only, and only when the spec uses Iceberg. The Spark session catalog stays in memory, Hive is not started, and the Iceberg catalog cache is off so a read sees the current snapshot. This is not the Glue catalog.
 
-The runtime jar is `org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.7.1` (Spark 3.5, Scala 2.12). AWS Glue 5.0 ships Iceberg 1.7.1 with Spark 3.5.4, as listed in the AWS Glue versions documentation. Spark downloads the jar from Maven Central the first time a session is started for an Iceberg spec, and stores it in the Ivy cache (`~/.cache/qa-core-recon/ivy`, or `QA_CORE_RECON_IVY`). Later runs reuse the cache. CSV and Parquet do not download it.
+The runtime jar is `org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.7.1` (Spark 3.5, Scala 2.12). AWS Glue 5.0 ships Iceberg 1.7.1 with Spark 3.5.4, as listed in the AWS Glue versions documentation. Spark downloads the jar from Maven Central the first time a session is started for an Iceberg spec, and stores it in the Ivy cache (`~/.cache/qa-core-recon/ivy`, or `QA_CORE_RECON_IVY`). Later runs reuse the cache. CSV and Parquet do not download it. If the jar cannot be fetched and it is not already in that cache, `--check-data` prints a read error that names the runtime and the cache directory, and exits 2.
 
 Iceberg on a local warehouse is supported. An allowlisted `s3://` warehouse is still a valid spec. `--check-data` prints `s3 reads are not supported yet` and exits 2, before Spark starts. S3 and the Glue catalog are later PRs.
 

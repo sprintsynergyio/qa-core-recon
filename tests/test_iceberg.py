@@ -14,8 +14,8 @@ from qa_core_recon.cli import main
 from qa_core_recon.exit_codes import ExitCode
 from qa_core_recon.readers import ReadError, check_data, read_datasets
 from qa_core_recon.refusals import RefusalCode, RefusalError
-from qa_core_recon.spark import catalog_name_for
-from qa_core_recon.spec import Dataset, SpecError
+from qa_core_recon.spark import IcebergRuntimeError, catalog_name_for, missing_runtime_message
+from qa_core_recon.spec import _RESERVED_TABLE_PARTS, Dataset, SpecError
 from tests.support import parse_data, spec_data, write_csv, write_spec_file
 
 ROW = "1,10.50,2024-01-01,a\n"
@@ -221,6 +221,17 @@ def test_missing_iceberg_table_is_a_read_error(spark, tmp_path):
     )
 
 
+def test_iceberg_warehouse_that_is_a_file_is_a_read_error(spark, tmp_path):
+    source = tmp_path / "source.csv"
+    write_csv(source, ROW)
+    warehouse = tmp_path / "not-a-warehouse"
+    warehouse.write_text("not a directory", encoding="utf-8")
+    spec = parse_data(_target(tmp_path, source, warehouse))
+    with pytest.raises(ReadError) as caught:
+        check_data(spark, spec)
+    assert str(caught.value) == f"target iceberg warehouse is not a directory: {warehouse}"
+
+
 def test_missing_iceberg_warehouse_is_a_read_error(spark, tmp_path):
     source = tmp_path / "source.csv"
     write_csv(source, ROW)
@@ -241,9 +252,9 @@ def test_iceberg_table_identifier_must_include_a_namespace():
     assert _error(_base(table="ns..txn")) == (
         "source.table must be a namespace.table identifier, such as 'payments.txn'"
     )
-    nested = parse_data(_base(table="finance.payments.txn"))
-    assert nested.source.table == "finance.payments.txn"
-    assert nested.source.snapshot_id is None
+    assert _error(_base(table="finance.payments.txn")) == (
+        "source.table must be a namespace.table identifier, such as 'payments.txn'"
+    )
 
 
 def test_iceberg_table_identifier_rejects_bad_parts():
@@ -258,6 +269,75 @@ def test_iceberg_table_identifier_rejects_bad_parts():
             f"source.table part {part!r} must start with a letter or underscore "
             "and contain only letters, digits, and underscores"
         )
+
+
+@pytest.mark.parametrize(
+    "table",
+    [
+        "payments.txn.snapshot_id_42",
+        "payments.txn.at_timestamp_1700000000000",
+        "payments.txn.branch_main",
+        "payments.txn.tag_x",
+        "payments.txn.snapshots",
+    ],
+)
+def test_three_part_iceberg_names_are_rejected(table):
+    assert _error(_base(table=table)) == (
+        "source.table must be a namespace.table identifier, such as 'payments.txn'"
+    )
+
+
+@pytest.mark.parametrize(
+    ("table", "part"),
+    [
+        ("payments.snapshots", "snapshots"),
+        ("payments.History", "History"),
+        ("snapshots.txn", "snapshots"),
+        ("payments.snapshot_id_42", "snapshot_id_42"),
+        ("payments.at_timestamp_1700000000000", "at_timestamp_1700000000000"),
+        ("payments.branch_main", "branch_main"),
+        ("payments.tag_x", "tag_x"),
+    ],
+)
+def test_reserved_iceberg_names_are_rejected(table, part):
+    assert _error(_base(table=table)) == (
+        f"source.table part {part!r} is a reserved Iceberg name; use snapshot_id to pick a snapshot"
+    )
+
+
+def test_reserved_iceberg_part_list_is_the_metadata_tables():
+    assert _RESERVED_TABLE_PARTS == {
+        "entries",
+        "files",
+        "data_files",
+        "delete_files",
+        "history",
+        "metadata_log_entries",
+        "snapshots",
+        "refs",
+        "manifests",
+        "partitions",
+        "position_deletes",
+        "all_data_files",
+        "all_delete_files",
+        "all_files",
+        "all_manifests",
+        "all_entries",
+    }
+
+
+def test_reserved_name_on_the_target_uses_that_side():
+    data = _base()
+    data["source"] = {"path": "./data/raw/payments.csv", "format": "csv"}
+    data["target"] = {
+        "path": "./data/warehouse",
+        "format": "iceberg",
+        "table": "payments.snapshots",
+    }
+    assert _error(data) == (
+        "target.table part 'snapshots' is a reserved Iceberg name; "
+        "use snapshot_id to pick a snapshot"
+    )
 
 
 def test_iceberg_unknown_keys_and_snapshot_id_are_strict():
@@ -427,6 +507,69 @@ def test_check_data_iceberg_process_prints_only_data_ok(spark, tmp_path):
     assert result.returncode == 0
     assert result.stdout == "data ok\n"
     assert result.stderr == ""
+
+
+def test_cli_requests_iceberg_for_a_source_only_spec(monkeypatch, tmp_path, capsys):
+    calls = []
+
+    def fake_session(*_args, **kwargs):
+        calls.append(kwargs.get("iceberg"))
+        return None
+
+    monkeypatch.setattr("qa_core_recon.spark.local_session", fake_session)
+    monkeypatch.setattr("qa_core_recon.spark.local_session_active", lambda: False)
+    monkeypatch.setattr("qa_core_recon.spark.stop_local_session", lambda: None)
+    monkeypatch.setattr("qa_core_recon.readers.check_data", lambda *_args, **_kwargs: None)
+
+    source = tmp_path / "warehouse"
+    target = tmp_path / "target.csv"
+    spec = write_spec_file(
+        tmp_path,
+        spec_data(
+            tmp_path,
+            source,
+            target,
+            source_format="iceberg",
+            target_format="csv",
+            source_table=TABLE,
+        ),
+    )
+    assert main(["validate", "--spec", str(spec), "--check-data"]) is ExitCode.MATCH
+    assert calls == [True]
+    assert capsys.readouterr().out == "data ok\n"
+
+
+def test_cli_missing_iceberg_runtime_is_a_read_error(monkeypatch, tmp_path, capsys):
+    cache = tmp_path / "empty-ivy"
+    message = missing_runtime_message(cache)
+
+    def fail(*_args, **_kwargs):
+        raise IcebergRuntimeError(message)
+
+    monkeypatch.setattr("qa_core_recon.spark.local_session", fail)
+    monkeypatch.setattr("qa_core_recon.spark.local_session_active", lambda: False)
+    monkeypatch.setattr("qa_core_recon.spark.stop_local_session", lambda: None)
+
+    source = tmp_path / "warehouse"
+    target = tmp_path / "target.csv"
+    spec = write_spec_file(
+        tmp_path,
+        spec_data(
+            tmp_path,
+            source,
+            target,
+            source_format="iceberg",
+            target_format="csv",
+            source_table=TABLE,
+        ),
+    )
+    code = main(["validate", "--spec", str(spec), "--check-data"])
+    captured = capsys.readouterr()
+    assert code is ExitCode.REFUSED
+    assert captured.out == ""
+    assert captured.err == f"qa-core-recon: error: {message}\n"
+    assert "unexpected error" not in captured.err
+    assert "JAVA_GATEWAY_EXITED" not in captured.err
 
 
 def test_cli_loads_the_iceberg_runtime_only_when_the_spec_uses_it(monkeypatch, tmp_path, capsys):

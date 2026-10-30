@@ -6,9 +6,13 @@ from py4j.protocol import Py4JJavaError
 from qa_core_recon.spark import (
     ICEBERG_SPARK_PACKAGE,
     MAVEN_CENTRAL,
+    IcebergRuntimeError,
     catalog_name_for,
     ivy_cache_dir,
     local_session,
+    missing_runtime_message,
+    runtime_jar_cached,
+    session_start_failure,
 )
 
 
@@ -31,6 +35,37 @@ def test_session_is_local_and_fixed(spark):
     assert spark.conf.get("spark.sql.execution.arrow.pyspark.enabled") == "false"
     assert spark.conf.get("spark.sql.csv.parser.columnPruning.enabled") == "false"
     assert local_session() is spark
+
+
+def test_running_session_without_iceberg_cannot_gain_it(spark, monkeypatch):
+    import qa_core_recon.spark as spark_mod
+
+    monkeypatch.setattr(spark_mod, "_iceberg_ready", False)
+    with pytest.raises(RuntimeError) as caught:
+        local_session(iceberg=True)
+    assert str(caught.value) == (
+        "the local Spark session is already running without the Iceberg runtime"
+    )
+
+
+def test_missing_iceberg_runtime_is_a_clear_read_error(tmp_path):
+    cache = tmp_path / "empty-ivy"
+    original = RuntimeError("JAVA_GATEWAY_EXITED")
+    failure = session_start_failure(original, iceberg=True, ivy=cache)
+    assert isinstance(failure, IcebergRuntimeError)
+    assert str(failure) == missing_runtime_message(cache)
+    assert ICEBERG_SPARK_PACKAGE in str(failure)
+    assert "Maven Central" in str(failure)
+    assert str(cache) in str(failure)
+    assert "JAVA_GATEWAY_EXITED" not in str(failure)
+    assert runtime_jar_cached(cache) is False
+
+    present = tmp_path / "warm-ivy"
+    present.mkdir()
+    (present / "org.apache.iceberg_iceberg-spark-runtime-3.5_2.12-1.7.1.jar").write_bytes(b"jar")
+    assert runtime_jar_cached(present) is True
+    assert session_start_failure(original, iceberg=True, ivy=present) is original
+    assert session_start_failure(original, iceberg=False, ivy=cache) is original
 
 
 def test_session_leaves_no_hive_files_in_the_repo(spark):

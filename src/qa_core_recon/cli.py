@@ -91,11 +91,20 @@ def _validate(args: argparse.Namespace) -> ExitCode:
         _print_error(str(exc))
         return ExitCode.REFUSED
 
-    from qa_core_recon.spark import local_session, local_session_active, stop_local_session
+    from qa_core_recon.spark import (
+        IcebergRuntimeError,
+        local_session,
+        local_session_active,
+        stop_local_session,
+    )
 
     needs_iceberg = spec.source.format == "iceberg" or spec.target.format == "iceberg"
     created = not local_session_active()
-    spark = local_session(iceberg=needs_iceberg)
+    try:
+        spark = local_session(iceberg=needs_iceberg)
+    except IcebergRuntimeError as exc:
+        _print_error(str(exc))
+        return ExitCode.REFUSED
     try:
         check_data(spark, spec)
     except ReadError as exc:

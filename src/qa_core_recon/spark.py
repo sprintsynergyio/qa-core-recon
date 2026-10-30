@@ -52,6 +52,11 @@ MAVEN_CENTRAL = "https://repo1.maven.org/maven2"
 _session: SparkSession | None = None
 _warehouse: Path | None = None
 _iceberg_ready: bool = False
+_RUNTIME_JAR_SUFFIX = f"iceberg-spark-runtime-3.5_2.12-{ICEBERG_VERSION}.jar"
+
+
+class IcebergRuntimeError(Exception):
+    """The Iceberg Spark runtime jar is not available. This is a read error."""
 
 
 def local_session_active() -> bool:
@@ -91,6 +96,34 @@ def hadoop_catalog(spark: SparkSession, warehouse: str) -> str:
     spark.conf.set(f"{prefix}.io-impl", "org.apache.iceberg.hadoop.HadoopFileIO")
     spark.conf.set(f"{prefix}.cache-enabled", "false")
     return name
+
+
+def missing_runtime_message(cache: Path) -> str:
+    """Return the read error used when the Iceberg jar cannot be resolved."""
+    return (
+        f"the Iceberg runtime {ICEBERG_SPARK_PACKAGE} could not be fetched "
+        f"from Maven Central or found in the Ivy cache at {cache}"
+    )
+
+
+def runtime_jar_cached(cache: Path) -> bool:
+    """Return True when the pinned runtime jar is already in ``cache``."""
+    if not cache.is_dir():
+        return False
+    return any(
+        path.is_file() and path.name.endswith(_RUNTIME_JAR_SUFFIX) for path in cache.rglob("*.jar")
+    )
+
+
+def session_start_failure(exc: BaseException, *, iceberg: bool, ivy: Path | None) -> BaseException:
+    """Map a failed session start to a read error when the runtime is missing.
+
+    A gateway exit while the jar is absent is the offline cache miss. A start
+    failure after the jar is cached is left unchanged.
+    """
+    if iceberg and ivy is not None and not runtime_jar_cached(ivy):
+        return IcebergRuntimeError(missing_runtime_message(ivy))
+    return exc
 
 
 def local_session(warehouse: Path | None = None, *, iceberg: bool = False) -> SparkSession:
@@ -142,6 +175,7 @@ def local_session(warehouse: Path | None = None, *, iceberg: bool = False) -> Sp
         .config("spark.pyspark.python", sys.executable)
         .config("spark.pyspark.driver.python", sys.executable)
     )
+    ivy: Path | None = None
     if iceberg:
         ivy = ivy_cache_dir()
         ivy.mkdir(parents=True, exist_ok=True)
@@ -153,8 +187,11 @@ def local_session(warehouse: Path | None = None, *, iceberg: bool = False) -> Sp
     try:
         session = _start_quietly(builder)
         session.sparkContext.setLogLevel("ERROR")
-    except Exception:
+    except Exception as exc:
         shutil.rmtree(root, ignore_errors=True)
+        failure = session_start_failure(exc, iceberg=iceberg, ivy=ivy)
+        if isinstance(failure, IcebergRuntimeError):
+            raise failure from None
         raise
     _session = session
     _warehouse = root

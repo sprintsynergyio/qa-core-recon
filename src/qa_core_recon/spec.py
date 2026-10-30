@@ -26,7 +26,8 @@ segment, a query, or a fragment is malformed rather than folded.
 ``table`` and an optional ``snapshot_id``. Those keys are rejected on CSV and
 Parquet. ``path`` is still the location the allowlist checks: a file or
 directory for CSV and Parquet, and the Hadoop catalog warehouse for Iceberg.
-``table`` is a ``namespace.table`` identifier, not a filesystem path.
+``table`` is exactly ``namespace.table``, two parts, not a filesystem path.
+Metadata table names and time-travel selectors are rejected.
 """
 
 import re
@@ -46,6 +47,33 @@ _SNAPSHOT_ID_MAX = (1 << 63) - 1
 # One directory name under the warehouse. A dot or a slash would add or climb
 # a directory. A leading digit is rejected so Spark can use the name unquoted.
 _IDENTIFIER_PART = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+# Iceberg treats these as metadata tables, or as a snapshot, branch, or tag
+# selector, when they appear after the table name. Two-part names stop that
+# path; rejecting the names themselves covers a table part such as "snapshots".
+_RESERVED_TABLE_PARTS = frozenset(
+    {
+        "entries",
+        "files",
+        "data_files",
+        "delete_files",
+        "history",
+        "metadata_log_entries",
+        "snapshots",
+        "refs",
+        "manifests",
+        "partitions",
+        "position_deletes",
+        "all_data_files",
+        "all_delete_files",
+        "all_files",
+        "all_manifests",
+        "all_entries",
+    }
+)
+_SELECTOR_PART = re.compile(
+    r"(?:snapshot_id_\d+|at_timestamp_\d+|branch_.+|tag_.+)\Z",
+    re.IGNORECASE,
+)
 
 _TOP_LEVEL = (
     "version",
@@ -270,13 +298,20 @@ def _dataset(value: object, label: str) -> Dataset:
 def _require_table_identifier(value: object, label: str) -> str:
     text = _require_text(value, label)
     parts = text.split(".")
-    if len(parts) < 2 or any(part == "" for part in parts):
+    # Exactly namespace.table. A third part is how Iceberg names metadata
+    # tables and time-travel selectors (table.snapshots, table.snapshot_id_1).
+    if len(parts) != 2 or any(part == "" for part in parts):
         raise SpecError(f"{label} must be a namespace.table identifier, such as 'payments.txn'")
     for part in parts:
         if _IDENTIFIER_PART.fullmatch(part) is None:
             raise SpecError(
                 f"{label} part {part!r} must start with a letter or underscore "
                 "and contain only letters, digits, and underscores"
+            )
+        if part.casefold() in _RESERVED_TABLE_PARTS or _SELECTOR_PART.fullmatch(part):
+            raise SpecError(
+                f"{label} part {part!r} is a reserved Iceberg name; "
+                "use snapshot_id to pick a snapshot"
             )
     return text
 
