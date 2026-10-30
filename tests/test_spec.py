@@ -512,6 +512,11 @@ def test_local_path_with_a_colon_in_the_first_segment_is_rejected():
         )
 
 
+def test_colon_in_a_parsed_part_is_rejected_after_dotdot_is_folded():
+    message = _error(lambda data: data["source"].__setitem__("path", "data/../file:/etc/hosts"))
+    assert message == "source.path must not contain a colon in the first path segment"
+
+
 def test_local_glob_characters_are_rejected_on_paths_and_allowlist_entries():
     message = _error(lambda data: data["source"].__setitem__("path", "data/a[1].csv"))
     assert message == "source.path path segment 'a[1].csv' contains glob character '['"
@@ -520,6 +525,14 @@ def test_local_glob_characters_are_rejected_on_paths_and_allowlist_entries():
         data["allowlist"] = ["data/a[1].csv", "s3://demo-bucket"]
 
     assert _error(allow) == ("allowlist[0] path segment 'a[1].csv' contains glob character '['")
+
+    message = _error(lambda data: data["source"].__setitem__("path", "data/x?.csv"))
+    assert message == "source.path path segment 'x?.csv' contains glob character '?'"
+
+    def question(data):
+        data["allowlist"] = ["data/a?", "s3://demo-bucket"]
+
+    assert _error(question) == ("allowlist[0] path segment 'a?' contains glob character '?'")
 
 
 def test_credentials_are_not_a_spec_field():
