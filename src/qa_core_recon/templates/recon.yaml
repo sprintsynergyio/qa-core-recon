@@ -7,19 +7,19 @@ version: 1
 # Dataset the job read from.
 source:
   path: ./data/raw/payments.csv
-  format: csv  # csv or parquet
+  format: csv  # csv, parquet, or iceberg
 
 # Dataset the job wrote.
 target:
   path: s3://demo-bucket/curated/payments
-  format: parquet  # csv or parquet
+  format: parquet  # csv, parquet, or iceberg
 
 # Columns that together identify one row in both datasets.
 keys: [txn_id]
 
 # Money columns, compared as exact decimals with this many digits after the point.
-# Optional cast is half-even or half-up. Add it only when the Parquet column is
-# float or double. It does not allow rounding of CSV or decimal values.
+# Optional cast is half-even or half-up. Add it only when the Parquet or Iceberg
+# column is float or double. It does not allow rounding of CSV or decimal values.
 amounts:
   - column: amount
     scale: 2

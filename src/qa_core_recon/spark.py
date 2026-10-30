@@ -6,20 +6,33 @@ session time zone is UTC. The UI is off. The driver binds to 127.0.0.1, so it
 does not advertise an external address. Arrow conversion is off, so decimal
 values stay on the Python parser in :mod:`qa_core_recon.decimals`.
 
-The catalog is in memory. Hive is not started. Warehouse, derby, and scratch
-directories are created under a temporary directory, so a run does not leave
-``metastore_db``, ``derby.log``, or ``spark-warehouse`` in the working
+The session catalog is in memory. Hive is not started. Warehouse, derby, and
+scratch directories are created under a temporary directory, so a run does not
+leave ``metastore_db``, ``derby.log``, or ``spark-warehouse`` in the working
 directory or the repo root.
 
+The Iceberg Spark runtime is loaded only when the caller asks for it, because
+Spark cannot add jars after the session exists. The jar is
+``org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.7.1``, the Iceberg
+version AWS Glue 5.0 ships for Spark 3.5 and Scala 2.12. Spark resolves that
+coordinate from Maven Central into an Ivy cache at
+``~/.cache/qa-core-recon/ivy``, or ``QA_CORE_RECON_IVY`` when that variable
+is set. The cache is not inside the session temp directory, so stopping the
+session does not delete it. A Hadoop catalog for one warehouse is registered
+later, and only when a spec reads Iceberg.
+
 Spark prints a startup banner on the process stderr before Python can change
-its log level, and that banner contains a timestamp. The banner is captured
-and dropped so the CLI's stderr stays limited to refusals and errors.
+its log level, and that banner contains a timestamp. Ivy prints a settings
+line on stdout when the Iceberg runtime is resolved. Both are captured and
+dropped so the CLI's output stays limited to refusals, errors, and the
+result line.
 
 The first call creates the session. Later calls in the same process return
 that session. Spark allows one context per JVM, so a stopped session is not
 replaced here. Stopping the session deletes its temporary directory.
 """
 
+import hashlib
 import os
 import shutil
 import sys
@@ -30,8 +43,15 @@ from pyspark.sql import SparkSession
 
 os.environ.setdefault("SPARK_LOCAL_IP", "127.0.0.1")
 
+# Confirmed on the AWS Glue versions page: Glue 5.0 ships Iceberg 1.7.1
+# with Spark 3.5.4 and Scala 2.12.
+ICEBERG_VERSION = "1.7.1"
+ICEBERG_SPARK_PACKAGE = f"org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:{ICEBERG_VERSION}"
+MAVEN_CENTRAL = "https://repo1.maven.org/maven2"
+
 _session: SparkSession | None = None
 _warehouse: Path | None = None
+_iceberg_ready: bool = False
 
 
 def local_session_active() -> bool:
@@ -39,10 +59,53 @@ def local_session_active() -> bool:
     return _session is not None
 
 
-def local_session(warehouse: Path | None = None) -> SparkSession:
-    """Return the process-wide local session, creating it on the first call."""
-    global _session, _warehouse
+def ivy_cache_dir() -> Path:
+    """Return the Ivy cache that holds the Iceberg runtime jar."""
+    override = os.environ.get("QA_CORE_RECON_IVY", "").strip()
+    if override:
+        return Path(override)
+    return Path.home() / ".cache" / "qa-core-recon" / "ivy"
+
+
+def catalog_name_for(warehouse: str) -> str:
+    """Return the Spark catalog name for one warehouse path string.
+
+    The name is derived from the path text. The same text always maps to the
+    same catalog, and a different warehouse does not reuse it.
+    """
+    digest = hashlib.sha256(warehouse.encode("utf-8")).hexdigest()[:16]
+    return f"iceberg_{digest}"
+
+
+def hadoop_catalog(spark: SparkSession, warehouse: str) -> str:
+    """Register a Hadoop catalog for ``warehouse`` and return its name.
+
+    The session catalog stays in memory. This catalog is separate, local, and
+    uncached, so a later read sees the current snapshot.
+    """
+    name = catalog_name_for(warehouse)
+    prefix = f"spark.sql.catalog.{name}"
+    spark.conf.set(prefix, "org.apache.iceberg.spark.SparkCatalog")
+    spark.conf.set(f"{prefix}.type", "hadoop")
+    spark.conf.set(f"{prefix}.warehouse", warehouse)
+    spark.conf.set(f"{prefix}.io-impl", "org.apache.iceberg.hadoop.HadoopFileIO")
+    spark.conf.set(f"{prefix}.cache-enabled", "false")
+    return name
+
+
+def local_session(warehouse: Path | None = None, *, iceberg: bool = False) -> SparkSession:
+    """Return the process-wide local session, creating it on the first call.
+
+    ``iceberg`` loads the Iceberg runtime. Spark accepts jars only while the
+    session is created, so a session that was started without it cannot gain
+    it later.
+    """
+    global _session, _warehouse, _iceberg_ready
     if _session is not None:
+        if iceberg and not _iceberg_ready:
+            raise RuntimeError(
+                "the local Spark session is already running without the Iceberg runtime"
+            )
         return _session
 
     root = warehouse if warehouse is not None else Path(tempfile.mkdtemp(prefix="qa-core-recon-"))
@@ -51,8 +114,7 @@ def local_session(warehouse: Path | None = None) -> SparkSession:
     scratch = root / "local"
     tmp = root / "tmp"
     meta = root / "warehouse"
-    ivy = root / "ivy"
-    for path in (derby, scratch, tmp, meta, ivy):
+    for path in (derby, scratch, tmp, meta):
         path.mkdir(parents=True, exist_ok=True)
 
     os.environ["SPARK_LOCAL_IP"] = "127.0.0.1"
@@ -72,7 +134,6 @@ def local_session(warehouse: Path | None = None) -> SparkSession:
         .config("spark.driver.bindAddress", "127.0.0.1")
         .config("spark.sql.warehouse.dir", str(meta))
         .config("spark.local.dir", str(scratch))
-        .config("spark.jars.ivy", str(ivy))
         .config("spark.sql.caseSensitive", "true")
         .config("spark.sql.execution.arrow.pyspark.enabled", "false")
         .config("spark.sql.csv.parser.columnPruning.enabled", "false")
@@ -81,6 +142,14 @@ def local_session(warehouse: Path | None = None) -> SparkSession:
         .config("spark.pyspark.python", sys.executable)
         .config("spark.pyspark.driver.python", sys.executable)
     )
+    if iceberg:
+        ivy = ivy_cache_dir()
+        ivy.mkdir(parents=True, exist_ok=True)
+        builder = (
+            builder.config("spark.jars.packages", ICEBERG_SPARK_PACKAGE)
+            .config("spark.jars.ivy", str(ivy))
+            .config("spark.jars.repositories", MAVEN_CENTRAL)
+        )
     try:
         session = _start_quietly(builder)
         session.sparkContext.setLogLevel("ERROR")
@@ -89,40 +158,48 @@ def local_session(warehouse: Path | None = None) -> SparkSession:
         raise
     _session = session
     _warehouse = root
+    _iceberg_ready = iceberg
     return session
 
 
 def _start_quietly(builder: SparkSession.Builder) -> SparkSession:
-    """Create the session and drop Spark's timestamped startup banner.
+    """Create the session and drop Spark and Ivy startup lines.
 
-    The JVM writes that banner to file descriptor 2. Redirecting Python's
-    ``sys.stderr`` does not catch it, so the descriptor itself is pointed at a
-    temporary file for the duration of startup and then restored.
+    The JVM writes its banner to file descriptor 2, and Ivy writes a settings
+    line to file descriptor 1. Redirecting Python's ``sys`` streams does not
+    catch either, so both descriptors are pointed at a temporary file for the
+    duration of startup and then restored.
     """
     captured = tempfile.NamedTemporaryFile(prefix="qa-core-recon-spark-log-", delete=False)
-    saved = os.dup(2)
+    saved_out = os.dup(1)
+    saved_err = os.dup(2)
     try:
+        os.dup2(captured.fileno(), 1)
         os.dup2(captured.fileno(), 2)
         try:
             return builder.getOrCreate()
         except Exception as exc:
-            os.dup2(saved, 2)
+            os.dup2(saved_out, 1)
+            os.dup2(saved_err, 2)
             detail = " ".join(str(exc).split()) or exc.__class__.__name__
             raise RuntimeError(f"cannot start the local Spark session: {detail}") from None
     finally:
-        os.dup2(saved, 2)
-        os.close(saved)
+        os.dup2(saved_out, 1)
+        os.dup2(saved_err, 2)
+        os.close(saved_out)
+        os.close(saved_err)
         captured.close()
         Path(captured.name).unlink(missing_ok=True)
 
 
 def stop_local_session() -> None:
     """Stop the session and delete its temporary directory."""
-    global _session, _warehouse
+    global _session, _warehouse, _iceberg_ready
     session = _session
     root = _warehouse
     _session = None
     _warehouse = None
+    _iceberg_ready = False
     if session is not None:
         session.stop()
     if root is not None:

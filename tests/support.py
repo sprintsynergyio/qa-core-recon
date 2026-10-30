@@ -16,11 +16,25 @@ def spec_data(
     *,
     source_format: str = "csv",
     target_format: str = "parquet",
+    source_table: str | None = None,
+    target_table: str | None = None,
+    source_snapshot: int | None = None,
+    target_snapshot: int | None = None,
 ) -> dict:
+    source_dataset: dict = {"path": str(source), "format": source_format}
+    target_dataset: dict = {"path": str(target), "format": target_format}
+    if source_table is not None:
+        source_dataset["table"] = source_table
+    if target_table is not None:
+        target_dataset["table"] = target_table
+    if source_snapshot is not None:
+        source_dataset["snapshot_id"] = source_snapshot
+    if target_snapshot is not None:
+        target_dataset["snapshot_id"] = target_snapshot
     return {
         "version": 1,
-        "source": {"path": str(source), "format": source_format},
-        "target": {"path": str(target), "format": target_format},
+        "source": source_dataset,
+        "target": target_dataset,
         "keys": ["txn_id"],
         "amounts": [{"column": "amount", "scale": 2}],
         "group_by": ["day"],

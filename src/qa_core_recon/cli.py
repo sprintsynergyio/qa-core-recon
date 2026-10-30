@@ -82,6 +82,7 @@ def _validate(args: argparse.Namespace) -> ExitCode:
         return ExitCode.MATCH
     # Imported here so init and a spec-only validate do not load PySpark.
     # sample-only and s3 are decided before the session, so they do not start a JVM.
+    # The Iceberg runtime is requested only when the spec uses Iceberg.
     from qa_core_recon.readers import ReadError, check_before_session, check_data
 
     try:
@@ -92,8 +93,9 @@ def _validate(args: argparse.Namespace) -> ExitCode:
 
     from qa_core_recon.spark import local_session, local_session_active, stop_local_session
 
+    needs_iceberg = spec.source.format == "iceberg" or spec.target.format == "iceberg"
     created = not local_session_active()
-    spark = local_session()
+    spark = local_session(iceberg=needs_iceberg)
     try:
         check_data(spark, spec)
     except ReadError as exc:

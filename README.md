@@ -2,7 +2,7 @@
 
 Prove that a target dataset matches its source after a Glue or PySpark job, using deterministic checks. No AI model decides pass or fail.
 
-**Status: readers.** `--version`, `init`, and `validate` work. `validate --check-data` opens local CSV and Parquet and runs the data-level refusals. `run` arrives in a later PR. Counts, sums, hashes, diffs, and reports are not in this release.
+**Status: readers.** `--version`, `init`, and `validate` work. `validate --check-data` opens local CSV, Parquet, and Iceberg and runs the data-level refusals. `run` arrives in a later PR. Counts, sums, hashes, diffs, and reports are not in this release.
 
 ## Install From Source
 
@@ -17,6 +17,8 @@ pip install -e ".[dev]"
 ```
 
 PySpark is pinned to the 3.5 line (`pyspark>=3.5,<3.6`), the Spark line in AWS Glue 5.0. `init` and `validate` do not start a JVM. `validate --check-data` does.
+
+A spec that uses Iceberg also needs the Iceberg Spark runtime `org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.7.1`. The first `validate --check-data` on that spec downloads it from Maven Central into `~/.cache/qa-core-recon/ivy`. Set `QA_CORE_RECON_IVY` to use another cache directory. A CSV or Parquet spec does not download it.
 
 ## Commands
 
@@ -100,7 +102,7 @@ These run only with `--check-data`, after the spec-level checks have passed.
 | ---- | ----------------------- |
 | `sample-only` | `sampled` is true. Decided before either dataset is opened. |
 | `unmapped-column` | A key, amount, `group_by`, or hash column is missing. The message names the side and the column. |
-| `float-amount` | A Parquet amount column is float or double and that amount has no `cast` rule. |
+| `float-amount` | A Parquet or Iceberg amount column is float or double and that amount has no `cast` rule. |
 | `inexact-amount` | An amount value is not an exact decimal at the spec scale, or the column type is not a number type. |
 
 First match wins, in this order:
@@ -113,23 +115,44 @@ Within `unmapped-column`, `float-amount`, and `inexact-amount`, source is checke
 
 ## Readers
 
-CSV and Parquet on local disk. S3 and Iceberg are later PRs. An allowlisted `s3://` path remains a valid spec, and plain `validate` accepts the packaged template. `--check-data` on an `s3://` path prints `qa-core-recon: error: s3 reads are not supported yet: ...` and exits 2. That is a read error, not `path-not-allowed`, because the allowlist check already passed. Source is named before target.
+CSV, Parquet, and local Iceberg. S3 is a later PR. See Iceberg for the catalog, the table identifier, and the pinned runtime. An allowlisted `s3://` path remains a valid spec, and plain `validate` accepts the packaged template. `--check-data` on an `s3://` path prints `qa-core-recon: error: s3 reads are not supported yet: ...` and exits 2. That is a read error, not `path-not-allowed`, because the allowlist check already passed. Source is named before target.
 
 Every path is checked against the allowlist again before it is opened. The check uses the path text, the same way `validate` does. It does not resolve symlinks, and it does not join a relative path to the spec file. A relative path is opened from the current directory.
 
-The Spark session is local mode on one thread (`local[1]`), with `spark.sql.shuffle.partitions` set to 1, the session time zone set to UTC, and the UI turned off. The driver binds to `127.0.0.1`. Arrow conversion is off. The catalog is in memory, so Hive is not started. Warehouse, derby, and scratch directories are created under a temporary directory. A run does not leave `metastore_db`, `derby.log`, or `spark-warehouse` in the working directory or the repo root. Spark's startup banner is dropped, because it carries a timestamp and is not part of the tool's result.
+The Spark session is local mode on one thread (`local[1]`), with `spark.sql.shuffle.partitions` set to 1, the session time zone set to UTC, and the UI turned off. The driver binds to `127.0.0.1`. Arrow conversion is off. The session catalog is in memory, so Hive is not started. Warehouse, derby, and scratch directories are created under a temporary directory. A run does not leave `metastore_db`, `derby.log`, or `spark-warehouse` in the working directory or the repo root. Spark's startup banner is dropped, because it carries a timestamp and is not part of the tool's result. When the spec uses Iceberg, that session loads the Iceberg Spark runtime and registers a Hadoop catalog for the warehouse. A CSV or Parquet spec does not.
 
 Column names are case sensitive. `Amount` does not satisfy a spec column named `amount`.
 
-CSV is read from a file, or from a directory of part files. Marker files whose names start with `.` or `_` are skipped, so a Spark `_SUCCESS` file is not treated as a header. Every part file must use the header of the first file in sorted name order. A leading UTF-8 BOM is stripped from that header, so it does not rename the first column. The header becomes an explicit string schema, and `inferSchema` is off. The read uses `FAILFAST`, and `spark.sql.csv.parser.columnPruning.enabled` is false, so every field of every row is parsed. A short row or an unescaped multi-line field is a read error: `source csv has a malformed row`. Amount columns are parsed from those strings. A CSV amount is never a float, so a CSV file does not produce `float-amount`.
+CSV is read from a file, or from a directory of part files. Marker files whose names start with `.` or `_` are skipped, so a Spark `_SUCCESS` file is not treated as a header. Every part file must use the header of the first file in sorted name order. A leading UTF-8 BOM is stripped from that header, so it does not rename the first column. The header becomes an explicit string schema, and `inferSchema` is off. The read uses `FAILFAST`, and `spark.sql.csv.parser.columnPruning.enabled` is false, so every field of every row is parsed. A short row, or any field that spans lines (quoted or not, since multi-line CSV is not supported yet), is a read error: `source csv has a malformed row`. Amount columns are parsed from those strings. A CSV amount is never a float, so a CSV file does not produce `float-amount`.
 
-Parquet is read from a file or a directory, with `mergeSchema` off. The file schema is kept until amount columns are retyped.
+Parquet is read from a file or a directory, with `mergeSchema` off. The file schema is kept until amount columns are retyped. Iceberg keeps its table schema the same way, then the amount columns are retyped.
 
 Readers read every row. They do not sample, limit, or keep a head. `sampled: true` is refused even when the files contain a full extract, because the spec declared a sample.
 
 Blank amount cells are null. They are not turned into zero. Null counts arrive with `run`.
 
 A missing path, a CSV file that is not UTF-8, a malformed CSV row, or a file that Spark cannot read is a read error (`qa-core-recon: error:`), exit 2. It is not a refusal code.
+
+## Iceberg
+
+`format: iceberg` reads an Iceberg table through a Hadoop catalog. `path` is the warehouse directory. `table` is the identifier, written `namespace.table`. More than one namespace level is allowed, as in `finance.payments.txn`. `snapshot_id` is optional. Leave it out to read the current snapshot. Set it to read that snapshot only.
+
+```yaml
+target:
+  path: ./data/warehouse
+  format: iceberg
+  table: payments.txn
+```
+
+`path` goes through the allowlist before any read, in the same way as a CSV or Parquet path. The identifier is not a path. Each part must start with a letter or underscore and then use only letters, digits, and underscores. That keeps the Hadoop catalog from turning the identifier into a directory outside the warehouse. `table` and `snapshot_id` on a CSV or Parquet dataset are unknown keys. A missing `table`, a bad identifier, a snapshot id that is not an integer, and a snapshot id outside a 64-bit signed integer are a malformed spec.
+
+The catalog is `org.apache.iceberg.spark.SparkCatalog` with `type` set to `hadoop`. It is registered for that warehouse only, and only when the spec uses Iceberg. The Spark session catalog stays in memory, Hive is not started, and the Iceberg catalog cache is off so a read sees the current snapshot. This is not the Glue catalog.
+
+The runtime jar is `org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.7.1` (Spark 3.5, Scala 2.12). AWS Glue 5.0 ships Iceberg 1.7.1 with Spark 3.5.4, as listed in the AWS Glue versions documentation. Spark downloads the jar from Maven Central the first time a session is started for an Iceberg spec, and stores it in the Ivy cache (`~/.cache/qa-core-recon/ivy`, or `QA_CORE_RECON_IVY`). Later runs reuse the cache. CSV and Parquet do not download it.
+
+Iceberg on a local warehouse is supported. An allowlisted `s3://` warehouse is still a valid spec. `--check-data` prints `s3 reads are not supported yet` and exits 2, before Spark starts. S3 and the Glue catalog are later PRs.
+
+After the table is open, Iceberg uses the same checks as Parquet. Decimal columns are typed to `decimal(38, scale)` and must already fit that scale. A float or double amount is `float-amount` unless the spec sets `cast`. A missing column is `unmapped-column`. A missing table, a missing warehouse, or a snapshot id that is not in the table is a read error (`qa-core-recon: error:`), exit 2.
 
 ## Decimal Rules
 
@@ -141,7 +164,7 @@ A text amount is ASCII only: optional surrounding whitespace, an optional sign, 
 
 That refusal is `inexact-amount`, exit 2. It is not a mismatch. A mismatch means the target differs from the source, and exit 1 is reserved for `run`. A value that does not fit the declared scale gives the tool no amount to compare.
 
-`amounts[].cast` is optional. The only values are `half-even` and `half-up`. When it is present, a Parquet float or double amount column is rounded to the spec scale with that mode. The value that is rounded is the shortest decimal spelling of the float (`repr`), which is the spelling Spark's `cast` uses. `2.675` at scale 2 is `2.68` for both `half-up` and `half-even`. The rule does not authorize rounding a CSV string, an integer, or a Parquet decimal. `10.005` at scale 2 is still `inexact-amount` when `cast` is set. Without `cast`, a float or double amount column is `float-amount` and its values are not read.
+`amounts[].cast` is optional. The only values are `half-even` and `half-up`. When it is present, a Parquet or Iceberg float or double amount column is rounded to the spec scale with that mode. The value that is rounded is the shortest decimal spelling of the float (`repr`), which is the spelling Spark's `cast` uses. `2.675` at scale 2 is `2.68` for both `half-up` and `half-even`. The rule does not authorize rounding a CSV string, an integer, or a Parquet or Iceberg decimal. `10.005` at scale 2 is still `inexact-amount` when `cast` is set. Without `cast`, a float or double amount column is `float-amount` and its values are not read.
 
 Non-finite values (`NaN`, `Infinity`) are `inexact-amount` even when a cast rule is present. A rounding mode does not define a decimal for them.
 
@@ -156,7 +179,7 @@ A column type other than string, decimal, integer, float, or double (for example
 | Field | Rule |
 | ----- | ---- |
 | `version` | Integer `1`. Any other version is rejected. |
-| `source`, `target` | Each has `path` and `format`. Format is `csv` or `parquet`. |
+| `source`, `target` | Each has `path` and `format`. Format is `csv`, `parquet`, or `iceberg`. Iceberg also has `table` and an optional `snapshot_id`. |
 | `keys` | List of column names. Absent, null, or empty is a `missing-key` refusal. |
 | `amounts` | List of `{column, scale}` with optional `cast`. `scale` is an integer from 0 through 38. `cast` is `half-even` or `half-up`. The list may be empty. |
 | `group_by`, `hash_columns` | Lists of column names. Either list may be empty. |
@@ -164,7 +187,7 @@ A column type other than string, decimal, integer, float, or double (for example
 | `sampled` | Boolean. `true` means the spec describes a sample. |
 | `allowlist` | List of local paths or `s3://` URIs. An empty list allows no path. |
 
-Unknown keys are rejected. Column names are non-empty single-line strings. Formats and the version number are exact: `csv`, `parquet`, and integer `1`.
+Unknown keys are rejected. Column names are non-empty single-line strings. Formats and the version number are exact: `csv`, `parquet`, `iceberg`, and integer `1`.
 
 `sampled` must be a real boolean. Write `true` or `false`. A string such as `"false"` is a malformed spec. A missing `sampled` is a malformed spec, so an omitted declaration cannot be treated as a full reconciliation. A spec written by an earlier `init`, before this field existed, must add `sampled: false` before it will validate. `sampled: true` loads successfully. `validate` prints `spec ok`. `validate --check-data` refuses with `sample-only` and does not start Spark. An allowlisted `s3://` path is also reported before Spark starts.
 
