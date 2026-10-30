@@ -14,4 +14,9 @@ htmlcov/
 
 # Local data and outputs
 /data/raw/
-/out/**/*.parquet
+/out/
+
+# Spark and Iceberg local artefacts
+spark-warehouse/
+metastore_db/
+derby.log
