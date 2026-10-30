@@ -1,0 +1,37 @@
+# qa-core-recon spec. Proves a target dataset matches its source.
+# The values below are examples for a payments table; replace them with your own.
+
+# Spec format version. Always 1 for now.
+version: 1
+
+# Dataset the job read from.
+source:
+  path: ./data/raw/payments.csv
+  format: csv  # csv or parquet
+
+# Dataset the job wrote.
+target:
+  path: s3://demo-bucket/curated/payments/
+  format: parquet  # csv or parquet
+
+# Columns that together identify one row in both datasets.
+keys: [txn_id]
+
+# Money columns, compared as exact decimals with this many digits after the point.
+amounts:
+  - column: amount
+    scale: 2
+
+# Columns to total amounts by, so a mismatch points at a group.
+group_by: [day]
+
+# Columns hashed per row to catch any changed value.
+hash_columns: [type, amount, name_orig, name_dest]
+
+# Allowed difference in totals, quoted so it is never a float. A non-zero value needs a reason.
+tolerance:
+  value: "0"
+  reason: ""
+
+# Path prefixes the tool may read. Any other source or target path is refused.
+allowlist: ["./data", "s3://demo-bucket"]
