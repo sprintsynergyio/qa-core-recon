@@ -260,6 +260,36 @@ def test_local_only_session_does_not_request_s3_packages(spark, monkeypatch):
     assert ICEBERG_SPARK_PACKAGE not in seen["packages"]
 
 
+def test_s3_session_sets_s3_builder_settings(spark, monkeypatch):
+    import qa_core_recon.spark as spark_mod
+
+    seen: dict[str, str | None] = {}
+
+    def capture(builder):
+        for key, value in builder._options.items():
+            seen[key] = value
+        raise RuntimeError("stopped before the jvm")
+
+    monkeypatch.setattr(spark_mod, "_session", None)
+    monkeypatch.setattr(spark_mod, "_warehouse", None)
+    monkeypatch.setattr(spark_mod, "_iceberg_ready", False)
+    monkeypatch.setattr(spark_mod, "_s3_ready", False)
+    monkeypatch.setattr(spark_mod, "_start_quietly", capture)
+    with pytest.raises(SessionStartError, match="stopped before the jvm"):
+        local_session(iceberg=False, s3=True)
+    assert seen["spark.jars.packages"] == jars_packages(s3=True)
+    assert seen["spark.hadoop.fs.s3a.impl"] == "org.apache.hadoop.fs.s3a.S3AFileSystem"
+    assert seen["spark.hadoop.fs.s3a.path.style.access"] == "true"
+    assert seen["spark.hadoop.fs.s3a.endpoint"] == os.environ["QA_CORE_RECON_S3_ENDPOINT"]
+    assert seen["spark.hadoop.fs.s3a.retry.limit"] == "1"
+    assert seen["spark.hadoop.fs.s3a.retry.interval"] == "200ms"
+    provider = seen["spark.hadoop.fs.s3a.aws.credentials.provider"]
+    assert provider is not None
+    assert "DefaultAWSCredentialsProviderChain" in provider
+    secret = os.environ["AWS_SECRET_ACCESS_KEY"]
+    assert all(secret not in (value or "") for value in seen.values())
+
+
 def test_session_leaves_no_hive_files_in_the_repo(spark):
     spark.range(1).count()
     root = Path(__file__).resolve().parents[1]

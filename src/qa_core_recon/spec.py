@@ -96,7 +96,7 @@ _BUCKET_FORBIDDEN_SUFFIXES = (
     "--table-s3",
 )
 # Spark globs these characters when it opens a Parquet or CSV path.
-_S3_GLOB_CHARS = frozenset("*[]{}\\")
+_GLOB_CHARS = frozenset("*?[]{}\\")
 
 _TOP_LEVEL = (
     "version",
@@ -482,11 +482,38 @@ def _require_location(path: str, label: str) -> _LocalPath | _S3Path:
     if path.startswith("s3:"):
         raise SpecError(f"{label} is not a valid s3:// URI")
     location = _parse_local(path)
-    # file:/etc/hosts has no "://", so it is not caught as a scheme. Spark still
-    # treats a colon in the first segment as a URI and reads that absolute file.
-    if location.parts and ":" in location.parts[0]:
-        raise SpecError(f"{label} must not contain a colon in the first path segment")
+    _reject_local_colon(path, location, label)
+    _reject_local_globs(path, location, label)
     return location
+
+
+def _raw_local_segments(path: str) -> list[str]:
+    """Return path pieces before ".." is folded.
+
+    Empty pieces and "." are skipped. ".." is kept, so a scheme hiding behind
+    it is still visible. Slashes and backslashes are both separators.
+    """
+    return [piece for piece in re.split(r"[/\\]", path) if piece not in ("", ".")]
+
+
+def _reject_local_colon(path: str, location: _LocalPath, label: str) -> None:
+    # file:/etc/hosts has no "://", so it is not caught as a scheme. Spark still
+    # treats a colon in the first segment as a URI. Folding ".." first would
+    # hide file:/../tmp/x.csv behind the relative path tmp/x.csv.
+    raw = _raw_local_segments(path)
+    if (raw and ":" in raw[0]) or (location.parts and ":" in location.parts[0]):
+        raise SpecError(f"{label} must not contain a colon in the first path segment")
+
+
+def _reject_local_globs(path: str, location: _LocalPath, label: str) -> None:
+    for piece in (*_raw_local_segments(path), *location.parts):
+        _reject_glob_segment(piece, label, "path segment")
+
+
+def _reject_glob_segment(piece: str, label: str, noun: str) -> None:
+    for char in piece:
+        if char in _GLOB_CHARS:
+            raise SpecError(f"{label} {noun} {piece!r} contains glob character {char!r}")
 
 
 def _parse_local(path: str) -> _LocalPath:
@@ -541,9 +568,7 @@ def _parse_s3(path: str, label: str) -> _S3Path:
             raise SpecError(f"{label} has an empty key segment")
         if piece in {".", ".."}:
             raise SpecError(f"{label} has a {piece!r} key segment")
-        for char in piece:
-            if char in _S3_GLOB_CHARS:
-                raise SpecError(f"{label} key segment {piece!r} contains glob character {char!r}")
+        _reject_glob_segment(piece, label, "key segment")
         parts.append(piece)
     return _S3Path(bucket=bucket, parts=tuple(parts))
 

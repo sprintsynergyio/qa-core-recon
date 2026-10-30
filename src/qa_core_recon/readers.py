@@ -585,6 +585,7 @@ def _parse_all_csv_rows(df: DataFrame, side: str) -> None:
 
 def _csv_files(location: Path, side: str) -> list[Path]:
     if location.is_file():
+        _reject_listed_glob(location.name, side)
         return [location]
     files = [
         child
@@ -594,6 +595,8 @@ def _csv_files(location: Path, side: str) -> list[Path]:
     files.sort(key=lambda child: child.name)
     if not files:
         raise ReadError(f"{side} csv has no data files")
+    for child in files:
+        _reject_listed_glob(child.name, side)
     return files
 
 

@@ -22,7 +22,12 @@ from qa_core_recon.readers import (
     read_datasets,
 )
 from qa_core_recon.refusals import RefusalCode, RefusalError
-from qa_core_recon.spark import _holds_credential, s3_hadoop_settings
+from qa_core_recon.spark import (
+    _holds_credential,
+    apply_s3_config,
+    s3_hadoop_settings,
+    scrub_s3_credentials,
+)
 from qa_core_recon.spec import to_s3a
 from tests.support import parse_data, spec_data, write_csv, write_spec_file
 
@@ -650,9 +655,19 @@ def test_s3_csv_files_are_compared_in_sorted_name_order(spark, monkeypatch):
     assert str(caught.value) == "source csv header in 'z.csv' does not match 'a.csv'"
 
 
-def test_s3_read_unsets_an_access_key(spark, tmp_path):
+def test_apply_s3_config_unsets_access_and_secret_keys(spark):
     conf = spark.sparkContext._jsc.hadoopConfiguration()
     conf.set("fs.s3a.access.key", "qa-core-recon-test-access-key")
+    conf.set("fs.s3a.secret.key", "qa-core-recon-test-secret-key")
+    apply_s3_config(spark)
+    assert conf.get("fs.s3a.access.key") in (None, "")
+    assert conf.get("fs.s3a.secret.key") in (None, "")
+
+
+def test_s3_read_unsets_access_and_secret_keys(spark, tmp_path):
+    conf = spark.sparkContext._jsc.hadoopConfiguration()
+    conf.set("fs.s3a.access.key", "qa-core-recon-test-access-key")
+    conf.set("fs.s3a.secret.key", "qa-core-recon-test-secret-key")
     bucket = _bucket("scrub-key")
     target = _local_csv(tmp_path, "target.csv", CSV)
     path = f"s3://{bucket}/raw/missing.csv"
@@ -665,6 +680,32 @@ def test_s3_read_unsets_an_access_key(spark, tmp_path):
     with pytest.raises(ReadError):
         check_data(spark, parse_data(data))
     assert conf.get("fs.s3a.access.key") in (None, "")
+    assert conf.get("fs.s3a.secret.key") in (None, "")
+
+
+def test_scrub_removes_a_secret_stored_under_an_unmarked_name(spark):
+    conf = spark.sparkContext._jsc.hadoopConfiguration()
+    secret = os.environ["AWS_SECRET_ACCESS_KEY"]
+    conf.set("com.example.note", secret)
+    scrub_s3_credentials(spark)
+    assert conf.get("com.example.note") in (None, "")
+
+
+def test_status_403_is_access_denied():
+    path = "s3://recon-bucket/raw/payments.csv"
+    exc = RuntimeError("Service: Amazon S3; Status Code: 403; Error Code: Forbidden")
+    assert _classify_s3_error(exc, "target", path, missing_key=True) == (
+        f"access denied reading target path {path}"
+    )
+
+
+def test_missing_key_markers_apply_only_when_requested():
+    path = "s3://recon-bucket/pq/absent"
+    exc = RuntimeError("Path does not exist: s3a://recon-bucket/pq/absent PATH_NOT_FOUND")
+    assert _classify_s3_error(exc, "target", path, missing_key=True) == (
+        f"target path not found: {path}"
+    )
+    assert _classify_s3_error(exc, "target", path, missing_key=False) is None
 
 
 def test_holds_credential_matches_a_key_name_only():

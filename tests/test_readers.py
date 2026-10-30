@@ -366,6 +366,18 @@ def test_data_refusal_order_is_stable(spark, tmp_path):
     assert "9.001" not in inexact.message
 
 
+def test_local_csv_directory_rejects_a_glob_file_name(spark, tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "a[1].csv").write_text(HEADER + ROW, encoding="utf-8")
+    target = tmp_path / "target.csv"
+    write_csv(target, ROW)
+    spec = _spec(tmp_path, source, target, target_format="csv")
+    with pytest.raises(ReadError) as caught:
+        check_data(spark, spec)
+    assert str(caught.value) == "source csv object 'a[1].csv' contains glob character '['"
+
+
 def test_reader_rechecks_the_allowlist_before_opening(spark, tmp_path):
     source, target = _pair(tmp_path)
     spec = _spec(tmp_path, source, target, target_format="csv")

@@ -158,7 +158,7 @@ After the table is open, Iceberg uses the same checks as Parquet. Decimal column
 
 ## S3
 
-An `s3://` path in the spec is read by Spark as `s3a://`. The spec keeps the `s3://` text. One trailing slash is allowed on a path and on an allowlist entry, because a Glue location often ends with `/`. That slash is not a path component. `s3://bucket/curated/` and `s3://bucket/curated` are the same location. A second slash is still an empty segment, and the spec is malformed. `.`, `..`, a query, and a fragment are still rejected. A key segment must not contain a glob character (`*`, `[`, `]`, `{`, `}`, or `\`). Spark would expand it, so `s3://bucket/pq/*` could read every object under that prefix.
+An `s3://` path in the spec is read by Spark as `s3a://`. The spec keeps the `s3://` text. One trailing slash is allowed on a path and on an allowlist entry, because a Glue location often ends with `/`. That slash is not a path component. `s3://bucket/curated/` and `s3://bucket/curated` are the same location. A second slash is still an empty segment, and the spec is malformed. `.`, `..`, a query, and a fragment are still rejected. A key segment must not contain a glob character (`*`, `?`, `[`, `]`, `{`, `}`, or `\`). Spark would expand it, so `s3://bucket/pq/*` could read every object under that prefix. The same characters are rejected in a local path.
 
 The allowlist is checked before any read, on the path text, one whole component at a time. An `s3://` path matches only an `s3://` entry. A local entry does not cover a bucket, and a bucket entry does not cover a local path.
 
@@ -217,7 +217,7 @@ Unknown keys are rejected. Column names are non-empty single-line strings. Forma
 
 `tolerance.value` is a monetary amount. It must be a quoted string, parsed with `decimal.Decimal`. A YAML float is an error and is never converted. A YAML integer is an error too, because only a quoted string keeps the exact digits. The value must be finite and zero or greater. Zero may have an empty reason. A value above zero needs a reason that contains something other than whitespace.
 
-Paths are local paths or `s3://bucket/key` URIs. Any other scheme is a malformed spec, which exits 2 with `qa-core-recon: error:`, and is not a `path-not-allowed` refusal. A local path whose first segment contains a colon is malformed too. `file:/etc/hosts` has no `://`, but Spark would still open that absolute file.
+Paths are local paths or `s3://bucket/key` URIs. Any other scheme is a malformed spec, which exits 2 with `qa-core-recon: error:`, and is not a `path-not-allowed` refusal. A local path whose first segment contains a colon is malformed too. That segment is taken from the path text, split on `/` and `\`, skipping empty pieces and `.`, before `..` is folded. `file:/etc/hosts`, `file:/../tmp/x.csv`, and `./file:/../etc` are rejected. Spark would open them as absolute files. A local segment must not contain a glob character (`*`, `?`, `[`, `]`, `{`, `}`, or `\`). Spark expands those, so `p/a[1].csv` can read a different file. A file of that shape inside a directory is a read error and is not opened.
 
 ## Allowlist Matching
 
@@ -236,6 +236,6 @@ Matching compares normalised whole path components. It reads the path text in th
 | `s3://demo-bucket/curated/payments/` | `s3://demo-bucket/curated/` | Allowed. One trailing slash is not a component. |
 | `/data/x.csv` | `./data` | Outside. An absolute path matches only an absolute entry. |
 
-An `s3://` path matches only an `s3://` entry, by bucket and then by key components. Key segments are literal. A segment that is `.` or `..`, an empty segment, a query (`?`), a fragment (`#`), or a glob character (`*`, `[`, `]`, `{`, `}`, or `\`) makes the spec malformed. One trailing slash is allowed and is not an empty segment. A second slash, as in `s3://bucket/key//`, is an empty segment and is rejected. Comparison is case sensitive. Bucket names must follow the S3 naming rules. See S3.
+An `s3://` path matches only an `s3://` entry, by bucket and then by key components. Key segments are literal. A segment that is `.` or `..`, an empty segment, a query (`?`), a fragment (`#`), or a glob character (`*`, `?`, `[`, `]`, `{`, `}`, or `\`) makes the spec malformed. The same glob characters are rejected in every segment of a local path and a local allowlist entry. One trailing slash is allowed and is not an empty segment. A second slash, as in `s3://bucket/key//`, is an empty segment and is rejected. Comparison is case sensitive. Bucket names must follow the S3 naming rules. See S3.
 
 An allowlist entry that normalises to an empty path (`.` or `./data/..`), the filesystem root (`/`), or a path that still contains `..` is a malformed spec. A source or target path may still use `..`; that path is normalised and then compared with the allowlist.

@@ -495,6 +495,32 @@ def test_local_path_with_a_colon_in_the_first_segment_is_rejected():
 
     assert _error(allow) == "allowlist[1] must not contain a colon in the first path segment"
 
+    hidden = (
+        "file:/../etc/hosts",
+        "./file:/../etc",
+        "file:/../tmp/x.csv",
+    )
+    for path in hidden:
+        message = _error(lambda data, path=path: data["source"].__setitem__("path", path))
+        assert message == "source.path must not contain a colon in the first path segment"
+
+        def allow_hidden(data, path=path):
+            data["allowlist"] = [path, "s3://demo-bucket"]
+
+        assert _error(allow_hidden) == (
+            "allowlist[0] must not contain a colon in the first path segment"
+        )
+
+
+def test_local_glob_characters_are_rejected_on_paths_and_allowlist_entries():
+    message = _error(lambda data: data["source"].__setitem__("path", "data/a[1].csv"))
+    assert message == "source.path path segment 'a[1].csv' contains glob character '['"
+
+    def allow(data):
+        data["allowlist"] = ["data/a[1].csv", "s3://demo-bucket"]
+
+    assert _error(allow) == ("allowlist[0] path segment 'a[1].csv' contains glob character '['")
+
 
 def test_credentials_are_not_a_spec_field():
     assert (
