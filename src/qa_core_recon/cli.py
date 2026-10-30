@@ -75,6 +75,82 @@ def _init(args: argparse.Namespace) -> ExitCode:
     return ExitCode.MATCH
 
 
+def _run(args: argparse.Namespace) -> ExitCode:
+    # Imported here so init and a spec-only validate do not load PySpark.
+    from qa_core_recon.readers import ReadError
+    from qa_core_recon.report import OutputError, ensure_output_available
+    from qa_core_recon.spark import IcebergRuntimeError
+
+    try:
+        out = ensure_output_available(args.out, force=args.force)
+    except OutputError as exc:
+        _print_error(str(exc))
+        return ExitCode.REFUSED
+    try:
+        return _execute_run(Path(args.spec), out)
+    except OutputError as exc:
+        _print_error(str(exc))
+        return ExitCode.REFUSED
+    except ReadError as exc:
+        _print_error(str(exc))
+        return ExitCode.REFUSED
+    except IcebergRuntimeError as exc:
+        _print_error(str(exc))
+        return ExitCode.REFUSED
+
+
+def _execute_run(spec_path: Path, out: Path) -> ExitCode:
+    """Run the same refusals as validate --check-data, then the aggregate checks.
+
+    A refusal still writes the report. A read error does not. The output
+    directory is created only when a report is published.
+    """
+    from qa_core_recon.checks import execute_checks
+    from qa_core_recon.compare import exit_code_for
+    from qa_core_recon.readers import check_before_session, read_datasets
+    from qa_core_recon.report import (
+        build_result_report,
+        publish,
+        render_markdown,
+        spec_sha256,
+    )
+    from qa_core_recon.spark import local_session, local_session_active, stop_local_session
+
+    try:
+        spec = load_spec(spec_path)
+        # sample-only and s3 are decided here, before a JVM starts.
+        check_before_session(spec)
+    except RefusalError as exc:
+        _publish_refused(spec_path, out, exc)
+        raise
+
+    created = not local_session_active()
+    needs_iceberg = spec.source.format == "iceberg" or spec.target.format == "iceberg"
+    spark = local_session(iceberg=needs_iceberg)
+    try:
+        try:
+            source, target = read_datasets(spark, spec)
+            checks, row_counts = execute_checks(source, target, spec)
+        except RefusalError as exc:
+            _publish_refused(spec_path, out, exc)
+            raise
+    finally:
+        if created:
+            stop_local_session()
+
+    report = build_result_report(spec_sha256(spec_path), checks, row_counts)
+    publish(out, report, render_markdown(report))
+    print(report["status"])
+    return exit_code_for(report["status"])
+
+
+def _publish_refused(spec_path: Path, out: Path, exc: RefusalError) -> None:
+    from qa_core_recon.report import build_refused_report, publish, render_markdown, spec_sha256
+
+    report = build_refused_report(spec_sha256(spec_path), exc.refusal)
+    publish(out, report, render_markdown(report))
+
+
 def _validate(args: argparse.Namespace) -> ExitCode:
     spec = load_spec(Path(args.spec))
     if not args.check_data:
@@ -141,6 +217,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     validate.set_defaults(handler=_validate)
 
+    run = commands.add_parser("run", help="compare source and target and write a report")
+    run.add_argument("--spec", required=True, help="path to the spec file")
+    run.add_argument("--out", required=True, help="directory for report.json and report.md")
+    run.add_argument(
+        "--force",
+        action="store_true",
+        help="write the report into a directory that is not empty",
+    )
+    run.set_defaults(handler=_run)
+
     return parser
 
 
@@ -160,6 +246,7 @@ def main(argv: list[str] | None = None) -> ExitCode:
     """Run the CLI and return an exit code.
 
     Exit code 1 means a dataset mismatch. init and validate never report one.
+    run returns 1 when an aggregate check does not match.
     Any unexpected exception is printed as a single stderr line and returns 2,
     so a bug cannot surface as exit code 1 and cannot print a traceback.
     """
