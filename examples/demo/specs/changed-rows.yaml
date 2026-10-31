@@ -1,0 +1,33 @@
+# TXN000001 through TXN000005 keep their keys. The amount and txn_type change.
+# TODO(key-diff): the key diff and row hashes PR will list those txn_id values
+# as changed. Until that PR is merged, the row count matches and this case
+# shows up through the amount sum.
+version: 1
+
+source:
+  path: examples/demo/data/changed-rows/source.csv
+  format: csv
+
+target:
+  path: examples/demo/data/changed-rows/target.csv
+  format: csv
+
+keys: [txn_id]
+
+amounts:
+  - column: amount
+    scale: 2
+
+group_by: [txn_date]
+
+# TODO(key-diff): the key diff and row hashes PR will hash these columns
+# per txn_id and list the changed rows in the report.
+hash_columns: [account_id, txn_type, amount, currency, txn_date]
+
+tolerance:
+  value: "0"
+  reason: ""
+
+sampled: false
+
+allowlist: ["examples/demo/data"]

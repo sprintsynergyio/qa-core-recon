@@ -2,7 +2,56 @@
 
 Prove that a target dataset matches its source after a Glue or PySpark job, using deterministic checks. No AI model decides pass or fail.
 
-**Status: aggregate checks and S3 reads.** `--version`, `init`, `validate`, and `run` work. `validate --check-data` and `run` open CSV, Parquet, and Iceberg on local disk and on S3. `run` compares row counts, amount sums, null keys, and duplicate keys, and writes `report.json` and `report.md`. Key diff, row hashes, changed-column diff, and the demo are not in this release.
+**Status: aggregate checks, S3 reads, and a synthetic demo.** `--version`, `init`, `validate`, and `run` work. `validate --check-data` and `run` open CSV, Parquet, and Iceberg on local disk and on S3. `run` compares row counts, amount sums, null keys, and duplicate keys, and writes `report.json` and `report.md`. Key diff, row hashes, and changed-column diff are not in this release. The made-up demo dataset is under `examples/demo`.
+
+## Quick Start
+
+The demo uses a made-up payments dataset of a few hundred rows. From the repository root, install the package, generate the CSV files, run the matching spec, and read the report.
+
+### Install
+
+Requires Python 3.11 and Java 17.
+
+```bash
+python3.11 -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev]"
+```
+
+### Generate
+
+```bash
+python examples/demo/generate.py
+```
+
+The generator uses the Python standard library and a fixed seed. Every run writes the same bytes. The files under `examples/demo/data/` are that output.
+
+### Run
+
+```bash
+qa-core-recon run --spec examples/demo/specs/match.yaml --out /tmp/qa-core-recon-match
+```
+
+The command prints `match` and exits 0. `report.json` and `report.md` are in `/tmp/qa-core-recon-match`.
+
+These specs exit 1:
+
+- `examples/demo/specs/missing-rows.yaml` drops every target row dated 2024-03-01. The row count and the amount sum both differ.
+- `examples/demo/specs/extra-rows.yaml` adds three target rows on 2024-03-06. The row count and the amount sum both differ.
+- `examples/demo/specs/changed-rows.yaml` keeps every `txn_id` and changes the amount and `txn_type` on five rows. The row count matches. The amount sum differs.
+- `examples/demo/specs/sum-mismatch.yaml` adds 0.50 to every target amount. The row count matches. The amount sum differs.
+
+`examples/demo/specs/iceberg.yaml` compares the matching CSV with an Iceberg table of the same rows. `examples/demo/specs/s3.yaml` reads that same pair from `s3://demo-bucket`. The tests build the Iceberg table and upload the CSV files to moto. The commands above use the local match spec.
+
+### Read The Report
+
+```bash
+cat /tmp/qa-core-recon-match/report.md
+```
+
+`report.json` is the same result as canonical JSON: sorted keys, indent 2, and one trailing newline. Headings in `report.md` are Title Case. The files have no timestamp. `spec_sha256` is the SHA-256 of the spec file you passed.
+
+TODO(key-diff): the key diff and row hashes PR will list the missing, extra, and changed `txn_id` values in this report. Until that PR is merged, those cases show up through the row count and the amount sum.
 
 ## Install From Source
 

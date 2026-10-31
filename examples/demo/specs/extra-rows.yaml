@@ -1,0 +1,33 @@
+# The target adds TXN900001, TXN900002, and TXN900003 on 2024-03-06.
+# TODO(key-diff): the key diff and row hashes PR will list those txn_id values
+# as extra. Until that PR is merged, this case shows up through the row count
+# and the amount sum.
+version: 1
+
+source:
+  path: examples/demo/data/extra-rows/source.csv
+  format: csv
+
+target:
+  path: examples/demo/data/extra-rows/target.csv
+  format: csv
+
+keys: [txn_id]
+
+amounts:
+  - column: amount
+    scale: 2
+
+group_by: [txn_date]
+
+# TODO(key-diff): the key diff and row hashes PR will hash these columns
+# per txn_id and list the extra rows in the report.
+hash_columns: [account_id, txn_type, amount, currency, txn_date]
+
+tolerance:
+  value: "0"
+  reason: ""
+
+sampled: false
+
+allowlist: ["examples/demo/data"]
