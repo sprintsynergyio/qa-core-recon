@@ -12,6 +12,7 @@ from qa_core_recon.hashing import (
     encode_row,
     encode_value,
     row_hash_hex,
+    strict_decimal_payload,
 )
 from qa_core_recon.spec import Amount, Dataset, Spec, Tolerance
 
@@ -61,6 +62,9 @@ def test_decimals_compare_by_value_and_keep_significant_digits():
     assert encode_value(Decimal("100.00")) == "decimal:3:100"
     assert row_hash_hex((Decimal("1.0"),)) == row_hash_hex((Decimal("1.00"),))
     assert row_hash_hex((Decimal("1.0"),)) != row_hash_hex((Decimal("1.01"),))
+    assert strict_decimal_payload("1.50", 10, 2) == "1.5"
+    assert strict_decimal_payload("1.001", 10, 2) is None
+    assert strict_decimal_payload("01", 10, 0) == "1"
     wide = Decimal("9" * 36 + ".99")
     assert encode_value(wide) == "decimal:39:" + "9" * 36 + ".99"
 
@@ -91,12 +95,13 @@ def test_timestamps_dates_and_booleans_use_a_fixed_form():
     assert encode_value(b"\x00\xff") == "bytes:4:00ff"
 
 
-def test_compared_columns_are_sorted_and_skip_keys_and_group_by():
+def test_compared_columns_are_sorted_and_skip_keys():
     spec = _spec(hash_columns=["note", "alpha"], keys=["txn_id"])
-    assert compared_columns(spec) == ("alpha", "amount", "note")
+    assert compared_columns(spec) == ("alpha", "amount", "day", "note")
     keyed_amount = _spec(keys=["amount"], hash_columns=["note"])
-    assert compared_columns(keyed_amount) == ("note",)
-    assert compared_columns(_spec(amounts=[], hash_columns=[], group_by=["day"])) == ()
+    assert compared_columns(keyed_amount) == ("day", "note")
+    assert compared_columns(_spec(amounts=[], hash_columns=[], group_by=["day"])) == ("day",)
+    assert compared_columns(_spec(amounts=[], hash_columns=[], group_by=[])) == ()
 
 
 def test_spark_sha256_matches_the_python_digest(spark):

@@ -117,7 +117,7 @@ Spark's own decimal sum is not used. With precision loss allowed, that sum retur
 
 **Duplicate Keys.** The number of key values that appear more than once, on each side. Any duplicate is a mismatch. The report gives the counts and up to 20 example keys. Those 20 are the first in sorted order, with nulls first. 20 is fixed (`DUPLICATE_EXAMPLE_LIMIT`). The count is the full number, so it can be higher than the number of examples. A key value is the whole key: every column in `keys`.
 
-**Row Hash.** For every row, Spark computes a SHA-256 over the compared columns. The compared columns are the amount columns and the `hash_columns`, with key columns removed. `group_by` is not included unless that column is also an amount or a hash column. Source and target use the same column names, so the hash order is those names sorted ascending. That is the target order after the identity mapping. A column that is not named in the spec is not hashed.
+**Row Hash.** For every row, Spark computes a SHA-256 over the compared columns. The compared columns are the amount columns, the `group_by` columns, and the `hash_columns`, with key columns removed. Source and target use the same column names, so the hash order is those names sorted ascending. That is the target order after the identity mapping. A column that is not named in the spec is not hashed. When that set is empty, changed rows cannot be detected, and the report says so.
 
 The encoding is one token per value, concatenated in that order. Null is the single character `n`. Every other value is `tag:length:payload`. `length` is the UTF-8 byte length of `payload`, written in decimal with no leading zeros. This keeps `("a,b", "c")` distinct from `("a", "b,c")`, and it keeps null distinct from the empty string (`string:0:`).
 
@@ -133,11 +133,11 @@ The encoding is one token per value, concatenated in that order. Null is the sin
 | date | `date:10:YYYY-MM-DD` |
 | timestamp | `timestamp:27:YYYY-MM-DDTHH:MM:SS.ffffffZ` |
 
-A decimal is the plain string of its exact numeric value. Trailing zeros that only record scale are removed, so `1.0` and `1.00` both encode as `decimal:1:1`. Every significant digit is kept. The string is not rounded and is not written in scientific notation. Negative zero is `0`. An integer and a decimal stay different tags, so integer `1` and decimal `1` do not match. Amount columns are already `decimal(38, scale)` before this encoding. The amount sum check still prints them at the spec scale. The row hash does not.
+A decimal is the plain string of its exact numeric value. Trailing zeros that only record scale are removed, so `1.0` and `1.00` both encode as `decimal:1:1`. Every significant digit is kept. The string is not rounded and is not written in scientific notation. Negative zero is `0`. When one side is an integer and the other is a decimal, both use this decimal payload, so integer `1` and decimal `1.00` match. Amount columns are already `decimal(38, scale)` before this encoding. The amount sum check still prints them at the spec scale. The row hash does not.
 
 A float uses one payload for every NaN, including a negative NaN (`NaN`). `-0.0` and `0.0` both encode as `0.0`. Other finite floats use Python `repr`. `Infinity` and `-Infinity` are fixed words.
 
-A date is `YYYY-MM-DD`. A timestamp is UTC with six fractional digits and a `Z` suffix. A value without a time zone is UTC, because the Spark session time zone is UTC. A value with a time zone is converted to UTC first.
+A date is `YYYY-MM-DD`. A `TimestampType` value is formatted in Spark with `date_format` under the UTC session, before any Python code sees it, as `YYYY-MM-DDTHH:MM:SS.ffffffZ`. The worker's local time zone is not used. `TimestampNTZ` uses that same pattern on the stored wall time and is not shifted. A string is parsed with `try_cast` into the other side's type when the types differ. A non-null string that does not parse is changed, not null. Float against double, and any other pair that cannot be aligned, is listed under `type_mismatches` and compared by its string rendering. That list makes the run a mismatch. No new refusal code is used.
 
 The row hash is not a separate pass or fail check. `key_diff` and `changed_columns` use it.
 
@@ -152,6 +152,8 @@ Three counts are reported. Any count above zero is a mismatch.
 | `changed` | The key is on both sides and the row hash differs. |
 
 Rows with a null in any key column are excluded. They stay in the null-key check and are not listed as missing, extra, or changed. A target key that has no matching source key is still extra: the excluded source row is not a key, so it does not match that target key.
+
+Key columns are aligned before the join, with the same rules as compared columns. The join is on those aligned strings, not on Spark's own cast. A string key must round-trip: `01` does not become integer `1`, so `01` is missing and `1` is extra. Types that cannot be aligned are compared as their canonical strings and listed under `type_mismatches`.
 
 Counts are by distinct key value, not by physical row. When several rows share a key, the row with the smallest row hash is the one that is compared. Two identical copies of one row therefore do not make the key changed. A second copy whose hash is larger is not the row that is compared. The duplicate-key check still reports the duplicate. The report states this rule on every run, and it says when duplicate keys were found.
 
@@ -238,7 +240,7 @@ Target duplicate keys: 0.
 
 Status: Match
 
-Compared columns, in hash order: amount, note.
+Compared columns, in hash order: amount, day, note.
 
 Rows with a null in any key column are excluded.
 Counts are by distinct key value.

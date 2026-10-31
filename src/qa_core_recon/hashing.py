@@ -17,10 +17,16 @@ scale are removed. Every significant digit is kept, the string is not
 rounded, and scientific notation is not used. Negative zero is ``0``.
 
 Float ``-0.0`` is ``0.0``. Every NaN, including a negative NaN, is ``NaN``.
-A naive timestamp is UTC, because the Spark session time zone is UTC. An
-aware timestamp is converted to UTC. The text is
-``YYYY-MM-DDTHH:MM:SS.ffffffZ`` with six fractional digits. A date is
-``YYYY-MM-DD``. Booleans are ``true`` and ``false``.
+Dates are ``YYYY-MM-DD``. Booleans are ``true`` and ``false``.
+
+Spark ``TimestampType`` values are not passed through :func:`encode_value`.
+The worker would hand them over as naive datetimes in the machine's local
+time zone. The key diff formats those instants in Spark, under the UTC
+session, before any Python encoder runs. ``TimestampNTZType`` is formatted
+from the stored wall time and is not shifted. A naive datetime passed to
+:func:`encode_value` directly is treated as UTC only when the caller already
+holds a UTC value. An aware datetime is converted to UTC. The text is
+``YYYY-MM-DDTHH:MM:SS.ffffffZ``.
 
 Tolerance is not applied here. Amount sums may lie inside the spec tolerance
 while the row hash still changes.
@@ -41,16 +47,20 @@ _DECIMAL_CONTEXT = Context(prec=100, traps=[])
 def compared_columns(spec: Spec) -> tuple[str, ...]:
     """Return the non-key columns in the row hash, sorted by name.
 
-    Amount columns and ``hash_columns`` are included. ``group_by`` is not,
-    unless that column is also an amount or a hash column. A key column is
-    never included. Source and target use the same names in this version, so
-    the sorted names are the target order after that mapping. The spec order
-    does not change the hash.
+    Amount columns, ``group_by`` columns, and ``hash_columns`` are included.
+    A key column is never included. Source and target use the same names in
+    this version, so the sorted names are the target order after that mapping.
+    The spec order does not change the hash. An empty result means a changed
+    row cannot be detected.
     """
     keys = set(spec.keys)
     names: list[str] = []
     seen: set[str] = set()
-    for name in (*(amount.column for amount in spec.amounts), *spec.hash_columns):
+    for name in (
+        *(amount.column for amount in spec.amounts),
+        *spec.group_by,
+        *spec.hash_columns,
+    ):
         if name in keys or name in seen:
             continue
         seen.add(name)
@@ -101,6 +111,36 @@ def _tag_and_payload(value: object) -> tuple[str, str]:
     if isinstance(value, date):
         return "date", value.isoformat()
     raise TypeError(f"cannot encode {type(value).__name__} for a row hash")
+
+
+def strict_decimal_payload(text: str, precision: int, scale: int) -> str | None:
+    """Return the decimal payload when ``text`` fits ``decimal(precision, scale)``.
+
+    Rounding is a failed parse. ``1.50`` at scale 2 is accepted. ``1.001`` at
+    scale 2 is not. The payload is the same text :func:`encode_value` uses.
+    """
+    from decimal import InvalidOperation
+
+    if text is None:
+        return None
+    raw = str(text).strip()
+    if raw == "":
+        return None
+    try:
+        value = Decimal(raw)
+    except InvalidOperation:
+        return None
+    if not value.is_finite():
+        return None
+    quantum = Decimal(1).scaleb(-scale)
+    with localcontext(_DECIMAL_CONTEXT):
+        fitted = value.quantize(quantum)
+        if fitted.compare(value) != 0:
+            return None
+        digits = fitted.as_tuple().digits
+        if digits != (0,) and len(digits) > precision:
+            return None
+    return _decimal_payload(value)
 
 
 def _decimal_payload(value: Decimal) -> str:

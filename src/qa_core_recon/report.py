@@ -408,8 +408,18 @@ def _key_diff_lines(details: dict) -> list[str]:
     if columns:
         lines.append("Compared columns, in hash order: " + ", ".join(columns) + ".")
     else:
-        lines.append("No compared columns were declared.")
+        lines.append(details["changed_detection"])
     lines.append("")
+    mismatches = details.get("type_mismatches") or []
+    if mismatches:
+        lines.append("Type mismatches. These columns are compared by their string rendering.")
+        lines.append("")
+        for item in mismatches:
+            lines.append(
+                f"- {item['column']} ({item['role']}). "
+                f"Source type: {item['source_type']}. Target type: {item['target_type']}."
+            )
+        lines.append("")
     for rule in details["rules"]:
         lines.append(rule)
     lines.append("")
@@ -457,7 +467,12 @@ def _changed_column_lines(details: dict) -> list[str]:
         lines.append("")
         for example in examples:
             key = _example_label(details["keys"], example["key"])
-            lines.append(f"- {key}. Source: {example['source']}. Target: {example['target']}.")
+            lines.append(
+                f"- {key}. Source: {_cell(example['source'])}. "
+                f"Target: {_cell(example['target'])}. "
+                f"Source token: {example['source_token']}. "
+                f"Target token: {example['target_token']}."
+            )
         if examples:
             lines.append("")
     return lines
@@ -485,6 +500,12 @@ def _example_label(keys: list[str], example: list) -> str:
         shown = "null" if value is None else str(value)
         parts.append(f"{name}={shown}")
     return ", ".join(parts)
+
+
+def _cell(value: object) -> str:
+    if value is None:
+        return "null"
+    return str(value)
 
 
 def _shown(value: object) -> str:
