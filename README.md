@@ -113,7 +113,7 @@ Sums are compared exactly. When the tolerance is above zero, the absolute differ
 
 Spark's own decimal sum is not used. With precision loss allowed, that sum returns null on overflow, and null is also what an all-null column produces. This command folds the sum as an exact decimal and then requires it to fit `decimal(38, scale)`. A total or a group sum that does not fit is a read error, exit 2, and no report is written. The message says `sum` for a total and `group sum` for one group. Source is checked before target. On one side, groups are checked in sorted order and then the total. Amount columns follow the spec order.
 
-**Null Keys.** The number of rows with a null in any key column, on each side. Any null key is a mismatch. The report gives both counts. An empty CSV field is an empty string, not a null. Parquet and Iceberg can store a real null.
+**Null Keys.** The number of rows with a null in any key column, on each side. Any null key is a mismatch. The report gives both counts. An empty CSV field and a quoted empty field (`""`) are both read as null. Parquet and Iceberg can store a real null.
 
 **Duplicate Keys.** The number of key values that appear more than once, on each side. Any duplicate is a mismatch. The report gives the counts and up to 20 example keys. Those 20 are the first in sorted order, with nulls first. 20 is fixed (`DUPLICATE_EXAMPLE_LIMIT`). The count is the full number, so it can be higher than the number of examples. A key value is the whole key: every column in `keys`.
 
@@ -153,7 +153,7 @@ Three counts are reported. Any count above zero is a mismatch.
 
 Rows with a null in any key column are excluded. They stay in the null-key check and are not listed as missing, extra, or changed. A target key that has no matching source key is still extra: the excluded source row is not a key, so it does not match that target key.
 
-Key columns are aligned before the join, with the same rules as compared columns. The join is on those aligned strings, not on Spark's own cast. A string key must round-trip: `01` does not become integer `1`, so `01` is missing and `1` is extra. Types that cannot be aligned are compared as their canonical strings and listed under `type_mismatches`.
+Key columns are aligned before the join. The join is on those aligned strings, not on Spark's own cast. A string key must equal the canonical text of the typed value, with no trim. An integer's text is its digits, so `1` matches and `01`, `+1`, ` 1`, `1.0`, `1.00`, and `1e0` do not. A decimal's text is the plain number at the column scale, with no exponent and no sign when the value is positive or zero. `decimal(10,2)` renders `1.00`, so only that spelling matches. A value that does not match stays unmatched and is missing or extra. Compared columns still accept equivalent spellings. Types that cannot be aligned are compared as their canonical strings and listed under `type_mismatches`.
 
 Counts are by distinct key value, not by physical row. When several rows share a key, the row with the smallest row hash is the one that is compared. Two identical copies of one row therefore do not make the key changed. A second copy whose hash is larger is not the row that is compared. The duplicate-key check still reports the duplicate. The report states this rule on every run, and it says when duplicate keys were found.
 

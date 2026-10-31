@@ -4,7 +4,7 @@ import json
 import os
 import subprocess
 import sys
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 
 from pyspark.sql import DataFrame
@@ -21,7 +21,7 @@ from pyspark.sql.types import (
     TimestampType,
 )
 
-from qa_core_recon.compare import KEY_DIFF_EXAMPLE_LIMIT
+from qa_core_recon.compare import KEY_DIFF_EXAMPLE_LIMIT, sort_token
 from qa_core_recon.exit_codes import ExitCode
 from qa_core_recon.hashing import encode_value, row_hash_hex
 from tests.support import HEADER, spec_data, write_csv, write_spec_file
@@ -34,6 +34,10 @@ from tests.test_run import (
 )
 
 ROW = "1,10.50,2024-01-01,a\n"
+
+
+def _utc(year, month, day, hour=0, minute=0, second=0):
+    return datetime(year, month, day, hour, minute, second, tzinfo=UTC)
 
 
 def _csv_run(tmp_path, source_body, target_body, header=HEADER, **changes):
@@ -320,8 +324,8 @@ def test_dates_timestamps_and_booleans(spark, tmp_path):
             StructField("instant", TimestampType(), True),
         ]
     )
-    moment = datetime(2024, 1, 2, 3, 4, 5)
-    later = datetime(2024, 1, 2, 3, 4, 6)
+    moment = _utc(2024, 1, 2, 3, 4, 5)
+    later = _utc(2024, 1, 2, 3, 4, 6)
     source_rows = [("1", True, date(2024, 1, 2), moment), ("2", True, date(2024, 1, 2), moment)]
     target_rows = [("1", True, date(2024, 1, 2), moment), ("2", False, date(2024, 1, 2), later)]
     code, report, _markdown = _parquet_run(
@@ -517,8 +521,8 @@ def test_timestamps_use_utc_under_a_local_time_zone(spark, tmp_path):
     )
     source = tmp_path / "source"
     target = tmp_path / "target"
-    _write_frame(spark, source, [("1", datetime(2024, 11, 3, 5, 30))], schema)
-    _write_frame(spark, target, [("1", datetime(2024, 11, 3, 6, 30))], schema)
+    _write_frame(spark, source, [("1", _utc(2024, 11, 3, 5, 30))], schema)
+    _write_frame(spark, target, [("1", _utc(2024, 11, 3, 6, 30))], schema)
     data = spec_data(tmp_path, source, target, source_format="parquet", target_format="parquet")
     data.update(amounts=[], group_by=[], hash_columns=["instant"])
     spec = write_spec_file(tmp_path, data)
@@ -561,7 +565,7 @@ def test_csv_values_align_with_parquet_types(spark, tmp_path):
     _write_frame(
         spark,
         target,
-        [("1", 5, Decimal("1.50"), date(2024, 1, 1), datetime(2024, 1, 1, 5, 30))],
+        [("1", 5, Decimal("1.50"), date(2024, 1, 1), _utc(2024, 1, 1, 5, 30))],
         schema,
     )
     data = spec_data(tmp_path, source, target, source_format="csv", target_format="parquet")
@@ -598,7 +602,7 @@ def test_csv_values_align_with_an_iceberg_target(spark, tmp_path):
         spark,
         warehouse,
         "payments.txn",
-        [("1", 5, Decimal("1.50"), date(2024, 1, 1), datetime(2024, 1, 1, 5, 30))],
+        [("1", 5, Decimal("1.50"), date(2024, 1, 1), _utc(2024, 1, 1, 5, 30))],
         schema,
         mode="overwrite",
     )
@@ -754,6 +758,101 @@ def test_nan_and_negative_zero_examples_sort_in_a_fixed_order(spark, tmp_path):
     assert code is ExitCode.MISMATCH
     examples = _key_diff(report)["details"]["changed"]["examples"]
     assert examples == [["-1.0"], ["0.0"], ["2.0"], ["NaN"]]
+
+
+_KEY_SPELLINGS = ("01", "+1", " 1", "1.0", "1.00", "1e0")
+
+
+def _spelling_rows(spellings):
+    return "".join(f"{text},a\n" for text in spellings)
+
+
+def test_int_key_text_must_be_the_digits(spark, tmp_path):
+    source = tmp_path / "source.csv"
+    write_csv(source, _spelling_rows(("1", *_KEY_SPELLINGS)), "txn_id,note\n")
+    schema = StructType(
+        [
+            StructField("txn_id", LongType(), True),
+            StructField("note", StringType(), True),
+        ]
+    )
+    target = tmp_path / "target"
+    _write_frame(spark, target, [(1, "a")], schema)
+    data = spec_data(tmp_path, source, target, source_format="csv", target_format="parquet")
+    data.update(amounts=[], group_by=[], hash_columns=["note"], keys=["txn_id"])
+    spec = write_spec_file(tmp_path, data)
+    out = tmp_path / "out"
+    assert _invoke(spec, out) is ExitCode.MISMATCH
+    details = _key_diff(_load(out)[0])["details"]
+    assert details["extra"]["count"] == 0
+    assert details["changed"]["count"] == 0
+    expected = [[text] for text in sorted(_KEY_SPELLINGS, key=sort_token)]
+    assert details["missing"]["examples"] == expected
+
+
+def test_decimal_key_text_must_use_the_column_scale(spark, tmp_path):
+    source = tmp_path / "source.csv"
+    write_csv(source, _spelling_rows(_KEY_SPELLINGS), "txn_id,note\n")
+    schema = StructType(
+        [
+            StructField("txn_id", DecimalType(10, 2), True),
+            StructField("note", StringType(), True),
+        ]
+    )
+    target = tmp_path / "target"
+    _write_frame(spark, target, [(Decimal("1.00"), "a")], schema)
+    data = spec_data(tmp_path, source, target, source_format="csv", target_format="parquet")
+    data.update(amounts=[], group_by=[], hash_columns=["note"], keys=["txn_id"])
+    spec = write_spec_file(tmp_path, data)
+    out = tmp_path / "out"
+    assert _invoke(spec, out) is ExitCode.MISMATCH
+    details = _key_diff(_load(out)[0])["details"]
+    assert details["extra"]["count"] == 0
+    assert details["changed"]["count"] == 0
+    unmatched = tuple(text for text in _KEY_SPELLINGS if text != "1.00")
+    assert details["missing"]["examples"] == [[text] for text in sorted(unmatched, key=sort_token)]
+
+
+def test_noncanonical_date_string_is_changed(spark, tmp_path):
+    source = tmp_path / "source.csv"
+    write_csv(source, "1,2024-1-1\n", "txn_id,day\n")
+    schema = StructType(
+        [
+            StructField("txn_id", StringType(), True),
+            StructField("day", DateType(), True),
+        ]
+    )
+    target = tmp_path / "target"
+    _write_frame(spark, target, [("1", date(2024, 1, 1))], schema)
+    data = spec_data(tmp_path, source, target, source_format="csv", target_format="parquet")
+    data.update(amounts=[], group_by=[], hash_columns=["day"])
+    spec = write_spec_file(tmp_path, data)
+    out = tmp_path / "out"
+    assert _invoke(spec, out) is ExitCode.MISMATCH
+    example = _changed(_load(out)[0])["details"]["columns"][0]["examples"][0]
+    assert example["key"] == ["1"]
+    assert example["source"] == "2024-1-1"
+    assert example["source_token"].startswith("invalid:")
+    assert example["target"] == "2024-01-01"
+
+
+def test_special_column_names_are_quoted_in_casts(spark, tmp_path):
+    key_names = ("a-b", "a b", "a.b", "a`b")
+    hash_names = ("h-b", "h b", "h.b", "h`b")
+    header = ",".join((*key_names, *hash_names)) + "\n"
+    source = tmp_path / "source.csv"
+    write_csv(source, "1,1,1,1,7,7,7,7\n", header)
+    fields = [StructField(name, LongType(), True) for name in (*key_names, *hash_names)]
+    target = tmp_path / "target"
+    _write_frame(spark, target, [(1, 1, 1, 1, 7, 7, 7, 7)], StructType(fields))
+    data = spec_data(tmp_path, source, target, source_format="csv", target_format="parquet")
+    data.update(amounts=[], group_by=[], keys=list(key_names), hash_columns=list(hash_names))
+    spec = write_spec_file(tmp_path, data)
+    out = tmp_path / "out"
+    assert _invoke(spec, out) is ExitCode.MATCH
+    report, _raw, _markdown = _load(out)
+    assert _key_diff(report)["status"] == "match"
+    assert _key_diff(report)["details"]["changed"]["count"] == 0
 
 
 def _note_schema(amount):

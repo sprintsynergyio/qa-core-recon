@@ -11,8 +11,13 @@ driver. Values stay in Spark.
   string that does not parse becomes an ``invalid:`` token, not null, so the
   row is changed. Decimal strings that would have to be rounded do not parse.
   Date strings must already be ``YYYY-MM-DD``.
-* Key columns use a lossless parse. ``01`` does not round-trip to ``1``, so
-  the string key stays unmatched and the long key stays unmatched.
+* Key columns use a lossless parse. The raw string, with no trim, must equal
+  one canonical rendering of the typed value. An integer renders as its
+  digits (``1``, not ``01`` or `` 1``). A decimal renders at the column
+  scale (``1.00`` for ``decimal(10,2)``), with no exponent and no sign when
+  the value is positive or zero. Anything else stays unmatched.
+* Compared columns keep a tolerant parse: surrounding spaces and equivalent
+  spellings may match, and a non-null string that does not parse is changed.
 * Any other pair, including float against double, is not given a new refusal
   code. The column is listed in ``type_mismatches`` and both sides are hashed
   as their string rendering.
@@ -119,7 +124,7 @@ def join_key(plan: FieldPlan, side: str) -> Column:
     dtype = _dtype(plan, side)
     column = _column(plan.name)
     if plan.kind == "parse" and plan.string_side == side:
-        return _parsed_string(column, _other_type(plan, side), lossless=True, for_join=True)
+        return _parsed_string(plan.name, _other_type(plan, side), lossless=True, for_join=True)
     if plan.kind == "render":
         return _rendered_token(column)
     if plan.kind == "numeric":
@@ -132,7 +137,7 @@ def value_token(plan: FieldPlan, side: str) -> Column:
     dtype = _dtype(plan, side)
     column = _column(plan.name)
     if plan.kind == "parse" and plan.string_side == side:
-        return _parsed_string(column, _other_type(plan, side), lossless=False, for_join=False)
+        return _parsed_string(plan.name, _other_type(plan, side), lossless=False, for_join=False)
     if plan.kind == "render":
         return _rendered_token(column)
     if plan.kind == "numeric":
@@ -154,7 +159,7 @@ def value_display(plan: FieldPlan, side: str) -> Column:
     if plan.kind == "render":
         return when(column.isNull(), lit(None).cast("string")).otherwise(column.cast("string"))
     if plan.kind == "parse" and plan.string_side == side:
-        return _parsed_display(column, _other_type(plan, side))
+        return _parsed_display(plan.name, _other_type(plan, side))
     return column
 
 
@@ -241,10 +246,13 @@ def _cell_token(column: Column) -> Column:
     return when(column.isNull(), lit("n")).otherwise(_ENCODE(column))
 
 
-def _parsed_string(column: Column, typed: DataType, *, lossless: bool, for_join: bool) -> Column:
+def _parsed_string(name: str, typed: DataType, *, lossless: bool, for_join: bool) -> Column:
+    column = _column(name)
     if isinstance(typed, DecimalType):
-        return _decimal_string_token(column, typed.precision, typed.scale, for_join=for_join)
-    parsed, ok = _parse(column, typed, lossless=lossless)
+        return _decimal_string_token(
+            name, typed.precision, typed.scale, lossless=lossless, for_join=for_join
+        )
+    parsed, ok = _parse(name, typed, lossless=lossless)
     aligned = _direct_token(parsed, typed)
     # A failed key keeps its own token, so two equal bad strings still join
     # and a bad string does not join a typed value. A failed compared value
@@ -253,15 +261,26 @@ def _parsed_string(column: Column, typed: DataType, *, lossless: bool, for_join:
     return when(column.isNull(), lit("n")).when(ok, aligned).otherwise(fallback)
 
 
-def _decimal_string_token(column: Column, precision: int, scale: int, *, for_join: bool) -> Column:
+def _decimal_string_token(
+    name: str, precision: int, scale: int, *, lossless: bool, for_join: bool
+) -> Column:
+    column = _column(name)
+    fallback = _cell_token(column) if for_join else _invalid_token(column)
+    if lossless:
+        # The raw text must be the scale rendering, such as 1.00 for scale 2.
+        parsed = _try_name(name, f"decimal({precision},{scale})")
+        rendered = parsed.cast("string")
+        ok = parsed.isNotNull() & (column == rendered)
+        aligned = _cell_token(parsed)
+        return when(column.isNull(), lit("n")).when(ok, aligned).otherwise(fallback)
     payload = _DECIMAL_PAYLOAD(trim(column), lit(precision), lit(scale))
     size = length(encode(payload, "UTF-8")).cast("string")
     token = concat(lit("decimal:"), size, lit(":"), payload)
-    fallback = _cell_token(column) if for_join else _invalid_token(column)
     return when(column.isNull(), lit("n")).when(payload.isNull(), fallback).otherwise(token)
 
 
-def _parsed_display(column: Column, typed: DataType) -> Column:
+def _parsed_display(name: str, typed: DataType) -> Column:
+    column = _column(name)
     if isinstance(typed, DecimalType):
         payload = _DECIMAL_PAYLOAD(trim(column), lit(typed.precision), lit(typed.scale))
         return (
@@ -269,7 +288,7 @@ def _parsed_display(column: Column, typed: DataType) -> Column:
             .when(payload.isNull(), column.cast("string"))
             .otherwise(payload)
         )
-    parsed, ok = _parse(column, typed, lossless=False)
+    parsed, ok = _parse(name, typed, lossless=False)
     if _is_timestamp(typed):
         shown = date_format(parsed, _TIMESTAMP_PATTERN)
     elif isinstance(typed, DateType):
@@ -283,46 +302,52 @@ def _parsed_display(column: Column, typed: DataType) -> Column:
     )
 
 
-def _parse(column: Column, typed: DataType, *, lossless: bool) -> tuple[Column, Column]:
-    text = trim(column)
+def _parse(name: str, typed: DataType, *, lossless: bool) -> tuple[Column, Column]:
+    column = _column(name)
     if _is_int(typed):
-        parsed = _try(text, "bigint")
+        parsed = _try_name(name, "bigint")
         if lossless:
-            ok = parsed.isNotNull() & (text == parsed.cast("string"))
+            # Digits only. " 1" and "01" are not "1".
+            ok = parsed.isNotNull() & (column == parsed.cast("string"))
         else:
             ok = parsed.isNotNull()
         return parsed, ok
     if isinstance(typed, DateType):
-        parsed = _try(text, "date")
+        parsed = _try_name(name, "date")
         canon = date_format(parsed, "yyyy-MM-dd")
-        ok = parsed.isNotNull() & (text == canon)
+        # Values may have surrounding spaces. Keys must already be canonical.
+        compared = column if lossless else trim(column)
+        ok = parsed.isNotNull() & (compared == canon)
         return parsed, ok
     if isinstance(typed, TimestampNTZType):
-        parsed = _try(text, "timestamp_ntz")
+        parsed = _try_name(name, "timestamp_ntz")
         return parsed, parsed.isNotNull()
     if isinstance(typed, TimestampType):
-        parsed = _try(text, "timestamp")
+        parsed = _try_name(name, "timestamp")
         return parsed, parsed.isNotNull()
     if isinstance(typed, BooleanType):
-        parsed = _try(text, "boolean")
+        parsed = _try_name(name, "boolean")
         return parsed, parsed.isNotNull()
     if isinstance(typed, FloatType):
-        parsed = _try(text, "float")
+        parsed = _try_name(name, "float")
         return parsed, parsed.isNotNull()
     if isinstance(typed, DoubleType):
-        parsed = _try(text, "double")
+        parsed = _try_name(name, "double")
         return parsed, parsed.isNotNull()
     if isinstance(typed, BinaryType):
         return column, lit(False)
     return column, lit(False)
 
 
-def _try(column: Column, sql_type: str) -> Column:
+def _quote_ident(name: str) -> str:
+    """Return a Spark identifier. Backticks inside the name are doubled."""
+    return "`" + name.replace("`", "``") + "`"
+
+
+def _try_name(name: str, sql_type: str) -> Column:
     # try_cast returns null for a value that does not fit, including when ANSI
-    # mode is on. ``toString`` of a named column is its SQL expression
-    # (``qty`` or ``trim(qty)``), which try_cast can wrap.
-    inner = column._jc.toString()
-    return expr(f"try_cast({inner} as {sql_type})")
+    # mode is on. The name is quoted so a hyphen or a dot stays one identifier.
+    return expr(f"try_cast({_quote_ident(name)} as {sql_type})")
 
 
 def _invalid_token(column: Column) -> Column:
