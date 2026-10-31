@@ -1,10 +1,18 @@
-"""Aggregate checks for ``qa-core-recon run``.
+"""Aggregate and key-diff checks for ``qa-core-recon run``.
 
-Four checks run, in this order: row_count, amount_sum, null_keys, duplicate_keys.
-All four run even when an earlier one mismatches. Each check computes its
-result inside Spark. Only aggregates reach the driver: one total per side,
-one row per group, the null-key counts, the duplicate-key count, and at most
-:data:`qa_core_recon.compare.DUPLICATE_EXAMPLE_LIMIT` example keys.
+Six checks run, in this order: row_count, amount_sum, null_keys,
+duplicate_keys, key_diff, changed_columns. All six run even when an earlier
+one mismatches. Each check computes its result inside Spark. Only aggregates
+reach the driver: one total per side, one row per group, the null-key counts,
+the duplicate-key count, the key-diff counts, the per-column changed counts,
+and at most :data:`qa_core_recon.compare.DUPLICATE_EXAMPLE_LIMIT` or
+:data:`qa_core_recon.compare.KEY_DIFF_EXAMPLE_LIMIT` example keys.
+
+The key diff drops rows with a null in any key column, then groups by the
+distinct key. One key contributes one count. When several rows share a key,
+the row with the smallest row hash is the one that is compared. The row hash
+is SHA-256 of the canonical encoding in :mod:`qa_core_recon.hashing`, computed
+in Spark. The full hash column is not collected.
 
 Amount sums are not Spark ``sum``. With precision loss allowed, Spark's sum
 of ``decimal(38, scale)`` returns null when the total overflows, which is the
@@ -36,11 +44,15 @@ from dataclasses import dataclass
 from decimal import Decimal
 
 from pyspark.sql import DataFrame
-from pyspark.sql.functions import col, lit
+from pyspark.sql.functions import col, concat, lit, sha2, struct, udf, when
 from pyspark.sql.functions import count as spark_count
+from pyspark.sql.functions import min as spark_min
+from pyspark.sql.functions import sum as spark_sum
+from pyspark.sql.types import StringType
 
 from qa_core_recon.compare import (
     DUPLICATE_EXAMPLE_LIMIT,
+    KEY_DIFF_EXAMPLE_LIMIT,
     absolute_difference,
     add_exact,
     decimal_fits,
@@ -54,10 +66,34 @@ from qa_core_recon.compare import (
     sums_match,
 )
 from qa_core_recon.decimals import DECIMAL_PRECISION
+from qa_core_recon.hashing import compared_columns, encode_value
 from qa_core_recon.readers import ReadError
 from qa_core_recon.spec import Spec
 
-_CHECK_ORDER = ("row_count", "amount_sum", "null_keys", "duplicate_keys")
+_CHECK_ORDER = (
+    "row_count",
+    "amount_sum",
+    "null_keys",
+    "duplicate_keys",
+    "key_diff",
+    "changed_columns",
+)
+
+_NULL_KEY_RULE = "Rows with a null in any key column are excluded."
+_DISTINCT_RULE = "Counts are by distinct key value."
+_DUPLICATE_RULE = "When a key is duplicated, the row with the smallest row hash is used."
+_CHANGED_COLUMN_RULE = (
+    "Each count is the number of distinct keys whose value differs. "
+    "The example is the row with the smallest row hash."
+)
+
+
+def _encode_cell(value: object) -> str:
+    """Return the canonical token. Runs on Spark executors, not the driver."""
+    return encode_value(value)
+
+
+_ENCODE = udf(_encode_cell, StringType())
 
 
 @dataclass(frozen=True)
@@ -77,7 +113,7 @@ class _Side:
 def execute_checks(
     source: DataFrame, target: DataFrame, spec: Spec
 ) -> tuple[list[dict], dict[str, int]]:
-    """Return the four check objects and the per-side row counts.
+    """Return the six check objects and the per-side row counts.
 
     Raises ReadError when an amount sum does not fit decimal(38, scale).
     """
@@ -94,6 +130,10 @@ def execute_checks(
             "source": _duplicate_keys(source, spec),
             "target": _duplicate_keys(target, spec),
         }
+        duplicates_present = duplicates["source"][0] > 0 or duplicates["target"][0] > 0
+        key_diff, changed_columns = _key_difference(
+            source, target, spec, duplicates_present=duplicates_present
+        )
     finally:
         source.unpersist()
         target.unpersist()
@@ -102,6 +142,8 @@ def execute_checks(
         _amount_sum_check(source_side, target_side, spec),
         _null_key_check(nulls, spec),
         _duplicate_key_check(duplicates, spec),
+        key_diff,
+        changed_columns,
     ]
     if tuple(check["name"] for check in checks) != _CHECK_ORDER:
         raise RuntimeError("checks were assembled out of order")
@@ -447,3 +489,230 @@ def _difference(source: Decimal | None, target: Decimal | None, scale: int):
 
 def _column(name: str):
     return col("`" + name.replace("`", "``") + "`")
+
+
+@dataclass(frozen=True)
+class _Keyed:
+    frame: DataFrame
+    hash_name: str
+    value_names: tuple[str, ...]
+
+
+def _key_difference(
+    source: DataFrame,
+    target: DataFrame,
+    spec: Spec,
+    *,
+    duplicates_present: bool,
+) -> tuple[dict, dict]:
+    """Return the key_diff and changed_columns checks.
+
+    Rows with a null in any key column are removed before the join. The join
+    is one row per distinct key. Counts and at most KEY_DIFF_EXAMPLE_LIMIT
+    examples are collected. The hash column itself is not collected.
+    """
+    columns = compared_columns(spec)
+    keys = list(spec.keys)
+    left = _keyed_side(source, keys, columns, "src")
+    right = _keyed_side(target, keys, columns, "tgt")
+    joined = left.frame.join(right.frame, on=keys, how="fullouter").cache()
+    try:
+        return _key_difference_from_join(
+            joined,
+            spec,
+            columns,
+            left,
+            right,
+            duplicates_present=duplicates_present,
+        )
+    finally:
+        joined.unpersist()
+
+
+def _key_difference_from_join(
+    joined: DataFrame,
+    spec: Spec,
+    columns: tuple[str, ...],
+    left: _Keyed,
+    right: _Keyed,
+    *,
+    duplicates_present: bool,
+) -> tuple[dict, dict]:
+    keys = list(spec.keys)
+    src_hash = _column(left.hash_name)
+    tgt_hash = _column(right.hash_name)
+    missing = src_hash.isNotNull() & tgt_hash.isNull()
+    extra = tgt_hash.isNotNull() & src_hash.isNull()
+    changed = src_hash.isNotNull() & tgt_hash.isNotNull() & (src_hash != tgt_hash)
+    column_differs = [
+        changed & (_column(src_name) != _column(tgt_name))
+        for src_name, tgt_name in zip(left.value_names, right.value_names, strict=True)
+    ]
+    summary = joined.agg(
+        spark_sum(when(missing, lit(1)).otherwise(lit(0))).alias("missing"),
+        spark_sum(when(extra, lit(1)).otherwise(lit(0))).alias("extra"),
+        spark_sum(when(changed, lit(1)).otherwise(lit(0))).alias("changed"),
+        *[
+            spark_sum(when(condition, lit(1)).otherwise(lit(0))).alias(f"d{index}")
+            for index, condition in enumerate(column_differs)
+        ],
+    ).collect()[0]
+    missing_count = _as_count(summary["missing"])
+    extra_count = _as_count(summary["extra"])
+    changed_count = _as_count(summary["changed"])
+    column_counts = [_as_count(summary[f"d{index}"]) for index in range(len(columns))]
+    if changed_count == 0 and any(column_counts):
+        raise RuntimeError("a column differs while the row hash matches")
+    if changed_count and not any(column_counts):
+        raise RuntimeError("row hash differs but no compared column differs")
+
+    missing_examples = _take_key_examples(joined, keys, missing) if missing_count else []
+    extra_examples = _take_key_examples(joined, keys, extra) if extra_count else []
+    changed_examples = _take_key_examples(joined, keys, changed) if changed_count else []
+    changed_column_rows = []
+    for index, name in enumerate(columns):
+        count = column_counts[index]
+        if count == 0:
+            continue
+        examples = _take_value_examples(
+            joined,
+            keys,
+            column_differs[index],
+            left.value_names[index],
+            right.value_names[index],
+        )
+        changed_column_rows.append({"column": name, "count": count, "examples": examples})
+
+    key_status = "match" if missing_count == extra_count == changed_count == 0 else "mismatch"
+    column_status = "match" if not changed_column_rows else "mismatch"
+    key_diff = {
+        "name": "key_diff",
+        "status": key_status,
+        "details": {
+            "changed": {"count": changed_count, "examples": changed_examples},
+            "columns": list(columns),
+            "counting": "distinct_key",
+            "duplicates_present": duplicates_present,
+            "example_limit": KEY_DIFF_EXAMPLE_LIMIT,
+            "extra": {"count": extra_count, "examples": extra_examples},
+            "keys": keys,
+            "missing": {"count": missing_count, "examples": missing_examples},
+            "null_keys": "excluded",
+            "rules": [_NULL_KEY_RULE, _DISTINCT_RULE, _DUPLICATE_RULE],
+        },
+    }
+    changed_columns = {
+        "name": "changed_columns",
+        "status": column_status,
+        "details": {
+            "columns": changed_column_rows,
+            "counting": "distinct_key",
+            "example_limit": KEY_DIFF_EXAMPLE_LIMIT,
+            "keys": keys,
+            "rule": _CHANGED_COLUMN_RULE,
+        },
+    }
+    return key_diff, changed_columns
+
+
+def _keyed_side(frame: DataFrame, keys: list[str], columns: tuple[str, ...], prefix: str) -> _Keyed:
+    """One row per distinct non-null key, with the smallest row hash's values."""
+    taken = set(frame.columns)
+    enc_names = [_private(taken, f"__qa_enc_{index}") for index in range(len(columns))]
+    hash_temp = _private(taken, "__qa_row_hash")
+    encoded = [
+        _ENCODE(_column(name)).alias(enc_name)
+        for name, enc_name in zip(columns, enc_names, strict=True)
+    ]
+    projected = _without_null_keys(frame.select(*[_column(name) for name in keys], *encoded), keys)
+    digest = _digest(enc_names)
+    projected = projected.withColumn(hash_temp, digest)
+    fields = [_column(hash_temp).alias("h")]
+    fields.extend(_column(enc_name).alias(f"c{index}") for index, enc_name in enumerate(enc_names))
+    output_taken = set(keys)
+    rep = _private(output_taken, "__qa_rep")
+    hash_name = _private(output_taken, f"__qa_{prefix}_hash")
+    value_names = tuple(
+        _private(output_taken, f"__qa_{prefix}_c{index}") for index in range(len(columns))
+    )
+    grouped = projected.groupBy(*[_column(name) for name in keys]).agg(
+        spark_min(struct(*fields)).alias(rep)
+    )
+    selected = [_column(name) for name in keys]
+    selected.append(_column(rep).getField("h").alias(hash_name))
+    for index, value_name in enumerate(value_names):
+        selected.append(_column(rep).getField(f"c{index}").alias(value_name))
+    return _Keyed(frame=grouped.select(*selected), hash_name=hash_name, value_names=value_names)
+
+
+def _digest(enc_names: list[str]):
+    if not enc_names:
+        return sha2(lit(""), 256)
+    return sha2(concat(*[_column(name) for name in enc_names]), 256)
+
+
+def _without_null_keys(frame: DataFrame, keys: list[str]) -> DataFrame:
+    condition = _column(keys[0]).isNotNull()
+    for name in keys[1:]:
+        condition = condition & _column(name).isNotNull()
+    return frame.filter(condition)
+
+
+def _take_key_examples(frame: DataFrame, keys: list[str], condition) -> list[list]:
+    limited = (
+        frame.filter(condition)
+        .orderBy(*[_column(name).asc_nulls_first() for name in keys])
+        .limit(KEY_DIFF_EXAMPLE_LIMIT)
+    )
+    rows = [tuple(item[name] for name in keys) for item in limited.collect()]
+    rows.sort(key=lambda item: tuple(sort_token(value) for value in item))
+    return [[render_value(value) for value in item] for item in rows]
+
+
+def _take_value_examples(
+    frame: DataFrame,
+    keys: list[str],
+    condition,
+    source_name: str,
+    target_name: str,
+) -> list[dict]:
+    taken = set(keys)
+    source_alias = _private(taken, "__qa_source_value")
+    target_alias = _private(taken, "__qa_target_value")
+    limited = (
+        frame.filter(condition)
+        .select(
+            *[_column(name) for name in keys],
+            _column(source_name).alias(source_alias),
+            _column(target_name).alias(target_alias),
+        )
+        .orderBy(*[_column(name).asc_nulls_first() for name in keys])
+        .limit(KEY_DIFF_EXAMPLE_LIMIT)
+    )
+    found = []
+    for item in limited.collect():
+        key = tuple(item[name] for name in keys)
+        found.append((key, item[source_alias], item[target_alias]))
+    found.sort(key=lambda item: tuple(sort_token(value) for value in item[0]))
+    return [
+        {
+            "key": [render_value(value) for value in key],
+            "source": source,
+            "target": target,
+        }
+        for key, source, target in found
+    ]
+
+
+def _as_count(value: object) -> int:
+    if value is None:
+        return 0
+    return int(value)
+
+
+def _private(taken: set[str], base: str) -> str:
+    name = base
+    while name in taken:
+        name += "_"
+    taken.add(name)
+    return name

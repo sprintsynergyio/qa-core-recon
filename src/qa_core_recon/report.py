@@ -36,6 +36,8 @@ _CHECK_HEADINGS = {
     "amount_sum": "Amount Sum",
     "null_keys": "Null Keys",
     "duplicate_keys": "Duplicate Keys",
+    "key_diff": "Key Diff",
+    "changed_columns": "Changed Columns",
 }
 
 
@@ -214,24 +216,43 @@ def reject_output_overlap(out: Path, source_path: str, target_path: str) -> None
 
     Writing the report into a dataset directory makes the next read treat
     ``report.json`` as another data file. ``s3://`` paths are not local, so
-    they do not overlap a local output directory.
+    they do not overlap a local output directory. A symlink loop on the
+    output path is an output error. A symlink loop on the source or the
+    target is a read error. Neither one is an unexpected error.
     """
     for side, dataset_path in (("source", source_path), ("target", target_path)):
-        if _local_paths_overlap(out, dataset_path):
+        if _local_paths_overlap(out, dataset_path, side):
             raise OutputError(f"output path {out} overlaps {side} path {dataset_path}")
 
 
-def _local_paths_overlap(out: Path, dataset_path: str) -> bool:
+def _local_paths_overlap(out: Path, dataset_path: str, side: str) -> bool:
     if _has_scheme(dataset_path) or dataset_path.startswith("s3:"):
         return False
     # resolve follows symlinks and folds "..". absolute() leaves both in place,
     # so a link to the dataset, or "<data>/other/../src", would miss the check.
+    # A symlink loop raises RuntimeError, not OSError.
     try:
-        left = out.resolve(strict=False).parts
-        right = Path(dataset_path).resolve(strict=False).parts
-    except OSError as exc:
-        raise OutputError(_cannot_use(out, exc)) from None
+        left = _resolve_parts(out)
+    except _PathResolveError as exc:
+        raise OutputError(f"cannot write {out}: {exc.detail}") from None
+    try:
+        right = _resolve_parts(Path(dataset_path))
+    except _PathResolveError as exc:
+        raise OutputError(f"cannot read {side} path {dataset_path!r}: {exc.detail}") from None
     return left == right or _is_prefix(left, right) or _is_prefix(right, left)
+
+
+class _PathResolveError(Exception):
+    def __init__(self, detail: str) -> None:
+        self.detail = detail
+
+
+def _resolve_parts(path: Path) -> tuple[str, ...]:
+    try:
+        return path.resolve(strict=False).parts
+    except (OSError, RuntimeError) as exc:
+        detail = getattr(exc, "strerror", None) or str(exc) or exc.__class__.__name__
+        raise _PathResolveError(detail) from None
 
 
 def _is_prefix(prefix: tuple[str, ...], path: tuple[str, ...]) -> bool:
@@ -293,6 +314,10 @@ def _check_lines(check: dict) -> list[str]:
         )
     elif name == "duplicate_keys":
         lines.extend(_duplicate_lines(details))
+    elif name == "key_diff":
+        lines.extend(_key_diff_lines(details))
+    elif name == "changed_columns":
+        lines.extend(_changed_column_lines(details))
     return lines
 
 
@@ -374,6 +399,67 @@ def _duplicate_side(label: str, keys: list[str], payload: dict) -> list[str]:
         lines.append(f"- {_example_label(keys, example)}")
     if examples:
         lines.append("")
+    return lines
+
+
+def _key_diff_lines(details: dict) -> list[str]:
+    lines: list[str] = []
+    columns = details["columns"]
+    if columns:
+        lines.append("Compared columns, in hash order: " + ", ".join(columns) + ".")
+    else:
+        lines.append("No compared columns were declared.")
+    lines.append("")
+    for rule in details["rules"]:
+        lines.append(rule)
+    lines.append("")
+    if details["duplicates_present"]:
+        lines.append("Duplicate keys were found, so each distinct key is counted once.")
+        lines.append("")
+    lines.append(f"Example limit: {details['example_limit']}.")
+    lines.append("")
+    for label, name in (("Missing", "missing"), ("Extra", "extra"), ("Changed", "changed")):
+        lines.extend(_key_bucket_lines(label, details["keys"], details[name]))
+    return lines
+
+
+def _key_bucket_lines(label: str, keys: list[str], payload: dict) -> list[str]:
+    count = payload["count"]
+    examples = payload["examples"]
+    lines = [f"{label} keys: {count}."]
+    if count > len(examples):
+        lines.append(f"The first {len(examples)} of {count} are listed in sorted order.")
+    lines.append("")
+    for example in examples:
+        lines.append(f"- {_example_label(keys, example)}")
+    if examples:
+        lines.append("")
+    return lines
+
+
+def _changed_column_lines(details: dict) -> list[str]:
+    lines = [
+        f"Example limit: {details['example_limit']}.",
+        "",
+        details["rule"],
+        "",
+    ]
+    columns = details["columns"]
+    if not columns:
+        lines.extend(["No compared column differs.", ""])
+        return lines
+    for column in columns:
+        count = column["count"]
+        examples = column["examples"]
+        lines.append(f"Column {column['column']}. Distinct keys that differ: {count}.")
+        if count > len(examples):
+            lines.append(f"The first {len(examples)} of {count} are listed in sorted order.")
+        lines.append("")
+        for example in examples:
+            key = _example_label(details["keys"], example["key"])
+            lines.append(f"- {key}. Source: {example['source']}. Target: {example['target']}.")
+        if examples:
+            lines.append("")
     return lines
 
 

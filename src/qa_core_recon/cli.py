@@ -267,7 +267,7 @@ def main(argv: list[str] | None = None) -> ExitCode:
     """Run the CLI and return an exit code.
 
     Exit code 1 means a dataset mismatch. init and validate never report one.
-    run returns 1 when an aggregate check does not match.
+    run returns 1 when any check does not match.
     Any unexpected exception is printed as a single stderr line and returns 2,
     so a bug cannot surface as exit code 1 and cannot print a traceback.
     """

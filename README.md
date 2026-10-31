@@ -2,7 +2,7 @@
 
 Prove that a target dataset matches its source after a Glue or PySpark job, using deterministic checks. No AI model decides pass or fail.
 
-**Status: aggregate checks.** `--version`, `init`, `validate`, and `run` work. `validate --check-data` opens local CSV, Parquet, and Iceberg and runs the data-level refusals. `run` compares row counts, amount sums, null keys, and duplicate keys, and writes `report.json` and `report.md`. Key diff, row hashes, changed-column diff, S3 reads, and the demo are not in this release.
+**Status: key diff.** `--version`, `init`, `validate`, and `run` work. `validate --check-data` opens local CSV, Parquet, and Iceberg and runs the data-level refusals. `run` compares row counts, amount sums, null keys, duplicate keys, and the key diff, and writes `report.json` and `report.md`. S3 reads and the demo are not in this release.
 
 ## Install From Source
 
@@ -52,7 +52,7 @@ Also open both datasets and run the data-level refusals:
 qa-core-recon validate --spec recon.yaml --check-data
 ```
 
-When those checks pass, the command prints `data ok` and exits with code 0. It does not compare the two datasets, so different amounts on the two sides still print `data ok`. `run` compares counts and sums and writes a report. Key diff, row hashes, and changed-column diff arrive in a later PR.
+When those checks pass, the command prints `data ok` and exits with code 0. It does not compare the two datasets, so different amounts on the two sides still print `data ok`. `run` compares counts, sums, and keys and writes a report.
 
 A refusal prints `refused: <code>: <message>` to stderr and exits with code 2. A malformed spec prints `qa-core-recon: error: <message>` to stderr and exits with code 2. A dataset that cannot be opened, including an allowlisted `s3://` path, prints `qa-core-recon: error: <message>` to stderr and exits with code 2.
 
@@ -72,8 +72,8 @@ Nothing in pass or fail calls a model. Two runs on the same inputs write byte-id
 
 | Code | Result |
 | ---- | ------ |
-| 0 | Every aggregate check matched. |
-| 1 | At least one aggregate check did not match. |
+| 0 | Every check matched. |
+| 1 | At least one check did not match. |
 | 2 | The run was refused, or a dataset or the output directory could not be used. |
 
 ### Example Spec
@@ -103,13 +103,13 @@ allowlist: ["./data"]
 
 ### Checks
 
-All four checks run inside Spark. Only the aggregates come back to the driver: one total per side, one row per group, the null-key counts, the duplicate-key count, and at most 20 example keys. A mismatch does not skip the later checks. The report lists them in this order.
+All six checks run inside Spark. Only the aggregates come back to the driver: one total per side, one row per group, the null-key counts, the duplicate-key count, the key-diff counts, the changed-column counts, and at most 20 example keys for each list. A mismatch does not skip the later checks. The report lists the checks in this order: row count, amount sum, null keys, duplicate keys, key diff, and changed columns. The row hash below is the encoding the last two checks use. It is not its own check.
 
 **Row Count.** Total rows on each side. When `group_by` is set, also the rows in each group. Groups are sorted. A group that is missing on either side is a mismatch and is listed. A count of 0 on one side means that group was not present. Group values compare by value across types, so an int 1 and a decimal 1.00 are the same group. Every float NaN is one shared group, shown as NaN, and it sorts after every other float. -0.0 is the same group as 0.0.
 
 **Amount Sum.** For each amount column, the exact sum on each side, stored as `decimal(38, scale)`, for the whole side and for each group. Decimals are written as strings with the full scale, so scale 2 renders `10.50`. Null amounts are left out of the sum. They are not added as zero. A side or a group with no non-null amount has a null sum. Two null sums match. A null sum against a number, including zero, is a mismatch.
 
-Sums are compared exactly. When the tolerance is above zero, the absolute difference must be less than or equal to that tolerance, and the report names the reason. Equality is inside the range. The same tolerance is applied to the total and to each group on its own. It is not a budget shared across groups. A missing group has no sum, so the tolerance does not cover it.
+Sums are compared exactly. When the tolerance is above zero, the absolute difference must be less than or equal to that tolerance, and the report names the reason. Equality is inside the range. The same tolerance is applied to the total and to each group on its own. It is not a budget shared across groups. A missing group has no sum, so the tolerance does not cover it. Tolerance applies only to these sums. It does not apply to the row hash or to the key diff. A row whose amount differs is a changed row even when the sums are inside the tolerance, and the run does not match.
 
 Spark's own decimal sum is not used. With precision loss allowed, that sum returns null on overflow, and null is also what an all-null column produces. This command folds the sum as an exact decimal and then requires it to fit `decimal(38, scale)`. A total or a group sum that does not fit is a read error, exit 2, and no report is written. The message says `sum` for a total and `group sum` for one group. Source is checked before target. On one side, groups are checked in sorted order and then the total. Amount columns follow the spec order.
 
@@ -117,7 +117,45 @@ Spark's own decimal sum is not used. With precision loss allowed, that sum retur
 
 **Duplicate Keys.** The number of key values that appear more than once, on each side. Any duplicate is a mismatch. The report gives the counts and up to 20 example keys. Those 20 are the first in sorted order, with nulls first. 20 is fixed (`DUPLICATE_EXAMPLE_LIMIT`). The count is the full number, so it can be higher than the number of examples. A key value is the whole key: every column in `keys`.
 
-Key diff, row hashes, and changed-column diff are not part of this command.
+**Row Hash.** For every row, Spark computes a SHA-256 over the compared columns. The compared columns are the amount columns and the `hash_columns`, with key columns removed. `group_by` is not included unless that column is also an amount or a hash column. Source and target use the same column names, so the hash order is those names sorted ascending. That is the target order after the identity mapping. A column that is not named in the spec is not hashed.
+
+The encoding is one token per value, concatenated in that order. Null is the single character `n`. Every other value is `tag:length:payload`. `length` is the UTF-8 byte length of `payload`, written in decimal with no leading zeros. This keeps `("a,b", "c")` distinct from `("a", "b,c")`, and it keeps null distinct from the empty string (`string:0:`).
+
+| Value | Token |
+| ----- | ----- |
+| null | `n` |
+| boolean | `bool:4:true` or `bool:5:false` |
+| integer | `int:<length>:<digits>` |
+| decimal | `decimal:<length>:<plain value>` |
+| float | `float:<length>:<text>` |
+| string | `string:<length>:<text>` |
+| bytes | `bytes:<length>:<lowercase hex>` |
+| date | `date:10:YYYY-MM-DD` |
+| timestamp | `timestamp:27:YYYY-MM-DDTHH:MM:SS.ffffffZ` |
+
+A decimal is the plain string of its exact numeric value. Trailing zeros that only record scale are removed, so `1.0` and `1.00` both encode as `decimal:1:1`. Every significant digit is kept. The string is not rounded and is not written in scientific notation. Negative zero is `0`. An integer and a decimal stay different tags, so integer `1` and decimal `1` do not match. Amount columns are already `decimal(38, scale)` before this encoding. The amount sum check still prints them at the spec scale. The row hash does not.
+
+A float uses one payload for every NaN, including a negative NaN (`NaN`). `-0.0` and `0.0` both encode as `0.0`. Other finite floats use Python `repr`. `Infinity` and `-Infinity` are fixed words.
+
+A date is `YYYY-MM-DD`. A timestamp is UTC with six fractional digits and a `Z` suffix. A value without a time zone is UTC, because the Spark session time zone is UTC. A value with a time zone is converted to UTC first.
+
+The row hash is not a separate pass or fail check. `key_diff` and `changed_columns` use it.
+
+**Key Diff.** A full outer join on the key columns. The join runs in Spark. Only the three counts, the per-column counts, and at most 20 example keys come back to the driver. `KEY_DIFF_EXAMPLE_LIMIT` is 20, the same cap as `DUPLICATE_EXAMPLE_LIMIT`. Examples are sorted with nulls first. The count is the full number, so it can be higher than 20.
+
+Three counts are reported. Any count above zero is a mismatch.
+
+| Count | Meaning |
+| ----- | ------- |
+| `missing` | The key is on the source and not on the target. |
+| `extra` | The key is on the target and not on the source. |
+| `changed` | The key is on both sides and the row hash differs. |
+
+Rows with a null in any key column are excluded. They stay in the null-key check and are not listed as missing, extra, or changed. A target key that has no matching source key is still extra: the excluded source row is not a key, so it does not match that target key.
+
+Counts are by distinct key value, not by physical row. When several rows share a key, the row with the smallest row hash is the one that is compared. Two identical copies of one row therefore do not make the key changed. A second copy whose hash is larger is not the row that is compared. The duplicate-key check still reports the duplicate. The report states this rule on every run, and it says when duplicate keys were found.
+
+**Changed Columns.** For the changed keys, each compared column has a count of how many distinct keys differ in that column, and up to 20 examples. An example has the key, the source token, and the target token, using the row-hash encoding above. Columns are sorted by name. Only columns with a count above zero are listed. A count above zero is a mismatch. The example is the row with the smallest row hash, the same row the key diff compared.
 
 ### Report Files
 
@@ -130,7 +168,7 @@ Key diff, row hashes, and changed-column diff are not part of this command.
 | `spec_sha256` | SHA-256 of the spec file bytes |
 | `status` | `match`, `mismatch`, or `refused` |
 | `refusals` | a list of `{code, message}`. Empty when the datasets were compared. |
-| `checks` | a list of `{name, status, details}`. Empty when the run was refused. Decimals in `details` are strings. |
+| `checks` | a list of `{name, status, details}`. Empty when the run was refused. Decimals in amount sums are strings. The names, in order, are `row_count`, `amount_sum`, `null_keys`, `duplicate_keys`, `key_diff`, and `changed_columns`. |
 | `row_counts` | `{source, target}`. Both are null when the run was refused, because the rows were not counted. |
 
 ### Sample Report
@@ -195,14 +233,42 @@ Example limit: 20.
 Source duplicate keys: 0.
 
 Target duplicate keys: 0.
+
+### Key Diff
+
+Status: Match
+
+Compared columns, in hash order: amount, note.
+
+Rows with a null in any key column are excluded.
+Counts are by distinct key value.
+When a key is duplicated, the row with the smallest row hash is used.
+
+Example limit: 20.
+
+Missing keys: 0.
+
+Extra keys: 0.
+
+Changed keys: 0.
+
+### Changed Columns
+
+Status: Match
+
+Example limit: 20.
+
+Each count is the number of distinct keys whose value differs. The example is the row with the smallest row hash.
+
+No compared column differs.
 ```
 
 ## Exit Codes
 
 | Code | Name | Meaning |
 | ---- | ---- | ------- |
-| 0 | `MATCH` | Success. For `validate`, the spec is usable. For `validate --check-data`, both datasets passed the data-level refusals. For `run`, every aggregate check matched. |
-| 1 | `MISMATCH` | `run` found a difference. At least one aggregate check did not match. |
+| 0 | `MATCH` | Success. For `validate`, the spec is usable. For `validate --check-data`, both datasets passed the data-level refusals. For `run`, every check matched. |
+| 1 | `MISMATCH` | `run` found a difference. At least one check did not match. |
 | 2 | `REFUSED` | The tool declined to run, or the input or the output directory could not be used, so there is no comparison result. A refusal still writes a report. A read error does not. |
 
 `init` and `validate` use codes 0 and 2 only. `--check-data` is part of `validate`, so it stays on those codes too. `run` uses 0, 1, and 2. An amount that cannot be represented at the spec scale is a refusal, exit 2, because the tool has no decimal to compare. A sum that does not fit `decimal(38, scale)` is a read error on `run`, exit 2, because a rounded total would be a wrong number. `init` and `validate` never return code 1.
@@ -270,7 +336,7 @@ Readers read every row. They do not sample, limit, or keep a head. `sampled: tru
 
 Blank amount cells are null. They are not turned into zero. `run` leaves a null amount out of the sum, and it counts null keys separately.
 
-A missing path, a CSV file that is not UTF-8, a malformed CSV row, or a file that Spark cannot read is a read error (`qa-core-recon: error:`), exit 2. It is not a refusal code.
+A missing path, a CSV file that is not UTF-8, a malformed CSV row, or a file that Spark cannot read is a read error (`qa-core-recon: error:`), exit 2. It is not a refusal code. A symlink loop in a source or target path is also a read error. The message is `cannot read <side> path ...: Symlink loop from ...`. It is not reported as a missing path, and it is not an unexpected error.
 
 ## Iceberg
 
