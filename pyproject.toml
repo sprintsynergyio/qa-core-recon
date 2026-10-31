@@ -11,7 +11,7 @@ requires-python = ">=3.11,<3.12"
 dependencies = ["pyyaml>=6", "pyspark>=3.5,<3.6"]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "ruff>=0.6"]
+dev = ["pytest>=8", "ruff>=0.6", "moto[server]>=5.0,<6"]
 
 [project.scripts]
 qa-core-recon = "qa_core_recon.cli:main"
