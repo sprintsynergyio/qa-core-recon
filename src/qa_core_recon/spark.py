@@ -318,11 +318,9 @@ def session_start_failure(
 
     A runtime is named only when the output points at dependency resolution
     and the pinned jar is not in the Ivy cache. S3 is checked first, then
-    Iceberg. Any other start failure keeps the generic session message. A
-    session that was not asked to load either runtime is left unchanged.
+    Iceberg. Every other start failure is a generic ``SessionStartError``
+    so the CLI can print it as a read error.
     """
-    if not iceberg and not s3:
-        return exc
     if ivy is not None and _dependency_resolution_failure(exc):
         if s3 and not s3_jars_cached(ivy):
             return S3RuntimeError(missing_s3_runtime_message(ivy))

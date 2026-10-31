@@ -199,25 +199,24 @@ _SafeUniqueKeyLoader.add_constructor(
 
 def load_spec(path: Path | str) -> Spec:
     """Read a spec file and return it, or raise SpecError or RefusalError."""
-    spec_path = Path(path)
-    try:
-        text = spec_path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        raise SpecError(f"spec file not found: {spec_path}") from None
-    except IsADirectoryError:
-        raise SpecError(f"spec path is a directory: {spec_path}") from None
-    except PermissionError:
-        raise SpecError(f"permission denied reading spec file: {spec_path}") from None
-    except UnicodeDecodeError:
-        raise SpecError(f"spec file is not valid UTF-8: {spec_path}") from None
-    except OSError as exc:
-        detail = exc.strerror or str(exc)
-        raise SpecError(f"cannot read spec file {spec_path}: {detail}") from None
-    return parse_spec(text)
+    spec = load_spec_shape(path)
+    enforce_spec_refusals(spec)
+    return spec
 
 
 def parse_spec(text: str) -> Spec:
     """Parse spec text. Shape is checked before any refusal."""
+    spec = parse_spec_shape(text)
+    enforce_spec_refusals(spec)
+    return spec
+
+
+def parse_spec_shape(text: str) -> Spec:
+    """Parse spec text into a spec. Refusals are not applied yet.
+
+    A missing or empty key list is stored as an empty key tuple. Call
+    :func:`enforce_spec_refusals` before using the spec to run.
+    """
     data = _load_mapping(text)
     _reject_unknown(data, _TOP_LEVEL, "spec")
     for key in _REQUIRED:
@@ -245,29 +244,11 @@ def parse_spec(text: str) -> Spec:
     for index, entry in enumerate(allowlist):
         _require_allowlist_entry(entry, f"allowlist[{index}]")
 
-    if keys is None:
-        raise RefusalError(Refusal(RefusalCode.MISSING_KEY, "the spec has no business key"))
-    if tolerance.value > 0 and tolerance.reason.strip() == "":
-        raise RefusalError(
-            Refusal(
-                RefusalCode.TOLERANCE_WITHOUT_REASON,
-                "tolerance is above zero and reason is empty",
-            )
-        )
-    for label, dataset in (("source", source), ("target", target)):
-        if not _path_allowed(dataset.path, allowlist):
-            raise RefusalError(
-                Refusal(
-                    RefusalCode.PATH_NOT_ALLOWED,
-                    f"{label} path {dataset.path!r} is outside the allowlist",
-                )
-            )
-
     return Spec(
         version=version,
         source=source,
         target=target,
-        keys=keys,
+        keys=keys if keys is not None else (),
         amounts=amounts,
         group_by=group_by,
         hash_columns=hash_columns,
@@ -275,6 +256,50 @@ def parse_spec(text: str) -> Spec:
         sampled=sampled,
         allowlist=allowlist,
     )
+
+
+def enforce_spec_refusals(spec: Spec) -> None:
+    """Raise the first spec-level refusal. Shape errors are not checked here."""
+    if not spec.keys:
+        raise RefusalError(Refusal(RefusalCode.MISSING_KEY, "the spec has no business key"))
+    if spec.tolerance.value > 0 and spec.tolerance.reason.strip() == "":
+        raise RefusalError(
+            Refusal(
+                RefusalCode.TOLERANCE_WITHOUT_REASON,
+                "tolerance is above zero and reason is empty",
+            )
+        )
+    for label, dataset in (("source", spec.source), ("target", spec.target)):
+        if not _path_allowed(dataset.path, spec.allowlist):
+            raise RefusalError(
+                Refusal(
+                    RefusalCode.PATH_NOT_ALLOWED,
+                    f"{label} path {dataset.path!r} is outside the allowlist",
+                )
+            )
+
+
+def load_spec_shape(path: Path | str) -> Spec:
+    """Read a spec file and return its shape, or raise SpecError.
+
+    Spec-level refusals are left for :func:`enforce_spec_refusals`, so the
+    caller can see the dataset paths even when the spec must not run.
+    """
+    spec_path = Path(path)
+    try:
+        text = spec_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        raise SpecError(f"spec file not found: {spec_path}") from None
+    except IsADirectoryError:
+        raise SpecError(f"spec path is a directory: {spec_path}") from None
+    except PermissionError:
+        raise SpecError(f"permission denied reading spec file: {spec_path}") from None
+    except UnicodeDecodeError:
+        raise SpecError(f"spec file is not valid UTF-8: {spec_path}") from None
+    except OSError as exc:
+        detail = exc.strerror or str(exc)
+        raise SpecError(f"cannot read spec file {spec_path}: {detail}") from None
+    return parse_spec_shape(text)
 
 
 def _load_mapping(text: str) -> dict:

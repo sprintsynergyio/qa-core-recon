@@ -102,7 +102,10 @@ def test_missing_iceberg_runtime_is_a_clear_read_error(tmp_path):
     assert isinstance(cached, SessionStartError)
     assert not isinstance(cached, IcebergRuntimeError)
     assert str(cached).startswith("cannot start the local Spark session")
-    assert session_start_failure(resolution, iceberg=False, ivy=cache) is resolution
+    plain = session_start_failure(resolution, iceberg=False, ivy=cache)
+    assert isinstance(plain, SessionStartError)
+    assert not isinstance(plain, IcebergRuntimeError)
+    assert str(plain).startswith("cannot start the local Spark session")
 
 
 def test_other_session_start_failures_stay_generic(tmp_path):
@@ -196,6 +199,39 @@ def test_startup_log_keeps_a_broken_java_home_generic(spark, monkeypatch, tmp_pa
     assert "JAVA_HOME" not in str(caught.value)
 
 
+def test_session_start_failure_checks_s3_then_iceberg_then_stays_generic(tmp_path):
+    cache = tmp_path / "empty"
+    unresolved = RuntimeError("unresolved dependency: missing")
+    s3_failure = session_start_failure(unresolved, iceberg=True, ivy=cache, s3=True)
+    assert isinstance(s3_failure, S3RuntimeError)
+    assert not isinstance(s3_failure, IcebergRuntimeError)
+    assert "unexpected error" not in str(s3_failure)
+
+    iceberg_failure = session_start_failure(unresolved, iceberg=True, ivy=cache, s3=False)
+    assert isinstance(iceberg_failure, IcebergRuntimeError)
+    assert str(iceberg_failure) == missing_runtime_message(cache)
+    assert "unexpected error" not in str(iceberg_failure)
+
+    warm = tmp_path / "warm-s3"
+    warm.mkdir()
+    (warm / "hadoop-aws-3.3.4.jar").write_bytes(b"jar")
+    (warm / "aws-java-sdk-bundle-1.12.262.jar").write_bytes(b"jar")
+    iceberg_after_s3 = session_start_failure(unresolved, iceberg=True, ivy=warm, s3=True)
+    assert isinstance(iceberg_after_s3, IcebergRuntimeError)
+
+    other = session_start_failure(
+        RuntimeError("JAVA_GATEWAY_EXITED"),
+        iceberg=False,
+        ivy=cache,
+        s3=False,
+    )
+    assert isinstance(other, SessionStartError)
+    assert not isinstance(other, S3RuntimeError)
+    assert not isinstance(other, IcebergRuntimeError)
+    assert str(other) == "cannot start the local Spark session: JAVA_GATEWAY_EXITED"
+    assert "unexpected error" not in str(other)
+
+
 def test_missing_s3_runtime_is_a_clear_read_error(tmp_path):
     cache = tmp_path / "empty-ivy"
     assert s3_jars_cached(cache) is False
@@ -242,7 +278,7 @@ def test_local_only_session_does_not_request_s3_packages(spark, monkeypatch):
     monkeypatch.setattr(spark_mod, "_iceberg_ready", False)
     monkeypatch.setattr(spark_mod, "_s3_ready", False)
     monkeypatch.setattr(spark_mod, "_start_quietly", capture)
-    with pytest.raises(RuntimeError, match="stopped before the jvm"):
+    with pytest.raises(SessionStartError, match="stopped before the jvm"):
         local_session(iceberg=False, s3=False)
     assert seen["packages"] is None
     assert seen["ivy"] is None

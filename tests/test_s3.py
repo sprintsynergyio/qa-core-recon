@@ -1,5 +1,6 @@
 """S3 reads through moto. No AWS account and no calls to AWS."""
 
+import json
 import os
 import shutil
 import subprocess
@@ -716,6 +717,52 @@ def test_holds_credential_matches_a_value_only():
     secret = "qa-core-recon-test-secret-key"
     assert _holds_credential("com.example.note", secret, (secret,)) is True
     assert _holds_credential("fs.s3a.endpoint", "http://127.0.0.1:9", (secret,)) is False
+
+
+def test_run_matches_and_mismatches_csv_on_s3(spark, tmp_path, capsys):
+    bucket = _bucket("run")
+    _put_csv(bucket, "raw/payments.csv", CSV)
+    _put_csv(bucket, "curated/same.csv", CSV)
+    matched = _spec(
+        tmp_path,
+        {"path": f"s3://{bucket}/raw/payments.csv", "format": "csv"},
+        {"path": f"s3://{bucket}/curated/same.csv", "format": "csv"},
+        [f"s3://{bucket}"],
+    )
+    spec = write_spec_file(tmp_path, matched)
+    out = tmp_path / "match-out"
+    code = main(["run", "--spec", str(spec), "--out", str(out)])
+    captured = capsys.readouterr()
+    secret = os.environ["AWS_SECRET_ACCESS_KEY"]
+    assert code is ExitCode.MATCH
+    assert captured.out == "match\n"
+    assert captured.err == ""
+    report = json.loads((out / "report.json").read_text(encoding="utf-8"))
+    assert report["status"] == "match"
+    published = (out / "report.json").read_text(encoding="utf-8") + (out / "report.md").read_text(
+        encoding="utf-8"
+    )
+    assert secret not in published
+    assert secret not in captured.out
+
+    _put_csv(bucket, "curated/other.csv", OTHER)
+    differed = _spec(
+        tmp_path,
+        {"path": f"s3://{bucket}/raw/payments.csv", "format": "csv"},
+        {"path": f"s3://{bucket}/curated/other.csv", "format": "csv"},
+        [f"s3://{bucket}"],
+    )
+    other_spec = write_spec_file(tmp_path, differed)
+    other_out = tmp_path / "mismatch-out"
+    code = main(["run", "--spec", str(other_spec), "--out", str(other_out)])
+    captured = capsys.readouterr()
+    assert code is ExitCode.MISMATCH
+    assert captured.out == "mismatch\n"
+    assert captured.err == ""
+    report = json.loads((other_out / "report.json").read_text(encoding="utf-8"))
+    assert report["status"] == "mismatch"
+    published = (other_out / "report.json").read_text(encoding="utf-8")
+    assert secret not in published
 
 
 def test_local_only_process_does_not_request_s3_packages(tmp_path):
