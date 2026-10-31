@@ -153,7 +153,19 @@ Three counts are reported. Any count above zero is a mismatch.
 
 Rows with a null in any key column are excluded. They stay in the null-key check and are not listed as missing, extra, or changed. A target key that has no matching source key is still extra: the excluded source row is not a key, so it does not match that target key.
 
-Key columns are aligned before the join. The join is on those aligned strings, not on Spark's own cast. A string key must equal the canonical text of the typed value, with no trim. An integer's text is its digits, so `1` matches and `01`, `+1`, ` 1`, `1.0`, `1.00`, and `1e0` do not. A decimal's text is the plain number at the column scale, with no exponent and no sign when the value is positive or zero. `decimal(10,2)` renders `1.00`, so only that spelling matches. A value that does not match stays unmatched and is missing or extra. Compared columns still accept equivalent spellings. Types that cannot be aligned are compared as their canonical strings and listed under `type_mismatches`.
+Key columns are aligned before the join. The join is on those aligned strings, not on Spark's own cast. A string key must equal one canonical text, with no trim. A value that does not match stays unmatched and is missing or extra. Compared columns still accept equivalent spellings, including a space before a date.
+
+| Key type | Canonical text |
+| -------- | -------------- |
+| integer | Digits only. `1` matches. `01`, `+1`, ` 1`, `1.0`, `1.00`, and `1e0` do not. |
+| decimal | The plain number at the column scale, with no exponent and no sign when the value is positive or zero. `decimal(10,2)` is `1.00`. `decimal(20,10)` zero is `0.0000000000`, not `0E-10`. |
+| date | `YYYY-MM-DD`. A leading space does not match. |
+| boolean | Exactly `true` or `false`. `TRUE`, `1`, `yes`, and ` true` do not match. |
+| timestamp | `YYYY-MM-DDTHH:MM:SS.ffffffZ`, the same UTC text as the row hash. `2024-01-01` and ` 2024-01-01` do not match midnight. |
+| timestamp without a time zone | The same text with no trailing `Z`. |
+| float or double | Not aligned with a string. The key is listed under `type_mismatches`, the run mismatches, and the two sides are compared as strings so `01` and ` 1e0` do not join `1.0`. |
+
+Other types that cannot be aligned are also compared as strings and listed under `type_mismatches`.
 
 Counts are by distinct key value, not by physical row. When several rows share a key, the row with the smallest row hash is the one that is compared. Two identical copies of one row therefore do not make the key changed. A second copy whose hash is larger is not the row that is compared. The duplicate-key check still reports the duplicate. The report states this rule on every run, and it says when duplicate keys were found.
 

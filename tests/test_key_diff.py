@@ -18,6 +18,7 @@ from pyspark.sql.types import (
     StringType,
     StructField,
     StructType,
+    TimestampNTZType,
     TimestampType,
 )
 
@@ -853,6 +854,180 @@ def test_special_column_names_are_quoted_in_casts(spark, tmp_path):
     report, _raw, _markdown = _load(out)
     assert _key_diff(report)["status"] == "match"
     assert _key_diff(report)["details"]["changed"]["count"] == 0
+
+
+def test_high_scale_decimal_key_rejects_an_exponent(spark, tmp_path):
+    canonical = (
+        ("0.0000000000", Decimal(0)),
+        ("0.0000001000", Decimal("0.0000001")),
+        ("-1.5000000000", Decimal("-1.5")),
+    )
+    exponents = ("0E-10", "1.000E-7", "-1.5E+0")
+    source = tmp_path / "source.csv"
+    body = "".join(f"{text},a\n" for text, _value in canonical)
+    body += "".join(f"{text},a\n" for text in exponents)
+    write_csv(source, body, "txn_id,note\n")
+    schema = StructType(
+        [
+            StructField("txn_id", DecimalType(20, 10), True),
+            StructField("note", StringType(), True),
+        ]
+    )
+    target = tmp_path / "target"
+    _write_frame(spark, target, [(value, "a") for _text, value in canonical], schema)
+    data = spec_data(tmp_path, source, target, source_format="csv", target_format="parquet")
+    data.update(amounts=[], group_by=[], hash_columns=["note"], keys=["txn_id"])
+    spec = write_spec_file(tmp_path, data)
+    out = tmp_path / "out"
+    assert _invoke(spec, out) is ExitCode.MISMATCH
+    details = _key_diff(_load(out)[0])["details"]
+    assert details["extra"]["count"] == 0
+    assert details["changed"]["count"] == 0
+    assert details["missing"]["examples"] == [[text] for text in sorted(exponents, key=sort_token)]
+
+
+def test_boolean_key_requires_lowercase_true_or_false(spark, tmp_path):
+    bad = ("TRUE", "1", "yes", " true")
+    source = tmp_path / "source.csv"
+    write_csv(source, _spelling_rows(("true", "false", *bad)), "txn_id,note\n")
+    schema = StructType(
+        [
+            StructField("txn_id", BooleanType(), True),
+            StructField("note", StringType(), True),
+        ]
+    )
+    target = tmp_path / "target"
+    _write_frame(spark, target, [(True, "a"), (False, "a")], schema)
+    data = spec_data(tmp_path, source, target, source_format="csv", target_format="parquet")
+    data.update(amounts=[], group_by=[], hash_columns=["note"], keys=["txn_id"])
+    spec = write_spec_file(tmp_path, data)
+    out = tmp_path / "out"
+    assert _invoke(spec, out) is ExitCode.MISMATCH
+    details = _key_diff(_load(out)[0])["details"]
+    assert details["extra"]["count"] == 0
+    assert details["changed"]["count"] == 0
+    assert details["missing"]["examples"] == [[text] for text in sorted(bad, key=sort_token)]
+
+
+def test_timestamp_key_requires_the_utc_text(spark, tmp_path):
+    canonical = "2024-01-01T00:00:00.000000Z"
+    bad = ("2024-01-01", " 2024-01-01")
+    source = tmp_path / "source.csv"
+    write_csv(source, _spelling_rows((canonical, *bad)), "txn_id,note\n")
+    schema = StructType(
+        [
+            StructField("txn_id", TimestampType(), True),
+            StructField("note", StringType(), True),
+        ]
+    )
+    target = tmp_path / "target"
+    _write_frame(spark, target, [(_utc(2024, 1, 1), "a")], schema)
+    data = spec_data(tmp_path, source, target, source_format="csv", target_format="parquet")
+    data.update(amounts=[], group_by=[], hash_columns=["note"], keys=["txn_id"])
+    spec = write_spec_file(tmp_path, data)
+    out = tmp_path / "out"
+    assert _invoke(spec, out) is ExitCode.MISMATCH
+    details = _key_diff(_load(out)[0])["details"]
+    assert details["extra"]["count"] == 0
+    assert details["changed"]["count"] == 0
+    assert details["missing"]["examples"] == [[text] for text in sorted(bad, key=sort_token)]
+
+
+def test_timestamp_ntz_key_omits_the_zone_suffix(spark, tmp_path):
+    canonical = "2024-01-01T00:00:00.000000"
+    bad = ("2024-01-01T00:00:00.000000Z", "2024-01-01")
+    source = tmp_path / "source.csv"
+    write_csv(source, _spelling_rows((canonical, *bad)), "txn_id,note\n")
+    schema = StructType(
+        [
+            StructField("txn_id", TimestampNTZType(), True),
+            StructField("note", StringType(), True),
+        ]
+    )
+    target = tmp_path / "target"
+    _write_frame(spark, target, [(datetime(2024, 1, 1), "a")], schema)
+    data = spec_data(tmp_path, source, target, source_format="csv", target_format="parquet")
+    data.update(amounts=[], group_by=[], hash_columns=["note"], keys=["txn_id"])
+    spec = write_spec_file(tmp_path, data)
+    out = tmp_path / "out"
+    assert _invoke(spec, out) is ExitCode.MISMATCH
+    details = _key_diff(_load(out)[0])["details"]
+    assert details["extra"]["count"] == 0
+    assert details["changed"]["count"] == 0
+    assert details["missing"]["examples"] == [[text] for text in sorted(bad, key=sort_token)]
+
+
+def test_float_key_is_a_type_mismatch(spark, tmp_path):
+    bad = ("01", " 1e0")
+    source = tmp_path / "source.csv"
+    write_csv(source, _spelling_rows(bad), "measure,note\n")
+    schema = StructType(
+        [
+            StructField("measure", DoubleType(), True),
+            StructField("note", StringType(), True),
+        ]
+    )
+    target = tmp_path / "target"
+    _write_frame(spark, target, [(1.0, "a")], schema)
+    data = spec_data(tmp_path, source, target, source_format="csv", target_format="parquet")
+    data.update(amounts=[], group_by=[], hash_columns=["note"], keys=["measure"])
+    spec = write_spec_file(tmp_path, data)
+    out = tmp_path / "out"
+    assert _invoke(spec, out) is ExitCode.MISMATCH
+    report, _raw, markdown = _load(out)
+    details = _key_diff(report)["details"]
+    assert details["type_mismatches"] == [
+        {
+            "column": "measure",
+            "role": "key",
+            "source_type": "string",
+            "target_type": "double",
+        }
+    ]
+    assert details["missing"]["examples"] == [[text] for text in sorted(bad, key=sort_token)]
+    assert details["extra"]["count"] == 1
+    assert "Type mismatches." in markdown
+    assert "measure (key)." in markdown
+
+
+def test_padded_date_key_stays_unmatched(spark, tmp_path):
+    source = tmp_path / "source.csv"
+    write_csv(source, " 2024-01-01,a\n", "txn_id,note\n")
+    schema = StructType(
+        [
+            StructField("txn_id", DateType(), True),
+            StructField("note", StringType(), True),
+        ]
+    )
+    target = tmp_path / "target"
+    _write_frame(spark, target, [(date(2024, 1, 1), "a")], schema)
+    data = spec_data(tmp_path, source, target, source_format="csv", target_format="parquet")
+    data.update(amounts=[], group_by=[], hash_columns=["note"], keys=["txn_id"])
+    spec = write_spec_file(tmp_path, data)
+    out = tmp_path / "out"
+    assert _invoke(spec, out) is ExitCode.MISMATCH
+    details = _key_diff(_load(out)[0])["details"]
+    assert details["missing"]["examples"] == [[" 2024-01-01"]]
+    assert details["extra"]["count"] == 1
+    assert details["changed"]["count"] == 0
+
+
+def test_padded_date_value_still_matches(spark, tmp_path):
+    source = tmp_path / "source.csv"
+    write_csv(source, "1, 2024-01-01\n", "txn_id,day\n")
+    schema = StructType(
+        [
+            StructField("txn_id", StringType(), True),
+            StructField("day", DateType(), True),
+        ]
+    )
+    target = tmp_path / "target"
+    _write_frame(spark, target, [("1", date(2024, 1, 1))], schema)
+    data = spec_data(tmp_path, source, target, source_format="csv", target_format="parquet")
+    data.update(amounts=[], group_by=[], hash_columns=["day"])
+    spec = write_spec_file(tmp_path, data)
+    out = tmp_path / "out"
+    assert _invoke(spec, out) is ExitCode.MATCH
 
 
 def _note_schema(amount):

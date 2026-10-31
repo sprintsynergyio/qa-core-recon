@@ -11,6 +11,7 @@ from qa_core_recon.hashing import (
     compared_columns,
     encode_row,
     encode_value,
+    plain_decimal_text,
     row_hash_hex,
     strict_decimal_payload,
 )
@@ -62,6 +63,10 @@ def test_decimals_compare_by_value_and_keep_significant_digits():
     assert encode_value(Decimal("100.00")) == "decimal:3:100"
     assert row_hash_hex((Decimal("1.0"),)) == row_hash_hex((Decimal("1.00"),))
     assert row_hash_hex((Decimal("1.0"),)) != row_hash_hex((Decimal("1.01"),))
+    assert plain_decimal_text(Decimal(0), 10) == "0.0000000000"
+    assert plain_decimal_text(Decimal("1E-7"), 10) == "0.0000001000"
+    assert plain_decimal_text(Decimal("-1.5"), 10) == "-1.5000000000"
+    assert "E" not in plain_decimal_text(Decimal("0E-10"), 10)
     assert strict_decimal_payload("1.50", 10, 2) == "1.5"
     assert strict_decimal_payload("1.001", 10, 2) is None
     assert strict_decimal_payload("01", 10, 0) == "1"

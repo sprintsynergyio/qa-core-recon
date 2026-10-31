@@ -113,6 +113,21 @@ def _tag_and_payload(value: object) -> tuple[str, str]:
     raise TypeError(f"cannot encode {type(value).__name__} for a row hash")
 
 
+def plain_decimal_text(value: Decimal, scale: int) -> str:
+    """Return ``value`` at ``scale`` with no exponent and no plus sign.
+
+    Zero is unsigned. ``decimal(20,10)`` zero is ``0.0000000000``, not ``0E-10``.
+    """
+    if not value.is_finite():
+        raise ValueError("decimal is not finite")
+    quantum = Decimal(1).scaleb(-scale)
+    with localcontext(_DECIMAL_CONTEXT):
+        fitted = value.quantize(quantum)
+        if fitted.is_signed() and fitted == 0:
+            fitted = Decimal(0).quantize(quantum)
+        return format(fitted, "f")
+
+
 def strict_decimal_payload(text: str, precision: int, scale: int) -> str | None:
     """Return the decimal payload when ``text`` fits ``decimal(precision, scale)``.
 

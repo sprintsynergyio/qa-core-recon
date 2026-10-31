@@ -14,8 +14,12 @@ driver. Values stay in Spark.
 * Key columns use a lossless parse. The raw string, with no trim, must equal
   one canonical rendering of the typed value. An integer renders as its
   digits (``1``, not ``01`` or `` 1``). A decimal renders at the column
-  scale (``1.00`` for ``decimal(10,2)``), with no exponent and no sign when
-  the value is positive or zero. Anything else stays unmatched.
+  scale with :func:`qa_core_recon.hashing.plain_decimal_text` (``1.00`` for
+  ``decimal(10,2)``, ``0.0000000000`` for scale 10), never an exponent.
+  A boolean key is exactly ``true`` or ``false``. A timestamp key is the
+  UTC text used by the row hash. A timestamp without a time zone uses that
+  text without the trailing ``Z``. A float or double key is not aligned
+  with a string. Anything else stays unmatched.
 * Compared columns keep a tolerant parse: surrounding spaces and equivalent
   spellings may match, and a non-null string that does not parse is changed.
 * Any other pair, including float against double, is not given a new refusal
@@ -27,6 +31,7 @@ driver. Values stay in Spark.
 """
 
 from dataclasses import dataclass
+from decimal import Decimal
 
 from pyspark.sql.column import Column
 from pyspark.sql.functions import (
@@ -60,11 +65,13 @@ from pyspark.sql.types import (
 )
 from pyspark.sql.types import StringType as _StringType
 
-from qa_core_recon.hashing import encode_value, strict_decimal_payload
+from qa_core_recon.hashing import encode_value, plain_decimal_text, strict_decimal_payload
 
 _INTEGER_TYPES = (ByteType, ShortType, IntegerType, LongType)
 _TIMESTAMP_PATTERN = "yyyy-MM-dd'T'HH:mm:ss.SSSSSS'Z'"
-# Fixed width of that pattern. Every character is ASCII.
+# TimestampNTZ has no zone, so the key text omits the trailing Z.
+_TIMESTAMP_NTZ_PATTERN = "yyyy-MM-dd'T'HH:mm:ss.SSSSSS"
+# Fixed width of the zoned pattern. Every character is ASCII.
 _TIMESTAMP_WIDTH = 27
 
 _ENCODE = udf(encode_value, _StringType())
@@ -76,7 +83,15 @@ def _strict_decimal_udf(text, precision, scale):
     return strict_decimal_payload(str(text), int(precision), int(scale))
 
 
+def _plain_decimal_udf(value, scale):
+    if value is None or scale is None:
+        return None
+    number = value if isinstance(value, Decimal) else Decimal(str(value))
+    return plain_decimal_text(number, int(scale))
+
+
 _DECIMAL_PAYLOAD = udf(_strict_decimal_udf, _StringType())
+_PLAIN_DECIMAL = udf(_plain_decimal_udf, _StringType())
 
 
 @dataclass(frozen=True)
@@ -164,7 +179,11 @@ def value_display(plan: FieldPlan, side: str) -> Column:
 
 
 def _plan(name: str, role: str, source: DataType, target: DataType) -> FieldPlan:
-    kind, string_side = _kind(source, target)
+    # A float key has no single canonical spelling, so a string is not parsed.
+    if role == "key" and _string_vs_float(source, target):
+        kind, string_side = "render", None
+    else:
+        kind, string_side = _kind(source, target)
     return FieldPlan(
         name=name,
         role=role,
@@ -189,6 +208,13 @@ def _kind(source: DataType, target: DataType) -> tuple[str, str | None]:
     if isinstance(target, StringType) and _parsable(source):
         return "parse", "target"
     return "render", None
+
+
+def _string_vs_float(source: DataType, target: DataType) -> bool:
+    pair = (source, target)
+    return any(isinstance(item, StringType) for item in pair) and any(
+        isinstance(item, (FloatType, DoubleType)) for item in pair
+    )
 
 
 def _same_family(source: DataType, target: DataType) -> bool:
@@ -267,10 +293,10 @@ def _decimal_string_token(
     column = _column(name)
     fallback = _cell_token(column) if for_join else _invalid_token(column)
     if lossless:
-        # The raw text must be the scale rendering, such as 1.00 for scale 2.
+        # Spark's own cast uses an exponent from scale 7. The plain text does not.
         parsed = _try_name(name, f"decimal({precision},{scale})")
-        rendered = parsed.cast("string")
-        ok = parsed.isNotNull() & (column == rendered)
+        rendered = _PLAIN_DECIMAL(parsed, lit(scale))
+        ok = parsed.isNotNull() & rendered.isNotNull() & (column == rendered)
         aligned = _cell_token(parsed)
         return when(column.isNull(), lit("n")).when(ok, aligned).otherwise(fallback)
     payload = _DECIMAL_PAYLOAD(trim(column), lit(precision), lit(scale))
@@ -321,13 +347,27 @@ def _parse(name: str, typed: DataType, *, lossless: bool) -> tuple[Column, Colum
         return parsed, ok
     if isinstance(typed, TimestampNTZType):
         parsed = _try_name(name, "timestamp_ntz")
-        return parsed, parsed.isNotNull()
+        if lossless:
+            canon = date_format(parsed, _TIMESTAMP_NTZ_PATTERN)
+            ok = parsed.isNotNull() & (column == canon)
+        else:
+            ok = parsed.isNotNull()
+        return parsed, ok
     if isinstance(typed, TimestampType):
         parsed = _try_name(name, "timestamp")
-        return parsed, parsed.isNotNull()
+        if lossless:
+            canon = date_format(parsed, _TIMESTAMP_PATTERN)
+            ok = parsed.isNotNull() & (column == canon)
+        else:
+            ok = parsed.isNotNull()
+        return parsed, ok
     if isinstance(typed, BooleanType):
         parsed = _try_name(name, "boolean")
-        return parsed, parsed.isNotNull()
+        if lossless:
+            ok = parsed.isNotNull() & ((column == lit("true")) | (column == lit("false")))
+        else:
+            ok = parsed.isNotNull()
+        return parsed, ok
     if isinstance(typed, FloatType):
         parsed = _try_name(name, "float")
         return parsed, parsed.isNotNull()
