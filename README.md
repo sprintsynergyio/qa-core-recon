@@ -2,7 +2,7 @@
 
 Prove that a target dataset matches its source after a Glue or PySpark job, using deterministic checks. No AI model decides pass or fail.
 
-**Status: readers.** `--version`, `init`, and `validate` work. `validate --check-data` opens local CSV, Parquet, and Iceberg and runs the data-level refusals. `run` arrives in a later PR. Counts, sums, hashes, diffs, and reports are not in this release.
+**Status: aggregate checks.** `--version`, `init`, `validate`, and `run` work. `validate --check-data` opens local CSV, Parquet, and Iceberg and runs the data-level refusals. `run` compares row counts, amount sums, null keys, and duplicate keys, and writes `report.json` and `report.md`. Key diff, row hashes, changed-column diff, S3 reads, and the demo are not in this release.
 
 ## Install From Source
 
@@ -16,9 +16,9 @@ source .venv/bin/activate
 pip install -e ".[dev]"
 ```
 
-PySpark is pinned to the 3.5 line (`pyspark>=3.5,<3.6`), the Spark line in AWS Glue 5.0. `init` and `validate` do not start a JVM. `validate --check-data` does.
+PySpark is pinned to the 3.5 line (`pyspark>=3.5,<3.6`), the Spark line in AWS Glue 5.0. `init` and plain `validate` do not start a JVM. `validate --check-data` and `run` do. `run` skips the JVM when a spec-level refusal, `sample-only`, or an `s3://` input stops the command first.
 
-A spec that uses Iceberg also needs the Iceberg Spark runtime `org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.7.1`. The first `validate --check-data` on that spec downloads it from Maven Central into `~/.cache/qa-core-recon/ivy`. Set `QA_CORE_RECON_IVY` to use another cache directory. A CSV or Parquet spec does not download it.
+A spec that uses Iceberg also needs the Iceberg Spark runtime `org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.7.1`. The first `validate --check-data` or `run` on that spec downloads it from Maven Central into `~/.cache/qa-core-recon/ivy`. Set `QA_CORE_RECON_IVY` to use another cache directory. A CSV or Parquet spec does not download it.
 
 ## Commands
 
@@ -52,21 +52,160 @@ Also open both datasets and run the data-level refusals:
 qa-core-recon validate --spec recon.yaml --check-data
 ```
 
-When those checks pass, the command prints `data ok` and exits with code 0. It does not compare the two datasets, so different amounts on the two sides still print `data ok`. Counts, sums, hashes, and diffs arrive with `run`.
+When those checks pass, the command prints `data ok` and exits with code 0. It does not compare the two datasets, so different amounts on the two sides still print `data ok`. `run` compares counts and sums and writes a report. Key diff, row hashes, and changed-column diff arrive in a later PR.
 
 A refusal prints `refused: <code>: <message>` to stderr and exits with code 2. A malformed spec prints `qa-core-recon: error: <message>` to stderr and exits with code 2. A dataset that cannot be opened, including an allowlisted `s3://` path, prints `qa-core-recon: error: <message>` to stderr and exits with code 2.
 
-`run` arrives in a later PR.
+## Run
+
+Compare the source and the target and write a report:
+
+```bash
+qa-core-recon run --spec recon.yaml --out out
+```
+
+The command prints `match` or `mismatch` on stdout. A refusal prints the same `refused:` line as `validate` and still writes both report files, with status `refused`. A read error, a malformed spec, an unusable `--out`, and a sum that does not fit `decimal(38, scale)` print `qa-core-recon: error:` and write no report file.
+
+`--out` is a local directory. It is created when it is missing. It is not checked against the allowlist. `s3://` is rejected. It must not equal a local source or target path, sit inside one, or contain one, or the next read can pick up `report.json` as a data file. If the directory already contains any file, the command exits 2 and writes nothing, unless you pass `--force`. A leftover `.report.json.<pid>.tmp` or `.report.md.<pid>.tmp` file from a crashed publish is removed and does not count as content. Other names, and symlinks, are left in place. After the spec loads and the output path is accepted, any previous `report.json` and `report.md` are removed, so a read error does not leave the old report in place. A malformed spec, or an output path that overlaps a dataset, leaves that directory as it was. `--force` still leaves every other file alone. Both report files are written to temporary names in that directory and then renamed into place. If either rename fails, both report files are removed.
+
+Nothing in pass or fail calls a model. Two runs on the same inputs write byte-identical files. The report has no timestamp. It does not add a path of its own. `spec_sha256` is the SHA-256 of the spec file bytes.
+
+| Code | Result |
+| ---- | ------ |
+| 0 | Every aggregate check matched. |
+| 1 | At least one aggregate check did not match. |
+| 2 | The run was refused, or a dataset or the output directory could not be used. |
+
+### Example Spec
+
+```yaml
+version: 1
+source:
+  path: ./data/raw/payments.csv
+  format: csv
+target:
+  path: ./data/curated/payments
+  format: parquet
+keys: [txn_id]
+amounts:
+  - column: amount
+    scale: 2
+group_by: [day]
+hash_columns: [note]
+tolerance:
+  value: "0"
+  reason: ""
+sampled: false
+allowlist: ["./data"]
+```
+
+`tolerance.value` stays a quoted string. A value above zero needs a reason. That rule is the same one `validate` already enforces. `run` then uses the value as an exact decimal limit on amount sums.
+
+### Checks
+
+All four checks run inside Spark. Only the aggregates come back to the driver: one total per side, one row per group, the null-key counts, the duplicate-key count, and at most 20 example keys. A mismatch does not skip the later checks. The report lists them in this order.
+
+**Row Count.** Total rows on each side. When `group_by` is set, also the rows in each group. Groups are sorted. A group that is missing on either side is a mismatch and is listed. A count of 0 on one side means that group was not present. Group values compare by value across types, so an int 1 and a decimal 1.00 are the same group. Every float NaN is one shared group, shown as NaN, and it sorts after every other float. -0.0 is the same group as 0.0.
+
+**Amount Sum.** For each amount column, the exact sum on each side, stored as `decimal(38, scale)`, for the whole side and for each group. Decimals are written as strings with the full scale, so scale 2 renders `10.50`. Null amounts are left out of the sum. They are not added as zero. A side or a group with no non-null amount has a null sum. Two null sums match. A null sum against a number, including zero, is a mismatch.
+
+Sums are compared exactly. When the tolerance is above zero, the absolute difference must be less than or equal to that tolerance, and the report names the reason. Equality is inside the range. The same tolerance is applied to the total and to each group on its own. It is not a budget shared across groups. A missing group has no sum, so the tolerance does not cover it.
+
+Spark's own decimal sum is not used. With precision loss allowed, that sum returns null on overflow, and null is also what an all-null column produces. This command folds the sum as an exact decimal and then requires it to fit `decimal(38, scale)`. A total or a group sum that does not fit is a read error, exit 2, and no report is written. The message says `sum` for a total and `group sum` for one group. Source is checked before target. On one side, groups are checked in sorted order and then the total. Amount columns follow the spec order.
+
+**Null Keys.** The number of rows with a null in any key column, on each side. Any null key is a mismatch. The report gives both counts. An empty CSV field is an empty string, not a null. Parquet and Iceberg can store a real null.
+
+**Duplicate Keys.** The number of key values that appear more than once, on each side. Any duplicate is a mismatch. The report gives the counts and up to 20 example keys. Those 20 are the first in sorted order, with nulls first. 20 is fixed (`DUPLICATE_EXAMPLE_LIMIT`). The count is the full number, so it can be higher than the number of examples. A key value is the whole key: every column in `keys`.
+
+Key diff, row hashes, and changed-column diff are not part of this command.
+
+### Report Files
+
+`report.json` is UTF-8 JSON with sorted keys, indent 2, and one trailing newline. The fields are:
+
+| Field | Meaning |
+| ----- | ------- |
+| `tool` | `qa-core-recon` |
+| `version` | the package version |
+| `spec_sha256` | SHA-256 of the spec file bytes |
+| `status` | `match`, `mismatch`, or `refused` |
+| `refusals` | a list of `{code, message}`. Empty when the datasets were compared. |
+| `checks` | a list of `{name, status, details}`. Empty when the run was refused. Decimals in `details` are strings. |
+| `row_counts` | `{source, target}`. Both are null when the run was refused, because the rows were not counted. |
+
+### Sample Report
+
+This is `report.md` from a match of two identical two-row files. Amounts were `10.50` and `1.25`, grouped by day. The spec hash is the SHA-256 of that spec file.
+
+```text
+# Reconciliation Report
+
+## Result
+
+Status: Match
+
+Tool: qa-core-recon
+Version: 0.1.0
+Spec Hash: 35b87470e839cca880695b3166435a855a8f77f3ac338c0b5fd4a76f830af52f
+
+## Row Counts
+
+Source: 2
+Target: 2
+
+## Checks
+
+### Row Count
+
+Status: Match
+
+Source rows: 2. Target rows: 2.
+
+Grouped by day.
+
+Groups, in sorted order:
+
+- day=2024-01-01. Source rows: 1. Target rows: 1. Match.
+- day=2024-01-02. Source rows: 1. Target rows: 1. Match.
+
+### Amount Sum
+
+Status: Match
+
+Column amount, scale 2. Source sum: 11.75. Target sum: 11.75. Difference: 0.00. Tolerance: 0. Match.
+
+Groups, in sorted order:
+
+- day=2024-01-01. Source sum: 10.50. Target sum: 10.50. Difference: 0.00. Match.
+- day=2024-01-02. Source sum: 1.25. Target sum: 1.25. Difference: 0.00. Match.
+
+### Null Keys
+
+Status: Match
+
+Source rows with a null key: 0.
+Target rows with a null key: 0.
+
+### Duplicate Keys
+
+Status: Match
+
+Example limit: 20.
+
+Source duplicate keys: 0.
+
+Target duplicate keys: 0.
+```
 
 ## Exit Codes
 
 | Code | Name | Meaning |
 | ---- | ---- | ------- |
-| 0 | `MATCH` | Success. For `validate`, the spec is usable. For `validate --check-data`, both datasets passed the data-level refusals. For a later `run`, the target matches the source. |
-| 1 | `MISMATCH` | The target differs from the source. Reserved for `run`. |
-| 2 | `REFUSED` | The tool declined to run, or the input could not be opened, so there is no result. |
+| 0 | `MATCH` | Success. For `validate`, the spec is usable. For `validate --check-data`, both datasets passed the data-level refusals. For `run`, every aggregate check matched. |
+| 1 | `MISMATCH` | `run` found a difference. At least one aggregate check did not match. |
+| 2 | `REFUSED` | The tool declined to run, or the input or the output directory could not be used, so there is no comparison result. A refusal still writes a report. A read error does not. |
 
-`init` and `validate` use codes 0 and 2 only. `--check-data` is part of `validate`, so it stays on those codes too. An amount that cannot be represented at the spec scale is a refusal, exit 2, because the tool has no decimal to compare. Code 1 stays reserved for a dataset mismatch, so these commands never return it.
+`init` and `validate` use codes 0 and 2 only. `--check-data` is part of `validate`, so it stays on those codes too. `run` uses 0, 1, and 2. An amount that cannot be represented at the spec scale is a refusal, exit 2, because the tool has no decimal to compare. A sum that does not fit `decimal(38, scale)` is a read error on `run`, exit 2, because a rounded total would be a wrong number. `init` and `validate` never return code 1.
 
 A malformed spec, a refusal, an unreadable spec file, an unreadable dataset, and any unexpected error all exit with code 2. An unexpected error inside the CLI is caught, printed as one `qa-core-recon: error:` line on stderr, and exits with code 2. The CLI prints no traceback.
 
@@ -129,7 +268,7 @@ Parquet is read from a file or a directory, with `mergeSchema` off. The file sch
 
 Readers read every row. They do not sample, limit, or keep a head. `sampled: true` is refused even when the files contain a full extract, because the spec declared a sample.
 
-Blank amount cells are null. They are not turned into zero. Null counts arrive with `run`.
+Blank amount cells are null. They are not turned into zero. `run` leaves a null amount out of the sum, and it counts null keys separately.
 
 A missing path, a CSV file that is not UTF-8, a malformed CSV row, or a file that Spark cannot read is a read error (`qa-core-recon: error:`), exit 2. It is not a refusal code.
 
@@ -148,7 +287,7 @@ target:
 
 The catalog is `org.apache.iceberg.spark.SparkCatalog` with `type` set to `hadoop`. It is registered for that warehouse only, and only when the spec uses Iceberg. The Spark session catalog stays in memory, Hive is not started, and the Iceberg catalog cache is off so a read sees the current snapshot. This is not the Glue catalog.
 
-The runtime jar is `org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.7.1` (Spark 3.5, Scala 2.12). AWS Glue 5.0 ships Iceberg 1.7.1 with Spark 3.5.4, as listed in the AWS Glue versions documentation. Spark downloads the jar from Maven Central the first time a session is started for an Iceberg spec, and stores it in the Ivy cache (`~/.cache/qa-core-recon/ivy`, or `QA_CORE_RECON_IVY`). Later runs reuse the cache. CSV and Parquet do not download it. When Spark reports an unresolved dependency or an Ivy failure, and the jar is not already in that cache, `--check-data` prints a read error that names the runtime and the cache directory, and exits 2. Any other failure to start the session prints `cannot start the local Spark session` and exits 2.
+The runtime jar is `org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.7.1` (Spark 3.5, Scala 2.12). AWS Glue 5.0 ships Iceberg 1.7.1 with Spark 3.5.4, as listed in the AWS Glue versions documentation. Spark downloads the jar from Maven Central the first time a session is started for an Iceberg spec, and stores it in the Ivy cache (`~/.cache/qa-core-recon/ivy`, or `QA_CORE_RECON_IVY`). Later runs reuse the cache. CSV and Parquet do not download it. When Spark reports an unresolved dependency or an Ivy failure, and the jar is not already in that cache, `--check-data` and `run` print a read error that names the runtime and the cache directory, and exit 2. Any other failure to start the session prints `cannot start the local Spark session` and exits 2.
 
 Iceberg on a local warehouse is supported. An allowlisted `s3://` warehouse is still a valid spec. `--check-data` prints `s3 reads are not supported yet` and exits 2, before Spark starts. S3 and the Glue catalog are later PRs.
 
