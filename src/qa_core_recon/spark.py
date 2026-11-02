@@ -175,6 +175,8 @@ def s3_hadoop_settings() -> dict[str, str]:
 
     Credentials are not included. The default AWS chain reads them from the
     environment, a profile, or an instance role when a request is sent.
+    ``fs.s3.impl`` is the S3A filesystem, so an Iceberg file path of ``s3://``
+    uses the same client as ``s3a://``.
     ``QA_CORE_RECON_S3_ENDPOINT`` switches on path-style access. An ``http://``
     endpoint also turns TLS off, and retries are limited to one attempt after
     200ms so a dead endpoint fails quickly. With that override and no region
@@ -185,6 +187,9 @@ def s3_hadoop_settings() -> dict[str, str]:
     It does not consult the AWS SDK region chain.
     """
     settings = {
+        # Glue, EMR, and Athena store Iceberg file paths as s3://. Without this
+        # mapping Hadoop has no filesystem for that scheme.
+        "fs.s3.impl": "org.apache.hadoop.fs.s3a.S3AFileSystem",
         "fs.s3a.impl": "org.apache.hadoop.fs.s3a.S3AFileSystem",
         "fs.s3a.aws.credentials.provider": "com.amazonaws.auth.DefaultAWSCredentialsProviderChain",
     }
@@ -257,8 +262,9 @@ def scrub_s3_credentials(spark: SparkSession) -> None:
     """Drop credentials Hadoop copied into its configuration.
 
     The AWS chain still supplies them on the next request. They are not left
-    where a later log line or config dump could print them. This covers the
-    s3a keys and the older s3n keys Hadoop fills from the environment.
+    where a later log line or config dump could print them. This covers
+    ``fs.s3.*`` keys, ``fs.s3a.*`` keys, and the older s3n keys Hadoop fills
+    from the environment.
     """
     secrets = _credential_values()
     conf = spark.sparkContext._jsc.hadoopConfiguration()
