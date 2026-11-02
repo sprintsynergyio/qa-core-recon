@@ -5,15 +5,21 @@ import pytest
 from py4j.protocol import Py4JJavaError
 
 from qa_core_recon.spark import (
+    AWS_SDK_BUNDLE_PACKAGE,
+    HADOOP_AWS_PACKAGE,
     ICEBERG_SPARK_PACKAGE,
     MAVEN_CENTRAL,
     IcebergRuntimeError,
+    S3RuntimeError,
     SessionStartError,
     catalog_name_for,
     ivy_cache_dir,
+    jars_packages,
     local_session,
     missing_runtime_message,
+    missing_s3_runtime_message,
     runtime_jar_cached,
+    s3_jars_cached,
     session_start_failure,
 )
 
@@ -25,7 +31,7 @@ def test_session_is_local_and_fixed(spark):
     assert spark.conf.get("spark.sql.session.timeZone") == "UTC"
     assert spark.conf.get("spark.ui.enabled") == "false"
     assert spark.conf.get("spark.sql.catalogImplementation") == "in-memory"
-    assert spark.conf.get("spark.jars.packages") == ICEBERG_SPARK_PACKAGE
+    assert spark.conf.get("spark.jars.packages") == jars_packages(iceberg=True, s3=True)
     assert spark.conf.get("spark.jars.ivy") == str(ivy_cache_dir())
     assert spark.conf.get("spark.jars.repositories") == MAVEN_CENTRAL
     pending = catalog_name_for("/not/a/registered/warehouse")
@@ -37,6 +43,17 @@ def test_session_is_local_and_fixed(spark):
     assert spark.conf.get("spark.sql.execution.arrow.pyspark.enabled") == "false"
     assert spark.conf.get("spark.sql.csv.parser.columnPruning.enabled") == "false"
     assert local_session() is spark
+
+
+def test_running_session_without_s3_cannot_gain_it(spark, monkeypatch):
+    import qa_core_recon.spark as spark_mod
+
+    monkeypatch.setattr(spark_mod, "_s3_ready", False)
+    with pytest.raises(RuntimeError) as caught:
+        local_session(s3=True)
+    assert str(caught.value) == (
+        "the local Spark session is already running without the S3 runtime"
+    )
 
 
 def test_running_session_without_iceberg_cannot_gain_it(spark, monkeypatch):
@@ -180,6 +197,134 @@ def test_startup_log_keeps_a_broken_java_home_generic(spark, monkeypatch, tmp_pa
         "cannot start the local Spark session: [JAVA_GATEWAY_EXITED] Java gateway process exited"
     )
     assert "JAVA_HOME" not in str(caught.value)
+
+
+def test_session_start_failure_checks_s3_then_iceberg_then_stays_generic(tmp_path):
+    cache = tmp_path / "empty"
+    unresolved = RuntimeError("unresolved dependency: missing")
+    s3_failure = session_start_failure(unresolved, iceberg=True, ivy=cache, s3=True)
+    assert isinstance(s3_failure, S3RuntimeError)
+    assert not isinstance(s3_failure, IcebergRuntimeError)
+    assert "unexpected error" not in str(s3_failure)
+
+    iceberg_failure = session_start_failure(unresolved, iceberg=True, ivy=cache, s3=False)
+    assert isinstance(iceberg_failure, IcebergRuntimeError)
+    assert str(iceberg_failure) == missing_runtime_message(cache)
+    assert "unexpected error" not in str(iceberg_failure)
+
+    warm = tmp_path / "warm-s3"
+    warm.mkdir()
+    (warm / "hadoop-aws-3.3.4.jar").write_bytes(b"jar")
+    (warm / "aws-java-sdk-bundle-1.12.262.jar").write_bytes(b"jar")
+    iceberg_after_s3 = session_start_failure(unresolved, iceberg=True, ivy=warm, s3=True)
+    assert isinstance(iceberg_after_s3, IcebergRuntimeError)
+
+    other = session_start_failure(
+        RuntimeError("JAVA_GATEWAY_EXITED"),
+        iceberg=False,
+        ivy=cache,
+        s3=False,
+    )
+    assert isinstance(other, SessionStartError)
+    assert not isinstance(other, S3RuntimeError)
+    assert not isinstance(other, IcebergRuntimeError)
+    assert str(other) == "cannot start the local Spark session: JAVA_GATEWAY_EXITED"
+    assert "unexpected error" not in str(other)
+
+
+def test_missing_s3_runtime_is_a_clear_read_error(tmp_path):
+    cache = tmp_path / "empty-ivy"
+    assert s3_jars_cached(cache) is False
+    one = tmp_path / "half"
+    one.mkdir()
+    (one / "org.apache.hadoop_hadoop-aws-3.3.4.jar").write_bytes(b"jar")
+    assert s3_jars_cached(one) is False
+
+    resolution = RuntimeError(
+        "unresolved dependency: org.apache.hadoop#hadoop-aws;3.3.4: not found"
+    )
+    failure = session_start_failure(resolution, iceberg=False, ivy=cache, s3=True)
+    assert isinstance(failure, S3RuntimeError)
+    assert str(failure) == missing_s3_runtime_message(cache)
+    assert HADOOP_AWS_PACKAGE in str(failure)
+    assert AWS_SDK_BUNDLE_PACKAGE in str(failure)
+    assert "Maven Central" in str(failure)
+    assert str(cache) in str(failure)
+    assert "unresolved dependency" not in str(failure)
+
+    present = tmp_path / "warm-s3"
+    present.mkdir()
+    (present / "org.apache.hadoop_hadoop-aws-3.3.4.jar").write_bytes(b"jar")
+    (present / "com.amazonaws_aws-java-sdk-bundle-1.12.262.jar").write_bytes(b"jar")
+    assert s3_jars_cached(present) is True
+    cached = session_start_failure(resolution, iceberg=False, ivy=present, s3=True)
+    assert isinstance(cached, SessionStartError)
+    assert not isinstance(cached, S3RuntimeError)
+    assert str(cached).startswith("cannot start the local Spark session")
+
+
+def test_local_only_session_does_not_request_s3_packages(spark, monkeypatch):
+    import qa_core_recon.spark as spark_mod
+
+    seen: dict[str, str | None] = {}
+
+    def capture(builder):
+        seen["packages"] = builder._options.get("spark.jars.packages")
+        seen["ivy"] = builder._options.get("spark.jars.ivy")
+        raise RuntimeError("stopped before the jvm")
+
+    monkeypatch.setattr(spark_mod, "_session", None)
+    monkeypatch.setattr(spark_mod, "_warehouse", None)
+    monkeypatch.setattr(spark_mod, "_iceberg_ready", False)
+    monkeypatch.setattr(spark_mod, "_s3_ready", False)
+    monkeypatch.setattr(spark_mod, "_start_quietly", capture)
+    with pytest.raises(SessionStartError, match="stopped before the jvm"):
+        local_session(iceberg=False, s3=False)
+    assert seen["packages"] is None
+    assert seen["ivy"] is None
+
+    def capture_s3(builder):
+        seen["packages"] = builder._options.get("spark.jars.packages")
+        raise RuntimeError("stopped before the jvm")
+
+    monkeypatch.setattr(spark_mod, "_start_quietly", capture_s3)
+    with pytest.raises(SessionStartError, match="stopped before the jvm"):
+        local_session(iceberg=False, s3=True)
+    assert seen["packages"] == jars_packages(s3=True)
+    assert HADOOP_AWS_PACKAGE in seen["packages"]
+    assert AWS_SDK_BUNDLE_PACKAGE in seen["packages"]
+    assert ICEBERG_SPARK_PACKAGE not in seen["packages"]
+
+
+def test_s3_session_sets_s3_builder_settings(spark, monkeypatch):
+    import qa_core_recon.spark as spark_mod
+
+    seen: dict[str, str | None] = {}
+
+    def capture(builder):
+        for key, value in builder._options.items():
+            seen[key] = value
+        raise RuntimeError("stopped before the jvm")
+
+    monkeypatch.setattr(spark_mod, "_session", None)
+    monkeypatch.setattr(spark_mod, "_warehouse", None)
+    monkeypatch.setattr(spark_mod, "_iceberg_ready", False)
+    monkeypatch.setattr(spark_mod, "_s3_ready", False)
+    monkeypatch.setattr(spark_mod, "_start_quietly", capture)
+    with pytest.raises(SessionStartError, match="stopped before the jvm"):
+        local_session(iceberg=False, s3=True)
+    assert seen["spark.jars.packages"] == jars_packages(s3=True)
+    assert seen["spark.hadoop.fs.s3.impl"] == "org.apache.hadoop.fs.s3a.S3AFileSystem"
+    assert seen["spark.hadoop.fs.s3a.impl"] == "org.apache.hadoop.fs.s3a.S3AFileSystem"
+    assert seen["spark.hadoop.fs.s3a.path.style.access"] == "true"
+    assert seen["spark.hadoop.fs.s3a.endpoint"] == os.environ["QA_CORE_RECON_S3_ENDPOINT"]
+    assert seen["spark.hadoop.fs.s3a.retry.limit"] == "1"
+    assert seen["spark.hadoop.fs.s3a.retry.interval"] == "200ms"
+    provider = seen["spark.hadoop.fs.s3a.aws.credentials.provider"]
+    assert provider is not None
+    assert "DefaultAWSCredentialsProviderChain" in provider
+    secret = os.environ["AWS_SECRET_ACCESS_KEY"]
+    assert all(secret not in (value or "") for value in seen.values())
 
 
 def test_session_leaves_no_hive_files_in_the_repo(spark):

@@ -503,7 +503,7 @@ def test_s3_input_is_a_read_error_without_a_report(tmp_path, capsys):
     _assert_error(
         code,
         captured,
-        "s3 reads are not supported yet: target path 's3://demo-bucket/curated/payments'",
+        "target bucket not found: s3://demo-bucket/curated/payments",
     )
     assert not out.exists()
 

@@ -411,9 +411,7 @@ def test_s3_iceberg_warehouse_is_a_valid_spec_and_a_read_error(spark, tmp_path):
     spec_body["allowlist"] = [str(tmp_path), "s3://demo-bucket"]
     with pytest.raises(ReadError) as caught:
         check_data(spark, parse_data(spec_body))
-    assert str(caught.value) == (
-        "s3 reads are not supported yet: target path 's3://demo-bucket/warehouse'"
-    )
+    assert str(caught.value) == "target bucket not found: s3://demo-bucket/warehouse"
 
 
 def test_snapshot_id_reads_that_snapshot_and_the_default_is_current(spark, tmp_path):

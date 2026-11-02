@@ -1,8 +1,8 @@
 """Read source and target datasets for a recon spec.
 
-CSV, Parquet, and Iceberg on local disk only. S3 is a later PR. Every path is
-checked with the spec allowlist before it is opened. The check uses the path
-text and does not resolve symlinks.
+CSV, Parquet, and Iceberg on local disk and on S3. Every path is checked with
+the spec allowlist before it is opened. The check uses the path text and does
+not resolve symlinks. An ``s3://`` path is read as ``s3a://``.
 
 CSV is read with an explicit string schema and ``inferSchema`` off. Amount
 columns are then parsed by :func:`qa_core_recon.decimals.to_decimal`. Parquet
@@ -24,8 +24,10 @@ snapshot is read, or ``snapshot_id`` when the spec sets one.
    lexicographically smallest offending text in that column. The scan runs
    inside Spark and only that one value is returned to the driver.
 
-``path-not-allowed`` is re-checked before those reads. An allowlisted ``s3://``
-path raises :class:`ReadError` instead, because the allowlist already passed.
+``path-not-allowed`` is re-checked before those reads. A missing S3 bucket or
+key, access denied, and an endpoint that cannot be reached are read errors.
+The message names the side and the spec path and does not include the
+underlying exception text.
 """
 
 import csv
@@ -51,8 +53,14 @@ from pyspark.sql.types import (
 
 from qa_core_recon.decimals import DECIMAL_PRECISION, InexactAmount, to_decimal
 from qa_core_recon.refusals import Refusal, RefusalCode, RefusalError
-from qa_core_recon.spark import hadoop_catalog
-from qa_core_recon.spec import Amount, Dataset, Spec, _path_allowed
+from qa_core_recon.spark import (
+    apply_s3_config,
+    hadoop_catalog,
+    ivy_cache_dir,
+    missing_s3_runtime_message,
+    scrub_s3_credentials,
+)
+from qa_core_recon.spec import Amount, Dataset, Spec, _path_allowed, is_s3_path, to_s3a
 
 _MISSING_TABLE_MARKERS = (
     "NoSuchTableException",
@@ -69,7 +77,11 @@ class ReadError(ValueError):
 
 
 def check_before_session(spec: Spec) -> None:
-    """Raise sample-only or the S3 read error before a JVM is started."""
+    """Raise sample-only, or path-not-allowed, before a dataset is opened.
+
+    ``sample-only`` is raised before a JVM is required. An allowlisted
+    ``s3://`` path is not an error here. The read uses Spark.
+    """
     if spec.sampled:
         raise RefusalError(
             Refusal(
@@ -77,7 +89,7 @@ def check_before_session(spec: Spec) -> None:
                 "the spec declares sampling, so a full recon cannot be claimed",
             )
         )
-    _reject_remote_or_unlisted(spec)
+    _reject_unlisted(spec)
 
 
 def check_data(spark: SparkSession, spec: Spec) -> None:
@@ -107,7 +119,7 @@ def _prepare(spark: SparkSession, spec: Spec) -> tuple[DataFrame, DataFrame]:
     return source, target
 
 
-def _reject_remote_or_unlisted(spec: Spec) -> None:
+def _reject_unlisted(spec: Spec) -> None:
     for side, dataset in (("source", spec.source), ("target", spec.target)):
         if not _path_allowed(dataset.path, spec.allowlist):
             raise RefusalError(
@@ -116,9 +128,6 @@ def _reject_remote_or_unlisted(spec: Spec) -> None:
                     f"{side} path {dataset.path!r} is outside the allowlist",
                 )
             )
-    for side, dataset in (("source", spec.source), ("target", spec.target)):
-        if dataset.path.startswith("s3://"):
-            raise ReadError(f"s3 reads are not supported yet: {side} path {dataset.path!r}")
 
 
 def _refuse_unmapped(df: DataFrame, side: str, spec: Spec) -> None:
@@ -203,7 +212,11 @@ def _first_inexact(df: DataFrame, amount: Amount, kind: str, side: str, spec: Sp
     try:
         # min ignores nulls, so only the smallest bad text reaches the driver.
         return df.select(marker.alias("bad")).agg(spark_min("bad")).first()[0]
-    except Exception:
+    except Exception as exc:
+        if is_s3_path(dataset.path):
+            message = _classify_s3_error(exc, side, dataset.path, missing_key=True)
+            if message is not None:
+                raise ReadError(message) from None
         raise ReadError(f"cannot read {side} as {dataset.format}") from None
 
 
@@ -269,6 +282,8 @@ def _amount_kind(dtype: DataType) -> str:
 def _open(spark: SparkSession, dataset: Dataset, side: str) -> DataFrame:
     if dataset.format == "iceberg":
         return _read_iceberg(spark, dataset, side)
+    if is_s3_path(dataset.path):
+        return _open_s3(spark, dataset, side)
     location = _require_local(dataset.path, side)
     try:
         if dataset.format == "csv":
@@ -288,12 +303,96 @@ def _open(spark: SparkSession, dataset: Dataset, side: str) -> DataFrame:
     return frame
 
 
+def _open_s3(spark: SparkSession, dataset: Dataset, side: str) -> DataFrame:
+    apply_s3_config(spark)
+    location = to_s3a(dataset.path)
+    try:
+        if dataset.format == "csv":
+            frame = _read_csv_s3(spark, location, side)
+            _parse_all_csv_rows(frame, side)
+        elif dataset.format == "parquet":
+            frame = spark.read.option("mergeSchema", "false").parquet(location)
+        else:
+            raise ReadError(f"cannot read {side} as {dataset.format}")
+        if not isinstance(frame.schema, StructType):
+            raise ReadError(f"cannot read {side} as {dataset.format}")
+    except ReadError:
+        raise
+    except Exception as exc:
+        message = _classify_s3_error(exc, side, dataset.path, missing_key=True)
+        if message is not None:
+            raise ReadError(message) from None
+        raise ReadError(f"cannot read {side} as {dataset.format}") from None
+    else:
+        return frame
+    finally:
+        scrub_s3_credentials(spark)
+
+
+def _classify_s3_error(
+    exc: BaseException, side: str, path: str, *, missing_key: bool
+) -> str | None:
+    """Return a read-error line for an S3 failure, or None when it is not one.
+
+    The line names the side and the spec path. It does not include the
+    exception text, so a signed request or a credential cannot leak.
+    """
+    lowered = _exception_text(exc).lower()
+    if ("classnotfoundexception" in lowered or "noclassdeffounderror" in lowered) and (
+        "s3afilesystem" in lowered or "com.amazonaws" in lowered or "hadoop.fs.s3a" in lowered
+    ):
+        return missing_s3_runtime_message(ivy_cache_dir())
+    # Hadoop wraps a missing chain as AccessDeniedException caused by
+    # NoAuthWithAWSException. The credential check has to win, or the wrapper
+    # is reported as access denied.
+    if (
+        "noauthwithawsexception" in lowered
+        or "noauthwithaws" in lowered
+        or "no aws credentials" in lowered
+        or "unable to load aws credentials" in lowered
+    ):
+        return f"no AWS credentials found for {side} path {path}"
+    if (
+        "accessdenied" in lowered
+        or "access denied" in lowered
+        or "status code: 403" in lowered
+        or "allaccessdisabled" in lowered
+    ):
+        return f"access denied reading {side} path {path}"
+    if "nosuchbucket" in lowered or "specified bucket does not exist" in lowered:
+        return f"{side} bucket not found: {path}"
+    if (
+        "connection refused" in lowered
+        or "connectexception" in lowered
+        or "unknownhostexception" in lowered
+        or "connect timed out" in lowered
+        or "unable to execute http request" in lowered
+    ):
+        return f"cannot reach S3 for {side} path {path}"
+    if missing_key and (
+        "filenotfoundexception" in lowered
+        or "nosuchkey" in lowered
+        or "no such file" in lowered
+        or "status code: 404" in lowered
+        or "404 not found" in lowered
+        or "path does not exist" in lowered
+        or "path_not_found" in lowered
+    ):
+        return f"{side} path not found: {path}"
+    return None
+
+
 def _read_iceberg(spark: SparkSession, dataset: Dataset, side: str) -> DataFrame:
-    _require_warehouse(dataset.path, side)
+    if is_s3_path(dataset.path):
+        apply_s3_config(spark)
+        warehouse = to_s3a(dataset.path)
+    else:
+        _require_warehouse(dataset.path, side)
+        warehouse = dataset.path
     if not dataset.table:
         raise ReadError(f"cannot read {side} as iceberg")
     try:
-        catalog = hadoop_catalog(spark, dataset.path)
+        catalog = hadoop_catalog(spark, warehouse)
         reader = spark.read.format("iceberg")
         if dataset.snapshot_id is not None:
             reader = reader.option("snapshot-id", str(dataset.snapshot_id))
@@ -305,8 +404,16 @@ def _read_iceberg(spark: SparkSession, dataset: Dataset, side: str) -> DataFrame
     except ReadError:
         raise
     except Exception as exc:
+        if is_s3_path(dataset.path):
+            message = _classify_s3_error(exc, side, dataset.path, missing_key=False)
+            if message is not None:
+                raise ReadError(message) from None
         raise _iceberg_read_error(exc, dataset, side) from None
-    return frame
+    else:
+        return frame
+    finally:
+        if is_s3_path(dataset.path):
+            scrub_s3_credentials(spark)
 
 
 def _require_warehouse(path: str, side: str) -> Path:
@@ -367,6 +474,10 @@ def _read_csv(spark: SparkSession, location: Path, side: str) -> DataFrame:
         other = _header_names(_first_line(extra, side), side)
         if other != names:
             raise ReadError(f"{side} csv header in {extra.name!r} does not match {files[0].name!r}")
+    return _csv_frame(spark, [str(item) for item in files], names)
+
+
+def _csv_frame(spark: SparkSession, paths: list[str], names: list[str]) -> DataFrame:
     schema = StructType([StructField(name, StringType(), True) for name in names])
     return (
         spark.read.schema(schema)
@@ -374,8 +485,91 @@ def _read_csv(spark: SparkSession, location: Path, side: str) -> DataFrame:
         .option("inferSchema", "false")
         .option("encoding", "UTF-8")
         .option("mode", "FAILFAST")
-        .csv([str(item) for item in files])
+        .csv(paths)
     )
+
+
+def _read_csv_s3(spark: SparkSession, location: str, side: str) -> DataFrame:
+    files = _csv_s3_uris(spark, location, side)
+    names = _header_names(_first_s3_line(spark, files[0], side), side)
+    for extra in files[1:]:
+        other = _header_names(_first_s3_line(spark, extra, side), side)
+        if other != names:
+            raise ReadError(
+                f"{side} csv header in {_uri_name(extra)!r} does not match {_uri_name(files[0])!r}"
+            )
+    return _csv_frame(spark, files, names)
+
+
+def _csv_s3_uris(spark: SparkSession, uri: str, side: str) -> list[str]:
+    filesystem, path = _hadoop_file(spark, uri)
+    status = filesystem.getFileStatus(path)
+    if status.isFile():
+        return [uri]
+    found: list[tuple[str, str]] = []
+    for item in filesystem.listStatus(path):
+        name = str(item.getPath().getName())
+        if item.isFile() and name and not name.startswith(".") and not name.startswith("_"):
+            _reject_listed_glob(name, side)
+            found.append((name, str(item.getPath().toString())))
+    # Sort so the header comparison names files in a stable order. S3 listing
+    # order is not part of the result.
+    found.sort(key=lambda pair: pair[0])
+    if not found:
+        raise ReadError(f"{side} csv has no data files")
+    return [item[1] for item in found]
+
+
+def _reject_listed_glob(name: str, side: str) -> None:
+    """Refuse an object whose name Spark would treat as a glob.
+
+    The spec path is already free of glob characters. A listed object can
+    still be named ``a[1].csv``. Passing that URI back to Spark expands it
+    and the failure does not name the object.
+    """
+    for char in name:
+        if char in "*?[]{}\\":
+            raise ReadError(f"{side} csv object {name!r} contains glob character {char!r}")
+
+
+def _first_s3_line(spark: SparkSession, uri: str, side: str) -> str:
+    jvm = spark.sparkContext._jvm
+    filesystem, path = _hadoop_file(spark, uri)
+    stream = filesystem.open(path)
+    decoder = (
+        jvm.java.nio.charset.Charset.forName("UTF-8")
+        .newDecoder()
+        .onMalformedInput(jvm.java.nio.charset.CodingErrorAction.REPORT)
+        .onUnmappableCharacter(jvm.java.nio.charset.CodingErrorAction.REPORT)
+    )
+    reader = jvm.java.io.BufferedReader(jvm.java.io.InputStreamReader(stream, decoder))
+    try:
+        line = reader.readLine()
+    except Exception as exc:
+        text = _exception_text(exc).lower()
+        if "malformedinput" in text or "unmappablecharacter" in text:
+            raise ReadError(f"{side} csv is not valid UTF-8") from None
+        raise
+    finally:
+        reader.close()
+    if line is None:
+        raise ReadError(f"{side} csv is empty")
+    if line.startswith("\ufeff"):
+        line = line[1:]
+    if line == "":
+        raise ReadError(f"{side} csv is empty")
+    return line
+
+
+def _hadoop_file(spark: SparkSession, uri: str):
+    jvm = spark.sparkContext._jvm
+    conf = spark.sparkContext._jsc.hadoopConfiguration()
+    filesystem = jvm.org.apache.hadoop.fs.FileSystem.get(jvm.java.net.URI(uri), conf)
+    return filesystem, jvm.org.apache.hadoop.fs.Path(uri)
+
+
+def _uri_name(uri: str) -> str:
+    return uri.rstrip("/").rsplit("/", 1)[-1]
 
 
 def _parse_all_csv_rows(df: DataFrame, side: str) -> None:
@@ -391,6 +585,7 @@ def _parse_all_csv_rows(df: DataFrame, side: str) -> None:
 
 def _csv_files(location: Path, side: str) -> list[Path]:
     if location.is_file():
+        _reject_listed_glob(location.name, side)
         return [location]
     files = [
         child
@@ -400,6 +595,8 @@ def _csv_files(location: Path, side: str) -> list[Path]:
     files.sort(key=lambda child: child.name)
     if not files:
         raise ReadError(f"{side} csv has no data files")
+    for child in files:
+        _reject_listed_glob(child.name, side)
     return files
 
 
