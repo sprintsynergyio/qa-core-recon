@@ -38,6 +38,7 @@ from collections.abc import Sequence
 from datetime import UTC, date, datetime
 from decimal import Context, Decimal, localcontext
 
+from qa_core_recon.decimals import _AMOUNT_TEXT
 from qa_core_recon.spec import Spec
 
 # Above Spark's decimal(38). normalize() must not round a full-precision value.
@@ -138,9 +139,11 @@ def strict_decimal_payload(text: str, precision: int, scale: int) -> str | None:
 
     if text is None:
         return None
-    raw = str(text).strip()
-    if raw == "":
+    original = str(text)
+    # ASCII only, before Decimal(). Decimal accepts 1_000 and non-ASCII digits.
+    if _AMOUNT_TEXT.fullmatch(original) is None:
         return None
+    raw = original.strip()
     try:
         value = Decimal(raw)
     except InvalidOperation:

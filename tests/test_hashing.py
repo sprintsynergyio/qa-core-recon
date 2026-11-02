@@ -70,6 +70,10 @@ def test_decimals_compare_by_value_and_keep_significant_digits():
     assert strict_decimal_payload("1.50", 10, 2) == "1.5"
     assert strict_decimal_payload("1.001", 10, 2) is None
     assert strict_decimal_payload("01", 10, 0) == "1"
+    assert strict_decimal_payload("1_000", 12, 2) is None
+    assert strict_decimal_payload("١٠", 12, 2) is None
+    assert strict_decimal_payload("１０", 12, 2) is None
+    assert strict_decimal_payload("\u00a010", 12, 2) is None
     wide = Decimal("9" * 36 + ".99")
     assert encode_value(wide) == "decimal:39:" + "9" * 36 + ".99"
 

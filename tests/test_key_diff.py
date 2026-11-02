@@ -1030,6 +1030,90 @@ def test_padded_date_value_still_matches(spark, tmp_path):
     assert _invoke(spec, out) is ExitCode.MATCH
 
 
+_NON_ASCII_AMOUNTS = (
+    ("1", "1_000", Decimal("1000.00")),
+    ("2", "١٠", Decimal("10.00")),
+    ("3", "１０", Decimal("10.00")),
+    ("4", "\u00a010", Decimal("10.00")),
+)
+
+
+def test_non_ascii_amount_text_does_not_match_a_decimal_value(spark, tmp_path):
+    source = tmp_path / "source.csv"
+    body = "".join(f"{key},{text}\n" for key, text, _value in _NON_ASCII_AMOUNTS)
+    write_csv(source, body, "txn_id,qty\n")
+    schema = StructType(
+        [
+            StructField("txn_id", StringType(), True),
+            StructField("qty", DecimalType(12, 2), True),
+        ]
+    )
+    target = tmp_path / "target"
+    rows = [(key, value) for key, _text, value in _NON_ASCII_AMOUNTS]
+    _write_frame(spark, target, rows, schema)
+    data = spec_data(tmp_path, source, target, source_format="csv", target_format="parquet")
+    data.update(amounts=[], group_by=[], hash_columns=["qty"])
+    spec = write_spec_file(tmp_path, data)
+    out = tmp_path / "out"
+    assert _invoke(spec, out) is ExitCode.MISMATCH
+    column = _changed(_load(out)[0])["details"]["columns"][0]
+    assert column["column"] == "qty"
+    assert column["count"] == 4
+    assert [example["key"] for example in column["examples"]] == [["1"], ["2"], ["3"], ["4"]]
+    assert all(example["source_token"].startswith("invalid:") for example in column["examples"])
+
+
+def test_non_ascii_amount_text_does_not_match_an_int_key(spark, tmp_path):
+    source = tmp_path / "source.csv"
+    body = "".join(f"{text},a\n" for _key, text, _value in _NON_ASCII_AMOUNTS)
+    write_csv(source, body, "txn_id,note\n")
+    schema = StructType(
+        [
+            StructField("txn_id", LongType(), True),
+            StructField("note", StringType(), True),
+        ]
+    )
+    target = tmp_path / "target"
+    _write_frame(spark, target, [(1000, "a"), (10, "a")], schema)
+    data = spec_data(tmp_path, source, target, source_format="csv", target_format="parquet")
+    data.update(amounts=[], group_by=[], hash_columns=["note"], keys=["txn_id"])
+    spec = write_spec_file(tmp_path, data)
+    out = tmp_path / "out"
+    assert _invoke(spec, out) is ExitCode.MISMATCH
+    details = _key_diff(_load(out)[0])["details"]
+    texts = [text for _key, text, _value in _NON_ASCII_AMOUNTS]
+    assert details["missing"]["examples"] == [[text] for text in sorted(texts, key=sort_token)]
+    assert details["extra"]["examples"] == [[10], [1000]]
+    assert details["changed"]["count"] == 0
+
+
+def test_int_key_examples_are_the_first_by_value(spark, tmp_path):
+    keys = list(range(-5, 25))
+    schema = StructType(
+        [
+            StructField("txn_id", LongType(), True),
+            StructField("note", StringType(), True),
+        ]
+    )
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    _write_frame(spark, source, [(key, "a") for key in keys], schema)
+    _write_frame(spark, target, [(key, "b") for key in keys], schema)
+    data = spec_data(tmp_path, source, target, source_format="parquet", target_format="parquet")
+    data.update(amounts=[], group_by=[], hash_columns=["note"], keys=["txn_id"])
+    spec = write_spec_file(tmp_path, data)
+    out = tmp_path / "out"
+    assert _invoke(spec, out) is ExitCode.MISMATCH
+    report = _load(out)[0]
+    expected = [[key] for key in range(-5, 15)]
+    changed = _key_diff(report)["details"]["changed"]
+    assert changed["count"] == len(keys)
+    assert changed["examples"] == expected
+    column = _changed(report)["details"]["columns"][0]
+    assert column["count"] == len(keys)
+    assert [example["key"] for example in column["examples"]] == expected
+
+
 def _note_schema(amount):
     return StructType(
         [

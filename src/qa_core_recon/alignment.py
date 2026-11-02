@@ -65,6 +65,7 @@ from pyspark.sql.types import (
 )
 from pyspark.sql.types import StringType as _StringType
 
+from qa_core_recon.decimals import _AMOUNT_TEXT
 from qa_core_recon.hashing import encode_value, plain_decimal_text, strict_decimal_payload
 
 _INTEGER_TYPES = (ByteType, ShortType, IntegerType, LongType)
@@ -83,6 +84,12 @@ def _strict_decimal_udf(text, precision, scale):
     return strict_decimal_payload(str(text), int(precision), int(scale))
 
 
+def _amount_text_ok(text) -> bool:
+    if text is None:
+        return False
+    return _AMOUNT_TEXT.fullmatch(str(text)) is not None
+
+
 def _plain_decimal_udf(value, scale):
     if value is None or scale is None:
         return None
@@ -92,6 +99,7 @@ def _plain_decimal_udf(value, scale):
 
 _DECIMAL_PAYLOAD = udf(_strict_decimal_udf, _StringType())
 _PLAIN_DECIMAL = udf(_plain_decimal_udf, _StringType())
+_ASCII_AMOUNT = udf(_amount_text_ok, BooleanType())
 
 
 @dataclass(frozen=True)
@@ -296,7 +304,9 @@ def _decimal_string_token(
         # Spark's own cast uses an exponent from scale 7. The plain text does not.
         parsed = _try_name(name, f"decimal({precision},{scale})")
         rendered = _PLAIN_DECIMAL(parsed, lit(scale))
-        ok = parsed.isNotNull() & rendered.isNotNull() & (column == rendered)
+        ok = (
+            parsed.isNotNull() & _ASCII_AMOUNT(column) & rendered.isNotNull() & (column == rendered)
+        )
         aligned = _cell_token(parsed)
         return when(column.isNull(), lit("n")).when(ok, aligned).otherwise(fallback)
     payload = _DECIMAL_PAYLOAD(trim(column), lit(precision), lit(scale))
@@ -332,51 +342,62 @@ def _parse(name: str, typed: DataType, *, lossless: bool) -> tuple[Column, Colum
     column = _column(name)
     if _is_int(typed):
         parsed = _try_name(name, "bigint")
+        # ASCII amount text, so 1_000 and non-ASCII digits are not integers.
+        text_ok = _ASCII_AMOUNT(column)
         if lossless:
             # Digits only. " 1" and "01" are not "1".
-            ok = parsed.isNotNull() & (column == parsed.cast("string"))
+            ok = parsed.isNotNull() & text_ok & (column == parsed.cast("string"))
         else:
-            ok = parsed.isNotNull()
+            ok = parsed.isNotNull() & text_ok
         return parsed, ok
     if isinstance(typed, DateType):
         parsed = _try_name(name, "date")
         canon = date_format(parsed, "yyyy-MM-dd")
         # Values may have surrounding spaces. Keys must already be canonical.
         compared = column if lossless else trim(column)
-        ok = parsed.isNotNull() & (compared == canon)
+        ok = parsed.isNotNull() & _ascii_only(column) & (compared == canon)
         return parsed, ok
     if isinstance(typed, TimestampNTZType):
         parsed = _try_name(name, "timestamp_ntz")
+        text_ok = _ascii_only(column)
         if lossless:
             canon = date_format(parsed, _TIMESTAMP_NTZ_PATTERN)
-            ok = parsed.isNotNull() & (column == canon)
+            ok = parsed.isNotNull() & text_ok & (column == canon)
         else:
-            ok = parsed.isNotNull()
+            ok = parsed.isNotNull() & text_ok
         return parsed, ok
     if isinstance(typed, TimestampType):
         parsed = _try_name(name, "timestamp")
+        text_ok = _ascii_only(column)
         if lossless:
             canon = date_format(parsed, _TIMESTAMP_PATTERN)
-            ok = parsed.isNotNull() & (column == canon)
+            ok = parsed.isNotNull() & text_ok & (column == canon)
         else:
-            ok = parsed.isNotNull()
+            ok = parsed.isNotNull() & text_ok
         return parsed, ok
     if isinstance(typed, BooleanType):
         parsed = _try_name(name, "boolean")
+        text_ok = _ascii_only(column)
         if lossless:
-            ok = parsed.isNotNull() & ((column == lit("true")) | (column == lit("false")))
+            exact = (column == lit("true")) | (column == lit("false"))
+            ok = parsed.isNotNull() & text_ok & exact
         else:
-            ok = parsed.isNotNull()
+            ok = parsed.isNotNull() & text_ok
         return parsed, ok
     if isinstance(typed, FloatType):
         parsed = _try_name(name, "float")
-        return parsed, parsed.isNotNull()
+        return parsed, parsed.isNotNull() & _ASCII_AMOUNT(column)
     if isinstance(typed, DoubleType):
         parsed = _try_name(name, "double")
-        return parsed, parsed.isNotNull()
+        return parsed, parsed.isNotNull() & _ASCII_AMOUNT(column)
     if isinstance(typed, BinaryType):
         return column, lit(False)
     return column, lit(False)
+
+
+def _ascii_only(column: Column) -> Column:
+    """True when every character is ASCII. Spark's own cast is not this strict."""
+    return column.rlike("^[\u0000-\u007f]*$")
 
 
 def _quote_ident(name: str) -> str:

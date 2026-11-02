@@ -580,9 +580,19 @@ def _key_difference_from_join(
     if changed_count and not any(column_counts):
         raise RuntimeError("row hash differs but no compared column differs")
 
-    missing_examples = _take_key_examples(joined, left, right, missing) if missing_count else []
-    extra_examples = _take_key_examples(joined, left, right, extra) if extra_count else []
-    changed_examples = _take_key_examples(joined, left, right, changed) if changed_count else []
+    missing_examples = (
+        _take_key_examples(joined, left, right, missing, left.original_names)
+        if missing_count
+        else []
+    )
+    extra_examples = (
+        _take_key_examples(joined, left, right, extra, right.original_names) if extra_count else []
+    )
+    changed_examples = (
+        _take_key_examples(joined, left, right, changed, left.original_names)
+        if changed_count
+        else []
+    )
     changed_column_rows = []
     for index, name in enumerate(columns):
         count = column_counts[index]
@@ -594,6 +604,7 @@ def _key_difference_from_join(
             right,
             column_differs[index],
             index,
+            left.original_names,
         )
         changed_column_rows.append({"column": name, "count": count, "examples": examples})
 
@@ -711,10 +722,19 @@ def _without_null_keys(frame: DataFrame, keys: list[str]) -> DataFrame:
     return frame.filter(condition)
 
 
-def _take_key_examples(frame: DataFrame, left: _Keyed, right: _Keyed, condition) -> list[list]:
+def _take_key_examples(
+    frame: DataFrame,
+    left: _Keyed,
+    right: _Keyed,
+    condition,
+    order_names: tuple[str, ...],
+) -> list[list]:
+    # Order by the original key, not the aligned token. Token text such as
+    # int:2:-6 is not numeric order. Missing and changed rows use the source
+    # key. Extra rows use the target key. Nulls come first.
     limited = (
         frame.filter(condition)
-        .orderBy(*[_column(name).asc_nulls_first() for name in left.align_names])
+        .orderBy(*[_column(name).asc_nulls_first() for name in order_names])
         .limit(KEY_DIFF_EXAMPLE_LIMIT)
     )
     rows = [_picked_key(item, left, right) for item in limited.collect()]
@@ -728,6 +748,7 @@ def _take_value_examples(
     right: _Keyed,
     condition,
     index: int,
+    order_names: tuple[str, ...],
 ) -> list[dict]:
     source_token = left.token_names[index]
     target_token = right.token_names[index]
@@ -735,7 +756,7 @@ def _take_value_examples(
     target_value = right.display_names[index]
     limited = (
         frame.filter(condition)
-        .orderBy(*[_column(name).asc_nulls_first() for name in left.align_names])
+        .orderBy(*[_column(name).asc_nulls_first() for name in order_names])
         .limit(KEY_DIFF_EXAMPLE_LIMIT)
     )
     found = []
