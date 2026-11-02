@@ -128,7 +128,7 @@ def test_match_has_an_empty_key_diff(tmp_path):
     assert _changed(report)["details"]["columns"] == []
     assert "### Key Diff" in markdown
     assert "### Changed Columns" in markdown
-    assert "Compared columns, in hash order: amount, day, note." in markdown
+    assert "Compared columns, in hash order: `amount`, `day`, `note`." in markdown
     assert "No compared column differs." in markdown
 
 
@@ -145,7 +145,7 @@ def test_missing_keys_only(tmp_path):
     assert details["changed"]["count"] == 0
     assert _changed(report)["status"] == "match"
     assert "Missing keys: 1." in markdown
-    assert "txn_id=2" in markdown
+    assert "`txn_id`=`2`" in markdown
 
 
 def test_extra_keys_only(tmp_path):
@@ -187,9 +187,9 @@ def test_changed_keys_only(tmp_path):
             "target_token": encode_value("b"),
         }
     ]
-    assert "Column note. Distinct keys that differ: 1." in markdown
-    assert "Source: a. Target: b." in markdown
-    assert f"Source token: {encode_value('a')}." in markdown
+    assert "Column `note`. Distinct keys that differ: 1." in markdown
+    assert "Source: `a`. Target: `b`." in markdown
+    assert f"Source token: `{encode_value('a')}`." in markdown
 
 
 def test_missing_extra_and_changed_together_are_byte_identical(tmp_path):
@@ -227,8 +227,8 @@ def test_composite_keys(tmp_path):
     assert details["missing"] == {"count": 1, "examples": [["1", "2"]]}
     assert details["extra"] == {"count": 1, "examples": [["1", "3"]]}
     assert details["changed"]["count"] == 0
-    assert "txn_id=1, line=2" in markdown
-    assert "txn_id=1, line=3" in markdown
+    assert "`txn_id`=`1`, `line`=`2`" in markdown
+    assert "`txn_id`=`1`, `line`=`3`" in markdown
 
 
 def test_null_compared_values_stay_distinct_from_empty_strings(spark, tmp_path):
@@ -1011,7 +1011,7 @@ def test_float_key_is_a_type_mismatch(spark, tmp_path):
     assert details["missing"]["examples"] == [[text] for text in sorted(bad, key=sort_token)]
     assert details["extra"]["count"] == 1
     assert "Type mismatches." in markdown
-    assert "measure (key)." in markdown
+    assert "`measure` (key)." in markdown
 
 
 def test_padded_date_key_stays_unmatched(spark, tmp_path):
@@ -1348,6 +1348,158 @@ def test_timestamp_value_rejects_a_leading_control_character(spark, tmp_path):
     assert column["count"] == 1
     assert column["examples"][0]["source_token"].startswith("invalid:")
     assert column["examples"][0]["target"] == "2024-01-01T00:00:00.000000Z"
+
+
+_LINE_BREAKS = ("\n", "\r", "\r\n")
+
+
+def _typed_cases():
+    return (
+        ("boolean", BooleanType(), True, "true"),
+        ("timestamp", TimestampType(), _utc(2024, 1, 1), "2024-01-01T00:00:00.000000Z"),
+        ("timestamp_ntz", TimestampNTZType(), datetime(2024, 1, 1), "2024-01-01T00:00:00.000000"),
+        ("date", DateType(), date(2024, 1, 1), "2024-01-01"),
+        ("int", LongType(), 10, "10"),
+        ("decimal", DecimalType(12, 2), Decimal("10.00"), "10.00"),
+    )
+
+
+def test_trailing_line_breaks_do_not_match_typed_values(spark, tmp_path):
+    for name, typed, good, text in _typed_cases():
+        strings = [text + suffix for suffix in _LINE_BREAKS]
+        source_schema = StructType(
+            [
+                StructField("txn_id", StringType(), True),
+                StructField("value", StringType(), True),
+            ]
+        )
+        target_schema = StructType(
+            [
+                StructField("txn_id", StringType(), True),
+                StructField("value", typed, True),
+            ]
+        )
+        source = tmp_path / name / "source"
+        target = tmp_path / name / "target"
+        _write_frame(
+            spark,
+            source,
+            [(str(index), value) for index, value in enumerate(strings, start=1)],
+            source_schema,
+        )
+        _write_frame(
+            spark,
+            target,
+            [(str(index), good) for index in range(1, len(strings) + 1)],
+            target_schema,
+        )
+        data = spec_data(tmp_path, source, target, source_format="parquet", target_format="parquet")
+        data.update(amounts=[], group_by=[], hash_columns=["value"], keys=["txn_id"])
+        spec = write_spec_file(tmp_path / name, data)
+        out = tmp_path / name / "out"
+        assert _invoke(spec, out) is ExitCode.MISMATCH, name
+        column = _changed(_load(out)[0])["details"]["columns"][0]
+        assert column["count"] == len(strings), name
+        assert all(example["source_token"].startswith("invalid:") for example in column["examples"])
+
+
+def test_trailing_line_breaks_do_not_match_typed_keys(spark, tmp_path):
+    for name, typed, good, text in _typed_cases():
+        strings = [text + suffix for suffix in _LINE_BREAKS]
+        source_schema = StructType(
+            [
+                StructField("txn_id", StringType(), True),
+                StructField("note", StringType(), True),
+            ]
+        )
+        target_schema = StructType(
+            [
+                StructField("txn_id", typed, True),
+                StructField("note", StringType(), True),
+            ]
+        )
+        source = tmp_path / name / "source"
+        target = tmp_path / name / "target"
+        _write_frame(spark, source, [(value, "a") for value in strings], source_schema)
+        _write_frame(spark, target, [(good, "a")], target_schema)
+        data = spec_data(tmp_path, source, target, source_format="parquet", target_format="parquet")
+        data.update(amounts=[], group_by=[], hash_columns=["note"], keys=["txn_id"])
+        spec = write_spec_file(tmp_path / name, data)
+        out = tmp_path / name / "out"
+        assert _invoke(spec, out) is ExitCode.MISMATCH, name
+        details = _key_diff(_load(out)[0])["details"]
+        assert details["changed"]["count"] == 0, name
+        assert details["missing"]["examples"] == [[value] for value in sorted(strings)], name
+        assert details["extra"]["count"] == 1, name
+
+
+def test_group_by_timestamps_use_utc_text(spark, tmp_path):
+    schema = StructType(
+        [
+            StructField("txn_id", StringType(), True),
+            StructField("instant", TimestampType(), True),
+            StructField("wall", TimestampNTZType(), True),
+            StructField("note", StringType(), True),
+        ]
+    )
+    row = ("1", _utc(2023, 6, 1, 12), datetime(2023, 6, 1, 12), "a")
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    _write_frame(spark, source, [row], schema)
+    _write_frame(spark, target, [row], schema)
+    data = spec_data(tmp_path, source, target, source_format="parquet", target_format="parquet")
+    data.update(amounts=[], group_by=["instant", "wall"], hash_columns=["note"], keys=["txn_id"])
+    spec = write_spec_file(tmp_path, data)
+    expected = {
+        "instant": "2023-06-01T12:00:00.000000Z",
+        "wall": "2023-06-01T12:00:00.000000",
+    }
+    reports = []
+    for zone in ("UTC", "Asia/Karachi"):
+        with _process_tz(zone):
+            out = tmp_path / zone.replace("/", "-")
+            assert _invoke(spec, out) is ExitCode.MATCH, zone
+            raw = (out / "report.json").read_bytes()
+            report = json.loads(raw)
+            group = report["checks"][0]["details"]["groups"][0]["group"]
+            assert group == expected, zone
+            assert "17:00" not in raw.decode("utf-8"), zone
+            reports.append(raw)
+    assert reports[0] == reports[1]
+
+
+def test_report_markdown_keeps_forged_text_inside_one_span(spark, tmp_path):
+    payload = "y\n\n## Result\n\nStatus: Match\n| a | b |\n"
+    key = "id`|1"
+    schema = StructType(
+        [
+            StructField("txn_id", StringType(), True),
+            StructField("note", StringType(), True),
+        ]
+    )
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    _write_frame(spark, source, [(key, payload)], schema)
+    _write_frame(spark, target, [(key, "ok")], schema)
+    data = spec_data(tmp_path, source, target, source_format="parquet", target_format="parquet")
+    data.update(amounts=[], group_by=[], hash_columns=["note"], keys=["txn_id"])
+    spec = write_spec_file(tmp_path, data)
+    out = tmp_path / "out"
+    assert _invoke(spec, out) is ExitCode.MISMATCH
+    report, _raw, markdown = _load(out)
+    example = _changed(report)["details"]["columns"][0]["examples"][0]
+    assert example["source"] == payload
+    assert example["key"] == [key]
+    lines = markdown.splitlines()
+    matched = sum(1 for check in report["checks"] if check["status"] == "match")
+    mismatched = sum(1 for check in report["checks"] if check["status"] == "mismatch")
+    assert lines.count("## Result") == 1
+    assert lines.count("Status: Match") == matched
+    assert lines.count("Status: Mismatch") == mismatched + 1
+    assert all(not line.startswith("|") for line in lines)
+    assert r"y\n\n## Result\n\nStatus: Match\n\| a \| b \|\n" in markdown
+    assert "``id`\\|1``" in markdown
+    assert all(not line.startswith("## Result") or line == "## Result" for line in lines)
 
 
 def _note_schema(amount):

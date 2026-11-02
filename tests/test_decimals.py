@@ -113,6 +113,12 @@ def test_underscore_and_non_ascii_digits_are_inexact(text):
     assert caught.value.display == text
 
 
+@pytest.mark.parametrize("text", ["1\n", "1\r", "1\r\n"])
+def test_line_breaks_are_not_amount_whitespace(text):
+    with pytest.raises(InexactAmount):
+        to_decimal(text, 2, None)
+
+
 def test_long_offending_text_is_clipped():
     text = "a" * (DISPLAY_LIMIT + 1)
     with pytest.raises(InexactAmount) as caught:

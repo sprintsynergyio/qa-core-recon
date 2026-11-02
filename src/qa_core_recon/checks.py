@@ -179,7 +179,14 @@ def _aggregate_groups(frame: DataFrame, spec: Spec, side: str) -> list[_GroupSum
     group_names = list(spec.group_by)
     amount_names = [amount.column for amount in spec.amounts]
     width = len(group_names)
-    selected = frame.select(*[_column(name) for name in (*group_names, *amount_names)])
+    # Format timestamps in Spark. A collected TimestampType is a naive local
+    # datetime, so the group text would follow the host zone.
+    types = _field_types(frame)
+    group_columns = [
+        format_example_value(_column(name), types[name]).alias(name) for name in group_names
+    ]
+    amount_columns = [_column(name) for name in amount_names]
+    selected = frame.select(*group_columns, *amount_columns)
 
     def to_pair(row):
         values = tuple(row)

@@ -423,10 +423,11 @@ def _ascii_only(column: Column) -> Column:
     """True for printable ASCII, plus the space and tab a value parse may trim.
 
     Other ASCII controls (``\\x00``-``\\x1f`` and ``\\x7f``) are rejected.
-    Spark's cast still accepts ``true\\x01`` and a timestamp with a leading
-    control character, so the check has to refuse them here.
+    ``\\z`` is the end of the text. Java's ``$`` also matches before a final
+    line break, so ``true\\n`` and a timestamp ending in ``\\r\\n`` would pass
+    and Spark's cast would trim them into a match.
     """
-    return column.rlike("^[\t\u0020-\u007e]*$")
+    return column.rlike(r"^[\t\x20-\x7e]*\z")
 
 
 def _quote_ident(name: str) -> str:

@@ -215,23 +215,23 @@ Status: Match
 
 Source rows: 2. Target rows: 2.
 
-Grouped by day.
+Grouped by `day`.
 
 Groups, in sorted order:
 
-- day=2024-01-01. Source rows: 1. Target rows: 1. Match.
-- day=2024-01-02. Source rows: 1. Target rows: 1. Match.
+- `day`=`2024-01-01`. Source rows: 1. Target rows: 1. Match.
+- `day`=`2024-01-02`. Source rows: 1. Target rows: 1. Match.
 
 ### Amount Sum
 
 Status: Match
 
-Column amount, scale 2. Source sum: 11.75. Target sum: 11.75. Difference: 0.00. Tolerance: 0. Match.
+Column `amount`, scale 2. Source sum: 11.75. Target sum: 11.75. Difference: 0.00. Tolerance: 0. Match.
 
 Groups, in sorted order:
 
-- day=2024-01-01. Source sum: 10.50. Target sum: 10.50. Difference: 0.00. Match.
-- day=2024-01-02. Source sum: 1.25. Target sum: 1.25. Difference: 0.00. Match.
+- `day`=`2024-01-01`. Source sum: 10.50. Target sum: 10.50. Difference: 0.00. Match.
+- `day`=`2024-01-02`. Source sum: 1.25. Target sum: 1.25. Difference: 0.00. Match.
 
 ### Null Keys
 
@@ -254,7 +254,7 @@ Target duplicate keys: 0.
 
 Status: Match
 
-Compared columns, in hash order: amount, day, note.
+Compared columns, in hash order: `amount`, `day`, `note`.
 
 Rows with a null in any key column are excluded.
 Counts are by distinct key value.

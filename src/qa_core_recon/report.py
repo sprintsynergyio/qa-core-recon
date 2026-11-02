@@ -51,7 +51,8 @@ def spec_sha256(path: Path) -> str:
 
 
 # publish writes ``.report.json.<pid>.tmp`` and ``.report.md.<pid>.tmp``.
-_REPORT_TEMP = re.compile(r"^\.report\.(json|md)\.\d+\.tmp$")
+# ``\Z`` is the end of the name. ``$`` also matches before a trailing newline.
+_REPORT_TEMP = re.compile(r"^\.report\.(json|md)\.\d+\.tmp\Z")
 
 
 def _is_report_temp(name: str) -> bool:
@@ -178,7 +179,7 @@ def render_markdown(report: dict) -> str:
             ]
         )
         for refusal in report["refusals"]:
-            lines.append(f"- {refusal['code']}: {refusal['message']}")
+            lines.append(f"- {refusal['code']}: {_md(refusal['message'])}")
         lines.extend(
             [
                 "",
@@ -328,7 +329,7 @@ def _row_count_lines(details: dict) -> list[str]:
     ]
     if not details["group_by"]:
         return lines
-    names = ", ".join(details["group_by"])
+    names = ", ".join(_md(name) for name in details["group_by"])
     lines.extend([f"Grouped by {names}.", ""])
     if not details["groups"]:
         lines.extend(["No groups were present on either side.", ""])
@@ -353,7 +354,7 @@ def _amount_lines(details: dict) -> list[str]:
         return lines
     for column in details["columns"]:
         parts = [
-            f"Column {column['column']}, scale {column['scale']}.",
+            f"Column {_md(column['column'])}, scale {column['scale']}.",
             f"Source sum: {_shown(column['source'])}.",
             f"Target sum: {_shown(column['target'])}.",
             f"Difference: {_shown(column['difference'])}.",
@@ -361,7 +362,7 @@ def _amount_lines(details: dict) -> list[str]:
         ]
         reason = column["reason"].strip()
         if reason:
-            parts.append(f"Reason: {reason}.")
+            parts.append(f"Reason: {_md(reason)}.")
         parts.append(f"{_STATUS_LABELS[column['status']]}.")
         lines.extend([" ".join(parts), ""])
         if not column["groups"]:
@@ -406,7 +407,8 @@ def _key_diff_lines(details: dict) -> list[str]:
     lines: list[str] = []
     columns = details["columns"]
     if columns:
-        lines.append("Compared columns, in hash order: " + ", ".join(columns) + ".")
+        shown = ", ".join(_md(name) for name in columns)
+        lines.append(f"Compared columns, in hash order: {shown}.")
     else:
         lines.append(details["changed_detection"])
     lines.append("")
@@ -416,7 +418,7 @@ def _key_diff_lines(details: dict) -> list[str]:
         lines.append("")
         for item in mismatches:
             lines.append(
-                f"- {item['column']} ({item['role']}). "
+                f"- {_md(item['column'])} ({item['role']}). "
                 f"Source type: {item['source_type']}. Target type: {item['target_type']}."
             )
         lines.append("")
@@ -461,7 +463,7 @@ def _changed_column_lines(details: dict) -> list[str]:
     for column in columns:
         count = column["count"]
         examples = column["examples"]
-        lines.append(f"Column {column['column']}. Distinct keys that differ: {count}.")
+        lines.append(f"Column {_md(column['column'])}. Distinct keys that differ: {count}.")
         if count > len(examples):
             lines.append(f"The first {len(examples)} of {count} are listed in sorted order.")
         lines.append("")
@@ -470,8 +472,8 @@ def _changed_column_lines(details: dict) -> list[str]:
             lines.append(
                 f"- {key}. Source: {_cell(example['source'])}. "
                 f"Target: {_cell(example['target'])}. "
-                f"Source token: {example['source_token']}. "
-                f"Target token: {example['target_token']}."
+                f"Source token: {_md(example['source_token'])}. "
+                f"Target token: {_md(example['target_token'])}."
             )
         if examples:
             lines.append("")
@@ -489,23 +491,64 @@ def _missing_sentence(missing: str | None) -> str:
 def _group_label(group: dict) -> str:
     parts = []
     for name, value in group.items():
-        shown = "null" if value is None else str(value)
-        parts.append(f"{name}={shown}")
+        shown = "null" if value is None else _md(value)
+        parts.append(f"{_md(name)}={shown}")
     return ", ".join(parts)
 
 
 def _example_label(keys: list[str], example: list) -> str:
     parts = []
     for name, value in zip(keys, example, strict=True):
-        shown = "null" if value is None else str(value)
-        parts.append(f"{name}={shown}")
+        shown = "null" if value is None else _md(value)
+        parts.append(f"{_md(name)}={shown}")
     return ", ".join(parts)
 
 
 def _cell(value: object) -> str:
     if value is None:
         return "null"
-    return str(value)
+    return _md(value)
+
+
+def _md(value: object) -> str:
+    """Return one markdown code span for text that came from the datasets.
+
+    The fence is longer than any run of backticks in the text. Line breaks,
+    tabs, other controls, and ``|`` are written as visible escapes, so the
+    span stays inside one line and one table cell.
+    """
+    visible = _visible(str(value))
+    longest = 0
+    run = 0
+    for char in visible:
+        if char == "`":
+            run += 1
+            longest = max(longest, run)
+        else:
+            run = 0
+    fence = "`" * (longest + 1)
+    if visible.startswith("`") or visible.endswith("`"):
+        visible = f" {visible} "
+    return f"{fence}{visible}{fence}"
+
+
+def _visible(text: str) -> str:
+    parts = []
+    for char in text:
+        code = ord(char)
+        if char == "\n":
+            parts.append("\\n")
+        elif char == "\r":
+            parts.append("\\r")
+        elif char == "\t":
+            parts.append("\\t")
+        elif char == "|":
+            parts.append("\\|")
+        elif code < 32 or code == 127:
+            parts.append(f"\\x{code:02x}")
+        else:
+            parts.append(char)
+    return "".join(parts)
 
 
 def _shown(value: object) -> str:
