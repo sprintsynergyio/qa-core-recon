@@ -168,16 +168,38 @@ def value_token(plan: FieldPlan, side: str) -> Column:
     return _direct_token(column, dtype)
 
 
+def example_key(plan: FieldPlan, side: str) -> Column:
+    """Return the key text stored in an example.
+
+    ``TimestampType`` is formatted in Spark under the UTC session, so the
+    driver never turns it into a naive local datetime. ``TimestampNTZType``
+    keeps the stored wall time and the microseconds, with no trailing ``Z``.
+    """
+    return format_example_value(_column(plan.name), _dtype(plan, side))
+
+
+def format_example_value(column: Column, dtype: DataType) -> Column:
+    """Format a timestamp for an example. Other types stay as they are."""
+    if isinstance(dtype, TimestampNTZType):
+        return date_format(column, _TIMESTAMP_NTZ_PATTERN)
+    if isinstance(dtype, TimestampType):
+        return date_format(column, _TIMESTAMP_PATTERN)
+    return column
+
+
 def value_display(plan: FieldPlan, side: str) -> Column:
     """Return the value shown in an example.
 
     Timestamps are the UTC text, so the driver never converts them in the
-    machine time zone. Other direct values keep their Spark type for
-    :func:`qa_core_recon.compare.render_value`.
+    machine time zone. ``TimestampNTZType`` keeps the stored wall time and
+    does not gain a trailing ``Z``. Other direct values keep their Spark type
+    for :func:`qa_core_recon.compare.render_value`.
     """
     dtype = _dtype(plan, side)
     column = _column(plan.name)
-    if _is_timestamp(dtype):
+    if isinstance(dtype, TimestampNTZType):
+        return date_format(column, _TIMESTAMP_NTZ_PATTERN)
+    if isinstance(dtype, TimestampType):
         return date_format(column, _TIMESTAMP_PATTERN)
     if plan.kind == "render":
         return when(column.isNull(), lit(None).cast("string")).otherwise(column.cast("string"))
@@ -325,7 +347,9 @@ def _parsed_display(name: str, typed: DataType) -> Column:
             .otherwise(payload)
         )
     parsed, ok = _parse(name, typed, lossless=False)
-    if _is_timestamp(typed):
+    if isinstance(typed, TimestampNTZType):
+        shown = date_format(parsed, _TIMESTAMP_NTZ_PATTERN)
+    elif isinstance(typed, TimestampType):
         shown = date_format(parsed, _TIMESTAMP_PATTERN)
     elif isinstance(typed, DateType):
         shown = date_format(parsed, "yyyy-MM-dd")
@@ -396,8 +420,13 @@ def _parse(name: str, typed: DataType, *, lossless: bool) -> tuple[Column, Colum
 
 
 def _ascii_only(column: Column) -> Column:
-    """True when every character is ASCII. Spark's own cast is not this strict."""
-    return column.rlike("^[\u0000-\u007f]*$")
+    """True for printable ASCII, plus the space and tab a value parse may trim.
+
+    Other ASCII controls (``\\x00``-``\\x1f`` and ``\\x7f``) are rejected.
+    Spark's cast still accepts ``true\\x01`` and a timestamp with a leading
+    control character, so the check has to refuse them here.
+    """
+    return column.rlike("^[\t\u0020-\u007e]*$")
 
 
 def _quote_ident(name: str) -> str:

@@ -143,7 +143,7 @@ A date is `YYYY-MM-DD`. A `TimestampType` value is formatted in Spark with `date
 
 The row hash is not a separate pass or fail check. `key_diff` and `changed_columns` use it.
 
-**Key Diff.** A full outer join on the key columns. The join runs in Spark. Only the three counts, the per-column counts, and at most 20 example keys come back to the driver. `KEY_DIFF_EXAMPLE_LIMIT` is 20, the same cap as `DUPLICATE_EXAMPLE_LIMIT`. Examples are sorted with nulls first. The count is the full number, so it can be higher than 20.
+**Key Diff.** A full outer join on the key columns. The join runs in Spark. Only the three counts, the per-column counts, and at most 20 example keys come back to the driver. `KEY_DIFF_EXAMPLE_LIMIT` is 20, the same cap as `DUPLICATE_EXAMPLE_LIMIT`. Missing and changed rows are ordered by the source key values. Extra rows are ordered by the target key values. Nulls come first. A timestamp key is ordered by the timestamp itself, and the example text is the UTC form from the table above, formatted in Spark. A timestamp without a time zone keeps its wall-time text, including the microseconds. The count is the full number, so it can be higher than 20.
 
 Three counts are reported. Any count above zero is a mismatch.
 
@@ -171,7 +171,7 @@ Other types that cannot be aligned are also compared as strings and listed under
 
 Counts are by distinct key value, not by physical row. When several rows share a key, the row with the smallest row hash is the one that is compared. Two identical copies of one row therefore do not make the key changed. A second copy whose hash is larger is not the row that is compared. The duplicate-key check still reports the duplicate. The report states this rule on every run, and it says when duplicate keys were found.
 
-**Changed Columns.** For the changed keys, each compared column has a count of how many distinct keys differ in that column, and up to 20 examples. An example has the key, the source token, and the target token, using the row-hash encoding above. Columns are sorted by name. Only columns with a count above zero are listed. A count above zero is a mismatch. The example is the row with the smallest row hash, the same row the key diff compared.
+**Changed Columns.** For the changed keys, each compared column has a count of how many distinct keys differ in that column, and up to 20 examples. An example has the key, the source token, and the target token, using the row-hash encoding above. Columns are sorted by name. Only columns with a count above zero are listed. A count above zero is a mismatch. Examples are the first 20 in sorted order. When several rows share a key, the compared row is the one with the smallest row hash. That choice is among the duplicate rows. It is not the order of the examples.
 
 ### Report Files
 
@@ -274,7 +274,7 @@ Status: Match
 
 Example limit: 20.
 
-Each count is the number of distinct keys whose value differs. The example is the row with the smallest row hash.
+Each count is the number of distinct keys whose value differs. Examples are listed in sorted order. When a key is duplicated, the compared row is the one with the smallest row hash.
 
 No compared column differs.
 ```

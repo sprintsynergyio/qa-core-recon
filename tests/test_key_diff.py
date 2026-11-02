@@ -4,6 +4,8 @@ import json
 import os
 import subprocess
 import sys
+import time
+from contextlib import contextmanager
 from datetime import UTC, date, datetime
 from decimal import Decimal
 
@@ -37,8 +39,30 @@ from tests.test_run import (
 ROW = "1,10.50,2024-01-01,a\n"
 
 
-def _utc(year, month, day, hour=0, minute=0, second=0):
-    return datetime(year, month, day, hour, minute, second, tzinfo=UTC)
+def _utc(year, month, day, hour=0, minute=0, second=0, microsecond=0):
+    return datetime(year, month, day, hour, minute, second, microsecond, tzinfo=UTC)
+
+
+@contextmanager
+def _process_tz(name):
+    previous = os.environ.get("TZ")
+    os.environ["TZ"] = name
+    time.tzset()
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = previous
+        time.tzset()
+
+
+def _example_text(value, *, zoned):
+    text = value.strftime("%Y-%m-%dT%H:%M:%S.%f")
+    if zoned:
+        return text + "Z"
+    return text
 
 
 def _csv_run(tmp_path, source_body, target_body, header=HEADER, **changes):
@@ -1112,6 +1136,218 @@ def test_int_key_examples_are_the_first_by_value(spark, tmp_path):
     column = _changed(report)["details"]["columns"][0]
     assert column["count"] == len(keys)
     assert [example["key"] for example in column["examples"]] == expected
+
+
+def test_changed_string_keys_follow_source_values_not_tokens(spark, tmp_path):
+    keys = [str(number) for number in range(-30, 10)]
+    expected = [[key] for key in sorted(keys)[:KEY_DIFF_EXAMPLE_LIMIT]]
+    token_page = sorted(keys, key=lambda key: encode_value(int(key)))[:KEY_DIFF_EXAMPLE_LIMIT]
+    token_page.sort()
+    assert expected != [[key] for key in token_page]
+    assert expected != [[str(number)] for number in range(-30, -10)]
+    assert expected != [[key] for key in reversed(keys)][:KEY_DIFF_EXAMPLE_LIMIT]
+    source_schema = StructType(
+        [
+            StructField("txn_id", StringType(), True),
+            StructField("note", StringType(), True),
+        ]
+    )
+    target_schema = StructType(
+        [
+            StructField("txn_id", LongType(), True),
+            StructField("note", StringType(), True),
+        ]
+    )
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    _write_frame(spark, source, [(key, "a") for key in reversed(keys)], source_schema)
+    _write_frame(spark, target, [(int(key), "b") for key in reversed(keys)], target_schema)
+    data = spec_data(tmp_path, source, target, source_format="parquet", target_format="parquet")
+    data.update(amounts=[], group_by=[], hash_columns=["note"], keys=["txn_id"])
+    spec = write_spec_file(tmp_path, data)
+    out = tmp_path / "out"
+    assert _invoke(spec, out) is ExitCode.MISMATCH
+    report = _load(out)[0]
+    changed = _key_diff(report)["details"]["changed"]
+    assert changed["count"] == len(keys)
+    assert changed["examples"] == expected
+    column = _changed(report)["details"]["columns"][0]
+    assert column["count"] == len(keys)
+    assert [example["key"] for example in column["examples"]] == expected
+
+
+def test_extra_examples_follow_target_values_not_the_source_side(spark, tmp_path):
+    source_keys = [str(number) for number in range(30)]
+    target_keys = list(range(-30, 0))
+    expected_missing = [[key] for key in sorted(source_keys)[:KEY_DIFF_EXAMPLE_LIMIT]]
+    token_page = sorted(source_keys, key=encode_value)[:KEY_DIFF_EXAMPLE_LIMIT]
+    token_page.sort()
+    assert expected_missing != [[key] for key in token_page]
+    expected_extra = [[key] for key in target_keys[:KEY_DIFF_EXAMPLE_LIMIT]]
+    token_longs = sorted(target_keys, key=encode_value)[:KEY_DIFF_EXAMPLE_LIMIT]
+    token_longs.sort()
+    assert expected_extra != [[key] for key in token_longs]
+    source_schema = StructType(
+        [
+            StructField("txn_id", StringType(), True),
+            StructField("note", StringType(), True),
+        ]
+    )
+    target_schema = StructType(
+        [
+            StructField("txn_id", LongType(), True),
+            StructField("note", StringType(), True),
+        ]
+    )
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    _write_frame(spark, source, [(key, "a") for key in reversed(source_keys)], source_schema)
+    _write_frame(spark, target, [(key, "a") for key in reversed(target_keys)], target_schema)
+    data = spec_data(tmp_path, source, target, source_format="parquet", target_format="parquet")
+    data.update(amounts=[], group_by=[], hash_columns=["note"], keys=["txn_id"])
+    spec = write_spec_file(tmp_path, data)
+    out = tmp_path / "out"
+    assert _invoke(spec, out) is ExitCode.MISMATCH
+    details = _key_diff(_load(out)[0])["details"]
+    assert details["missing"]["count"] == len(source_keys)
+    assert details["missing"]["examples"] == expected_missing
+    assert details["extra"]["count"] == len(target_keys)
+    assert details["extra"]["examples"] == expected_extra
+    assert details["changed"]["count"] == 0
+
+
+def test_timestamp_key_examples_use_utc_text_in_every_zone(spark, tmp_path):
+    missing = (_utc(2023, 6, 1, 12), _utc(2023, 6, 1, 18))
+    extra = (_utc(2023, 6, 2), _utc(2023, 12, 1, microsecond=42))
+    changed = _utc(2023, 7, 15, 8, 30)
+    schema = StructType(
+        [
+            StructField("txn_id", TimestampType(), True),
+            StructField("note", StringType(), True),
+        ]
+    )
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    _write_frame(
+        spark,
+        source,
+        [(changed, "a"), (missing[1], "a"), (missing[0], "a")],
+        schema,
+    )
+    _write_frame(
+        spark,
+        target,
+        [(changed, "b"), (extra[1], "a"), (extra[0], "a")],
+        schema,
+    )
+    data = spec_data(tmp_path, source, target, source_format="parquet", target_format="parquet")
+    data.update(amounts=[], group_by=[], hash_columns=["note"], keys=["txn_id"])
+    spec = write_spec_file(tmp_path, data)
+    missing_text = [[_example_text(value, zoned=True)] for value in missing]
+    extra_text = [[_example_text(value, zoned=True)] for value in extra]
+    changed_text = [[_example_text(changed, zoned=True)]]
+    for zone in ("UTC", "Asia/Karachi"):
+        with _process_tz(zone):
+            out = tmp_path / zone.replace("/", "-")
+            assert _invoke(spec, out) is ExitCode.MISMATCH, zone
+            report = _load(out)[0]
+            details = _key_diff(report)["details"]
+            assert details["missing"]["examples"] == missing_text, zone
+            assert details["extra"]["examples"] == extra_text, zone
+            assert details["changed"]["examples"] == changed_text, zone
+            column = _changed(report)["details"]["columns"][0]
+            assert [example["key"] for example in column["examples"]] == changed_text, zone
+            assert "17:00" not in json.dumps(report), zone
+
+
+def test_timestamp_ntz_key_examples_keep_wall_time_and_microseconds(spark, tmp_path):
+    missing = (datetime(2023, 6, 1, 12), datetime(2023, 6, 1, 18))
+    extra = (datetime(2023, 6, 2), datetime(2023, 12, 1, microsecond=42))
+    changed = datetime(2023, 7, 15, 8, 30)
+    schema = StructType(
+        [
+            StructField("txn_id", TimestampNTZType(), True),
+            StructField("note", StringType(), True),
+        ]
+    )
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    _write_frame(
+        spark,
+        source,
+        [(changed, "a"), (missing[1], "a"), (missing[0], "a")],
+        schema,
+    )
+    _write_frame(
+        spark,
+        target,
+        [(changed, "b"), (extra[1], "a"), (extra[0], "a")],
+        schema,
+    )
+    data = spec_data(tmp_path, source, target, source_format="parquet", target_format="parquet")
+    data.update(amounts=[], group_by=[], hash_columns=["note"], keys=["txn_id"])
+    spec = write_spec_file(tmp_path, data)
+    missing_text = [[_example_text(value, zoned=False)] for value in missing]
+    extra_text = [[_example_text(value, zoned=False)] for value in extra]
+    changed_text = [[_example_text(changed, zoned=False)]]
+    for zone in ("UTC", "Asia/Karachi"):
+        with _process_tz(zone):
+            out = tmp_path / zone.replace("/", "-")
+            assert _invoke(spec, out) is ExitCode.MISMATCH, zone
+            report = _load(out)[0]
+            details = _key_diff(report)["details"]
+            assert details["missing"]["examples"] == missing_text, zone
+            assert details["extra"]["examples"] == extra_text, zone
+            assert details["changed"]["examples"] == changed_text, zone
+            column = _changed(report)["details"]["columns"][0]
+            assert [example["key"] for example in column["examples"]] == changed_text, zone
+            assert all("Z" not in example[0] for example in details["extra"]["examples"])
+            assert "17:00" not in json.dumps(report), zone
+
+
+def test_boolean_value_rejects_a_trailing_control_character(spark, tmp_path):
+    source = tmp_path / "source.csv"
+    write_csv(source, "1,true\x01\n", "txn_id,flag\n")
+    schema = StructType(
+        [
+            StructField("txn_id", StringType(), True),
+            StructField("flag", BooleanType(), True),
+        ]
+    )
+    target = tmp_path / "target"
+    _write_frame(spark, target, [("1", True)], schema)
+    data = spec_data(tmp_path, source, target, source_format="csv", target_format="parquet")
+    data.update(amounts=[], group_by=[], hash_columns=["flag"], keys=["txn_id"])
+    spec = write_spec_file(tmp_path, data)
+    out = tmp_path / "out"
+    assert _invoke(spec, out) is ExitCode.MISMATCH
+    column = _changed(_load(out)[0])["details"]["columns"][0]
+    assert column["column"] == "flag"
+    assert column["count"] == 1
+    assert column["examples"][0]["source_token"].startswith("invalid:")
+
+
+def test_timestamp_value_rejects_a_leading_control_character(spark, tmp_path):
+    source = tmp_path / "source.csv"
+    write_csv(source, "1,\x012024-01-01T00:00:00.000000Z\n", "txn_id,instant\n")
+    schema = StructType(
+        [
+            StructField("txn_id", StringType(), True),
+            StructField("instant", TimestampType(), True),
+        ]
+    )
+    target = tmp_path / "target"
+    _write_frame(spark, target, [("1", _utc(2024, 1, 1))], schema)
+    data = spec_data(tmp_path, source, target, source_format="csv", target_format="parquet")
+    data.update(amounts=[], group_by=[], hash_columns=["instant"], keys=["txn_id"])
+    spec = write_spec_file(tmp_path, data)
+    out = tmp_path / "out"
+    assert _invoke(spec, out) is ExitCode.MISMATCH
+    column = _changed(_load(out)[0])["details"]["columns"][0]
+    assert column["column"] == "instant"
+    assert column["count"] == 1
+    assert column["examples"][0]["source_token"].startswith("invalid:")
+    assert column["examples"][0]["target"] == "2024-01-01T00:00:00.000000Z"
 
 
 def _note_schema(amount):

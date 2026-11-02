@@ -52,6 +52,8 @@ from pyspark.sql.functions import min as spark_min
 from pyspark.sql.functions import sum as spark_sum
 
 from qa_core_recon.alignment import (
+    example_key,
+    format_example_value,
     join_key,
     plan_fields,
     type_mismatches,
@@ -92,7 +94,8 @@ _DISTINCT_RULE = "Counts are by distinct key value."
 _DUPLICATE_RULE = "When a key is duplicated, the row with the smallest row hash is used."
 _CHANGED_COLUMN_RULE = (
     "Each count is the number of distinct keys whose value differs. "
-    "The example is the row with the smallest row hash."
+    "Examples are listed in sorted order. "
+    "When a key is duplicated, the compared row is the one with the smallest row hash."
 )
 _CHANGED_UNAVAILABLE = "Changed rows cannot be detected because no compared columns were declared."
 
@@ -309,16 +312,25 @@ def _null_key_count(frame: DataFrame, spec: Spec) -> int:
 
 def _duplicate_keys(frame: DataFrame, spec: Spec) -> tuple[int, list[list]]:
     keys = list(spec.keys)
+    types = _field_types(frame)
     alias = "__qa_row_count"
     while alias in keys:
         alias += "_"
     grouped = frame.groupBy(*[_column(name) for name in keys]).agg(spark_count(lit(1)).alias(alias))
     duplicates = grouped.filter(col(f"`{alias}`") > 1)
     found = duplicates.count()
+    # Order by the stored key. A timestamp is ordered as a timestamp, then
+    # rendered in Spark so the driver does not apply the host zone.
     ordered = duplicates.orderBy(*[_column(name).asc_nulls_first() for name in keys]).limit(
         DUPLICATE_EXAMPLE_LIMIT
     )
-    examples = [tuple(row[index] for index in range(len(keys))) for row in ordered.collect()]
+    rendered_columns = [
+        format_example_value(_column(name), types[name]).alias(name) for name in keys
+    ]
+    examples = [
+        tuple(row[index] for index in range(len(keys)))
+        for row in ordered.select(*rendered_columns).collect()
+    ]
     examples.sort(key=lambda item: tuple(sort_token(value) for value in item))
     rendered = [[render_value(value) for value in item] for item in examples]
     return found, rendered
@@ -500,6 +512,7 @@ class _Keyed:
     token_names: tuple[str, ...]
     display_names: tuple[str, ...]
     original_names: tuple[str, ...]
+    order_names: tuple[str, ...]
 
 
 def _key_difference(
@@ -581,17 +594,13 @@ def _key_difference_from_join(
         raise RuntimeError("row hash differs but no compared column differs")
 
     missing_examples = (
-        _take_key_examples(joined, left, right, missing, left.original_names)
-        if missing_count
-        else []
+        _take_key_examples(joined, left, right, missing, left.order_names) if missing_count else []
     )
     extra_examples = (
-        _take_key_examples(joined, left, right, extra, right.original_names) if extra_count else []
+        _take_key_examples(joined, left, right, extra, right.order_names) if extra_count else []
     )
     changed_examples = (
-        _take_key_examples(joined, left, right, changed, left.original_names)
-        if changed_count
-        else []
+        _take_key_examples(joined, left, right, changed, left.order_names) if changed_count else []
     )
     changed_column_rows = []
     for index, name in enumerate(columns):
@@ -604,7 +613,7 @@ def _key_difference_from_join(
             right,
             column_differs[index],
             index,
-            left.original_names,
+            left.order_names,
         )
         changed_column_rows.append({"column": name, "count": count, "examples": examples})
 
@@ -654,6 +663,9 @@ def _keyed_side(
     original_names = tuple(
         _private(taken, f"__qa_{prefix}_k{index}") for index in range(len(key_plans))
     )
+    order_names = tuple(
+        _private(taken, f"__qa_{prefix}_o{index}") for index in range(len(key_plans))
+    )
     token_names = tuple(
         _private(taken, f"__qa_{prefix}_t{index}") for index in range(len(column_plans))
     )
@@ -663,7 +675,10 @@ def _keyed_side(
     selected = []
     for index, plan in enumerate(key_plans):
         selected.append(join_key(plan, side).alias(align_names[index]))
-        selected.append(_column(plan.name).alias(original_names[index]))
+        # Example text is formatted in Spark. The order column stays the
+        # original value, so a timestamp sorts as a timestamp.
+        selected.append(example_key(plan, side).alias(original_names[index]))
+        selected.append(_column(plan.name).alias(order_names[index]))
     for index, plan in enumerate(column_plans):
         selected.append(value_token(plan, side).alias(token_names[index]))
         selected.append(value_display(plan, side).alias(display_names[index]))
@@ -676,6 +691,8 @@ def _keyed_side(
         fields.append(_column(display_names[index]).alias(f"d{index}"))
     for index, original_name in enumerate(original_names):
         fields.append(_column(original_name).alias(f"k{index}"))
+    for index, order_name in enumerate(order_names):
+        fields.append(_column(order_name).alias(f"o{index}"))
     output_taken = set(align_names)
     rep = _private(output_taken, "__qa_rep")
     hash_name = _private(output_taken, f"__qa_{prefix}_hash")
@@ -688,6 +705,9 @@ def _keyed_side(
     out_originals = tuple(
         _private(output_taken, f"__qa_{prefix}_key{index}") for index in range(len(original_names))
     )
+    out_orders = tuple(
+        _private(output_taken, f"__qa_{prefix}_ord{index}") for index in range(len(order_names))
+    )
     grouped = projected.groupBy(*[_column(name) for name in align_names]).agg(
         spark_min(struct(*fields)).alias(rep)
     )
@@ -699,6 +719,8 @@ def _keyed_side(
         chosen.append(_column(rep).getField(f"d{index}").alias(name))
     for index, name in enumerate(out_originals):
         chosen.append(_column(rep).getField(f"k{index}").alias(name))
+    for index, name in enumerate(out_orders):
+        chosen.append(_column(rep).getField(f"o{index}").alias(name))
     return _Keyed(
         frame=grouped.select(*chosen),
         hash_name=hash_name,
@@ -706,6 +728,7 @@ def _keyed_side(
         token_names=out_tokens,
         display_names=out_displays,
         original_names=out_originals,
+        order_names=out_orders,
     )
 
 
@@ -731,7 +754,9 @@ def _take_key_examples(
 ) -> list[list]:
     # Order by the original key, not the aligned token. Token text such as
     # int:2:-6 is not numeric order. Missing and changed rows use the source
-    # key. Extra rows use the target key. Nulls come first.
+    # key. Extra rows use the target key. A timestamp column is still a
+    # timestamp here, so the order is the instant, not host-local text.
+    # Nulls come first.
     limited = (
         frame.filter(condition)
         .orderBy(*[_column(name).asc_nulls_first() for name in order_names])
