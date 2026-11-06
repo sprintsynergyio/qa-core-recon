@@ -437,6 +437,16 @@ def test_missing_and_unreadable_files_are_read_errors(spark, tmp_path):
     assert str(caught.value) == "cannot read target as parquet"
 
 
+def test_symlink_loop_is_a_read_error(spark, tmp_path):
+    target = tmp_path / "target.csv"
+    write_csv(target, ROW)
+    loop = tmp_path / "loop"
+    loop.symlink_to(loop)
+    with pytest.raises(ReadError) as caught:
+        check_data(spark, _spec(tmp_path, loop, target, target_format="csv"))
+    assert str(caught.value) == f"cannot read source path '{loop}': Symlink loop from '{loop}'"
+
+
 def test_read_does_not_modify_the_source_file(spark, tmp_path):
     source, target = _pair(tmp_path)
     before = source.read_bytes()

@@ -455,10 +455,14 @@ def _exception_text(exc: BaseException) -> str:
 def _require_local(path: str, side: str) -> Path:
     location = Path(path)
     try:
+        # resolve() raises RuntimeError ("Symlink loop from ...") when the
+        # path is a symlink cycle. exists() returns False for that path and
+        # would otherwise report it as missing.
+        location.resolve(strict=False)
         exists = location.exists()
         kind = "file" if location.is_file() else "dir" if location.is_dir() else "other"
-    except OSError as exc:
-        detail = exc.strerror or exc.__class__.__name__
+    except (OSError, RuntimeError) as exc:
+        detail = getattr(exc, "strerror", None) or str(exc) or exc.__class__.__name__
         raise ReadError(f"cannot read {side} path {path!r}: {detail}") from None
     if not exists:
         raise ReadError(f"{side} path not found: {path}")

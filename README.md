@@ -2,7 +2,7 @@
 
 Prove that a target dataset matches its source after a Glue or PySpark job, using deterministic checks. No AI model decides pass or fail.
 
-**Status: aggregate checks, S3 reads, and a synthetic demo.** `--version`, `init`, `validate`, and `run` work. `validate --check-data` and `run` open CSV, Parquet, and Iceberg on local disk and on S3. `run` compares row counts, amount sums, null keys, and duplicate keys, and writes `report.json` and `report.md`. Key diff, row hashes, and changed-column diff are not in this release. The made-up demo dataset is under `examples/demo`.
+**Status: key diff, S3 reads, and a synthetic demo.** `--version`, `init`, `validate`, and `run` work. `validate --check-data` and `run` open CSV, Parquet, and Iceberg on local disk and on S3. `run` compares row counts, amount sums, null keys, duplicate keys, the key diff, and changed columns, and writes `report.json` and `report.md`. The made-up demo dataset is under `examples/demo`.
 
 ## Quick Start
 
@@ -36,10 +36,10 @@ The command prints `match` and exits 0. `report.json` and `report.md` are in `/t
 
 These specs exit 1:
 
-- `examples/demo/specs/missing-rows.yaml` drops every target row dated 2024-03-01. The row count and the amount sum both differ.
-- `examples/demo/specs/extra-rows.yaml` adds three target rows on 2024-03-06. The row count and the amount sum both differ.
-- `examples/demo/specs/changed-rows.yaml` keeps every `txn_id` and changes the amount and `txn_type` on five rows. The row count matches. The amount sum differs.
-- `examples/demo/specs/sum-mismatch.yaml` adds 0.50 to every target amount. The row count matches. The amount sum differs.
+- `examples/demo/specs/missing-rows.yaml` drops every target row dated 2024-03-01. The row count, the amount sum, and the key diff all differ. The report lists the missing `txn_id` values.
+- `examples/demo/specs/extra-rows.yaml` adds three target rows on 2024-03-06. The row count, the amount sum, and the key diff all differ. The report lists the extra `txn_id` values.
+- `examples/demo/specs/changed-rows.yaml` keeps every `txn_id` and changes the amount and `txn_type` on five rows. The row count matches. The amount sum, the key diff, and the changed-column check differ. The report lists those five `txn_id` values.
+- `examples/demo/specs/sum-mismatch.yaml` adds 0.50 to every target amount. The row count matches. The amount sum, the key diff, and the changed-column check differ. Every `txn_id` is listed as changed.
 
 `examples/demo/specs/iceberg.yaml` compares the matching CSV with an Iceberg table of the same rows. `examples/demo/specs/s3.yaml` reads that same pair from `s3://demo-bucket`. The tests build the Iceberg table and upload the CSV files to moto. The commands above use the local match spec.
 
@@ -49,16 +49,14 @@ These specs exit 1:
 cat /tmp/qa-core-recon-match/report.md
 ```
 
-`report.json` is the same result as canonical JSON: sorted keys, indent 2, and one trailing newline. Headings in `report.md` are Title Case. The files have no timestamp. `spec_sha256` is the SHA-256 of the spec file you passed.
-
-TODO(key-diff): the key diff and row hashes PR will list the missing, extra, and changed `txn_id` values in this report. Until that PR is merged, those cases show up through the row count and the amount sum.
+`report.json` is the same result as canonical JSON: sorted keys, indent 2, and one trailing newline. Headings in `report.md` are Title Case. The files have no timestamp. `spec_sha256` is the SHA-256 of the spec file you passed. Difference cases list the missing, extra, and changed `txn_id` values under the key diff and the changed-column check.
 
 ## Install From Source
 
 Requires Python 3.11 and Java 17. Java 17 is the runtime AWS Glue 5.0 uses with Spark 3.5.
 
 ```bash
-git clone https://github.com/sprintsynergyhq/qa-core-recon.git
+git clone https://github.com/sprintsynergyio/qa-core-recon.git
 cd qa-core-recon
 python3.11 -m venv .venv
 source .venv/bin/activate
@@ -103,7 +101,7 @@ Also open both datasets and run the data-level refusals:
 qa-core-recon validate --spec recon.yaml --check-data
 ```
 
-When those checks pass, the command prints `data ok` and exits with code 0. It does not compare the two datasets, so different amounts on the two sides still print `data ok`. `run` compares counts and sums and writes a report. Key diff, row hashes, and changed-column diff arrive in a later PR.
+When those checks pass, the command prints `data ok` and exits with code 0. It does not compare the two datasets, so different amounts on the two sides still print `data ok`. `run` compares counts, sums, and keys and writes a report.
 
 A refusal prints `refused: <code>: <message>` to stderr and exits with code 2. A malformed spec prints `qa-core-recon: error: <message>` to stderr and exits with code 2. A dataset that cannot be opened prints `qa-core-recon: error: <message>` to stderr and exits with code 2. That includes a missing file, a missing S3 bucket or key, access denied, and an S3 endpoint that cannot be reached.
 
@@ -123,8 +121,8 @@ Nothing in pass or fail calls a model. Two runs on the same inputs write byte-id
 
 | Code | Result |
 | ---- | ------ |
-| 0 | Every aggregate check matched. |
-| 1 | At least one aggregate check did not match. |
+| 0 | Every check matched. |
+| 1 | At least one check did not match. |
 | 2 | The run was refused, or a dataset or the output directory could not be used. |
 
 ### Example Spec
@@ -154,21 +152,73 @@ allowlist: ["./data"]
 
 ### Checks
 
-All four checks run inside Spark. Only the aggregates come back to the driver: one total per side, one row per group, the null-key counts, the duplicate-key count, and at most 20 example keys. A mismatch does not skip the later checks. The report lists them in this order.
+All six checks run inside Spark. Only the aggregates come back to the driver: one total per side, one row per group, the null-key counts, the duplicate-key count, the key-diff counts, the changed-column counts, and at most 20 example keys for each list. A mismatch does not skip the later checks. The report lists the checks in this order: row count, amount sum, null keys, duplicate keys, key diff, and changed columns. The row hash below is the encoding the last two checks use. It is not its own check.
 
 **Row Count.** Total rows on each side. When `group_by` is set, also the rows in each group. Groups are sorted. A group that is missing on either side is a mismatch and is listed. A count of 0 on one side means that group was not present. Group values compare by value across types, so an int 1 and a decimal 1.00 are the same group. Every float NaN is one shared group, shown as NaN, and it sorts after every other float. -0.0 is the same group as 0.0.
 
 **Amount Sum.** For each amount column, the exact sum on each side, stored as `decimal(38, scale)`, for the whole side and for each group. Decimals are written as strings with the full scale, so scale 2 renders `10.50`. Null amounts are left out of the sum. They are not added as zero. A side or a group with no non-null amount has a null sum. Two null sums match. A null sum against a number, including zero, is a mismatch.
 
-Sums are compared exactly. When the tolerance is above zero, the absolute difference must be less than or equal to that tolerance, and the report names the reason. Equality is inside the range. The same tolerance is applied to the total and to each group on its own. It is not a budget shared across groups. A missing group has no sum, so the tolerance does not cover it.
+Sums are compared exactly. When the tolerance is above zero, the absolute difference must be less than or equal to that tolerance, and the report names the reason. Equality is inside the range. The same tolerance is applied to the total and to each group on its own. It is not a budget shared across groups. A missing group has no sum, so the tolerance does not cover it. Tolerance applies only to these sums. It does not apply to the row hash or to the key diff. A row whose amount differs is a changed row even when the sums are inside the tolerance, and the run does not match.
 
 Spark's own decimal sum is not used. With precision loss allowed, that sum returns null on overflow, and null is also what an all-null column produces. This command folds the sum as an exact decimal and then requires it to fit `decimal(38, scale)`. A total or a group sum that does not fit is a read error, exit 2, and no report is written. The message says `sum` for a total and `group sum` for one group. Source is checked before target. On one side, groups are checked in sorted order and then the total. Amount columns follow the spec order.
 
-**Null Keys.** The number of rows with a null in any key column, on each side. Any null key is a mismatch. The report gives both counts. An empty CSV field is an empty string, not a null. Parquet and Iceberg can store a real null.
+**Null Keys.** The number of rows with a null in any key column, on each side. Any null key is a mismatch. The report gives both counts. An empty CSV field and a quoted empty field (`""`) are both read as null. Parquet and Iceberg can store a real null.
 
 **Duplicate Keys.** The number of key values that appear more than once, on each side. Any duplicate is a mismatch. The report gives the counts and up to 20 example keys. Those 20 are the first in sorted order, with nulls first. 20 is fixed (`DUPLICATE_EXAMPLE_LIMIT`). The count is the full number, so it can be higher than the number of examples. A key value is the whole key: every column in `keys`.
 
-Key diff, row hashes, and changed-column diff are not part of this command.
+**Row Hash.** For every row, Spark computes a SHA-256 over the compared columns. The compared columns are the amount columns, the `group_by` columns, and the `hash_columns`, with key columns removed. Source and target use the same column names, so the hash order is those names sorted ascending. That is the target order after the identity mapping. A column that is not named in the spec is not hashed. When that set is empty, changed rows cannot be detected, and the report says so.
+
+The encoding is one token per value, concatenated in that order. Null is the single character `n`. Every other value is `tag:length:payload`. `length` is the UTF-8 byte length of `payload`, written in decimal with no leading zeros. This keeps `("a,b", "c")` distinct from `("a", "b,c")`, and it keeps null distinct from the empty string (`string:0:`).
+
+| Value | Token |
+| ----- | ----- |
+| null | `n` |
+| boolean | `bool:4:true` or `bool:5:false` |
+| integer | `int:<length>:<digits>` |
+| decimal | `decimal:<length>:<plain value>` |
+| float | `float:<length>:<text>` |
+| string | `string:<length>:<text>` |
+| bytes | `bytes:<length>:<lowercase hex>` |
+| date | `date:10:YYYY-MM-DD` |
+| timestamp | `timestamp:27:YYYY-MM-DDTHH:MM:SS.ffffffZ` |
+
+A decimal is the plain string of its exact numeric value. Trailing zeros that only record scale are removed, so `1.0` and `1.00` both encode as `decimal:1:1`. Every significant digit is kept. The string is not rounded and is not written in scientific notation. Negative zero is `0`. When one side is an integer and the other is a decimal, both use this decimal payload, so integer `1` and decimal `1.00` match. Amount columns are already `decimal(38, scale)` before this encoding. The amount sum check still prints them at the spec scale. The row hash does not.
+
+A float uses one payload for every NaN, including a negative NaN (`NaN`). `-0.0` and `0.0` both encode as `0.0`. Other finite floats use Python `repr`. `Infinity` and `-Infinity` are fixed words.
+
+A date is `YYYY-MM-DD`. A `TimestampType` value is formatted in Spark with `date_format` under the UTC session, before any Python code sees it, as `YYYY-MM-DDTHH:MM:SS.ffffffZ`. The worker's local time zone is not used. `TimestampNTZ` uses that same pattern on the stored wall time and is not shifted. A string is parsed with `try_cast` into the other side's type when the types differ. A non-null string that does not parse is changed, not null. Float against double, and any other pair that cannot be aligned, is listed under `type_mismatches` and compared by its string rendering. That list makes the run a mismatch. No new refusal code is used.
+
+The row hash is not a separate pass or fail check. `key_diff` and `changed_columns` use it.
+
+**Key Diff.** A full outer join on the key columns. The join runs in Spark. Only the three counts, the per-column counts, and at most 20 example keys come back to the driver. `KEY_DIFF_EXAMPLE_LIMIT` is 20, the same cap as `DUPLICATE_EXAMPLE_LIMIT`. Missing and changed rows are ordered by the source key values. Extra rows are ordered by the target key values. Nulls come first. A timestamp key is ordered by the timestamp itself, and the example text is the UTC form from the table above, formatted in Spark. A timestamp without a time zone keeps its wall-time text, including the microseconds. The count is the full number, so it can be higher than 20.
+
+Three counts are reported. Any count above zero is a mismatch.
+
+| Count | Meaning |
+| ----- | ------- |
+| `missing` | The key is on the source and not on the target. |
+| `extra` | The key is on the target and not on the source. |
+| `changed` | The key is on both sides and the row hash differs. |
+
+Rows with a null in any key column are excluded. They stay in the null-key check and are not listed as missing, extra, or changed. A target key that has no matching source key is still extra: the excluded source row is not a key, so it does not match that target key.
+
+Key columns are aligned before the join. The join is on those aligned strings, not on Spark's own cast. A string key must equal one canonical text, with no trim. A value that does not match stays unmatched and is missing or extra. Compared columns still accept equivalent spellings, including a space before a date.
+
+| Key type | Canonical text |
+| -------- | -------------- |
+| integer | Digits only. `1` matches. `01`, `+1`, ` 1`, `1.0`, `1.00`, and `1e0` do not. |
+| decimal | The plain number at the column scale, with no exponent and no sign when the value is positive or zero. `decimal(10,2)` is `1.00`. `decimal(20,10)` zero is `0.0000000000`, not `0E-10`. |
+| date | `YYYY-MM-DD`. A leading space does not match. |
+| boolean | Exactly `true` or `false`. `TRUE`, `1`, `yes`, and ` true` do not match. |
+| timestamp | `YYYY-MM-DDTHH:MM:SS.ffffffZ`, the same UTC text as the row hash. `2024-01-01` and ` 2024-01-01` do not match midnight. |
+| timestamp without a time zone | The same text with no trailing `Z`. |
+| float or double | Not aligned with a string. The key is listed under `type_mismatches`, the run mismatches, and the two sides are compared as strings so `01` and ` 1e0` do not join `1.0`. |
+
+Other types that cannot be aligned are also compared as strings and listed under `type_mismatches`.
+
+Counts are by distinct key value, not by physical row. When several rows share a key, the row with the smallest row hash is the one that is compared. Two identical copies of one row therefore do not make the key changed. A second copy whose hash is larger is not the row that is compared. The duplicate-key check still reports the duplicate. The report states this rule on every run, and it says when duplicate keys were found.
+
+**Changed Columns.** For the changed keys, each compared column has a count of how many distinct keys differ in that column, and up to 20 examples. An example has the key, the source token, and the target token, using the row-hash encoding above. Columns are sorted by name. Only columns with a count above zero are listed. A count above zero is a mismatch. Examples are the first 20 in sorted order. When several rows share a key, the compared row is the one with the smallest row hash. That choice is among the duplicate rows. It is not the order of the examples.
 
 ### Report Files
 
@@ -181,7 +231,7 @@ Key diff, row hashes, and changed-column diff are not part of this command.
 | `spec_sha256` | SHA-256 of the spec file bytes |
 | `status` | `match`, `mismatch`, or `refused` |
 | `refusals` | a list of `{code, message}`. Empty when the datasets were compared. |
-| `checks` | a list of `{name, status, details}`. Empty when the run was refused. Decimals in `details` are strings. |
+| `checks` | a list of `{name, status, details}`. Empty when the run was refused. Decimals in amount sums are strings. The names, in order, are `row_count`, `amount_sum`, `null_keys`, `duplicate_keys`, `key_diff`, and `changed_columns`. |
 | `row_counts` | `{source, target}`. Both are null when the run was refused, because the rows were not counted. |
 
 ### Sample Report
@@ -212,23 +262,23 @@ Status: Match
 
 Source rows: 2. Target rows: 2.
 
-Grouped by day.
+Grouped by `day`.
 
 Groups, in sorted order:
 
-- day=2024-01-01. Source rows: 1. Target rows: 1. Match.
-- day=2024-01-02. Source rows: 1. Target rows: 1. Match.
+- `day`=`2024-01-01`. Source rows: 1. Target rows: 1. Match.
+- `day`=`2024-01-02`. Source rows: 1. Target rows: 1. Match.
 
 ### Amount Sum
 
 Status: Match
 
-Column amount, scale 2. Source sum: 11.75. Target sum: 11.75. Difference: 0.00. Tolerance: 0. Match.
+Column `amount`, scale 2. Source sum: 11.75. Target sum: 11.75. Difference: 0.00. Tolerance: 0. Match.
 
 Groups, in sorted order:
 
-- day=2024-01-01. Source sum: 10.50. Target sum: 10.50. Difference: 0.00. Match.
-- day=2024-01-02. Source sum: 1.25. Target sum: 1.25. Difference: 0.00. Match.
+- `day`=`2024-01-01`. Source sum: 10.50. Target sum: 10.50. Difference: 0.00. Match.
+- `day`=`2024-01-02`. Source sum: 1.25. Target sum: 1.25. Difference: 0.00. Match.
 
 ### Null Keys
 
@@ -246,14 +296,42 @@ Example limit: 20.
 Source duplicate keys: 0.
 
 Target duplicate keys: 0.
+
+### Key Diff
+
+Status: Match
+
+Compared columns, in hash order: `amount`, `day`, `note`.
+
+Rows with a null in any key column are excluded.
+Counts are by distinct key value.
+When a key is duplicated, the row with the smallest row hash is used.
+
+Example limit: 20.
+
+Missing keys: 0.
+
+Extra keys: 0.
+
+Changed keys: 0.
+
+### Changed Columns
+
+Status: Match
+
+Example limit: 20.
+
+Each count is the number of distinct keys whose value differs. Examples are listed in sorted order. When a key is duplicated, the compared row is the one with the smallest row hash.
+
+No compared column differs.
 ```
 
 ## Exit Codes
 
 | Code | Name | Meaning |
 | ---- | ---- | ------- |
-| 0 | `MATCH` | Success. For `validate`, the spec is usable. For `validate --check-data`, both datasets passed the data-level refusals. For `run`, every aggregate check matched. |
-| 1 | `MISMATCH` | `run` found a difference. At least one aggregate check did not match. |
+| 0 | `MATCH` | Success. For `validate`, the spec is usable. For `validate --check-data`, both datasets passed the data-level refusals. For `run`, every check matched. |
+| 1 | `MISMATCH` | `run` found a difference. At least one check did not match. |
 | 2 | `REFUSED` | The tool declined to run, or the input or the output directory could not be used, so there is no comparison result. A refusal still writes a report. A read error does not. |
 
 `init` and `validate` use codes 0 and 2 only. `--check-data` is part of `validate`, so it stays on those codes too. `run` uses 0, 1, and 2. An amount that cannot be represented at the spec scale is a refusal, exit 2, because the tool has no decimal to compare. A sum that does not fit `decimal(38, scale)` is a read error on `run`, exit 2, because a rounded total would be a wrong number. `init` and `validate` never return code 1.
@@ -319,9 +397,9 @@ Parquet is read from a file or a directory, with `mergeSchema` off. The file sch
 
 Readers read every row. They do not sample, limit, or keep a head. `sampled: true` is refused even when the files contain a full extract, because the spec declared a sample.
 
-Blank amount cells are null. They are not turned into zero. `run` leaves a null amount out of the sum, and it counts null keys separately.
+Blank amount cells are null. They are not turned into zero. A blank cell is empty or holds only spaces and tabs. A cell that holds only a line break or a Unicode space such as U+00A0 is `inexact-amount`. `run` leaves a null amount out of the sum, and it counts null keys separately.
 
-A missing path, a missing S3 bucket or key, access denied, an S3 endpoint that cannot be reached, a CSV file that is not UTF-8, a malformed CSV row, or a file that Spark cannot read is a read error (`qa-core-recon: error:`), exit 2. It is not a refusal code. The message names the side and the path. It does not include a stack trace.
+A missing path, a missing S3 bucket or key, access denied, an S3 endpoint that cannot be reached, a CSV file that is not UTF-8, a malformed CSV row, or a file that Spark cannot read is a read error (`qa-core-recon: error:`), exit 2. It is not a refusal code. The message names the side and the path. It does not include a stack trace. A symlink loop in a source or target path is also a read error. The message is `cannot read <side> path ...: Symlink loop from ...`. It is not reported as a missing path, and it is not an unexpected error.
 
 ## Iceberg
 
@@ -340,7 +418,7 @@ The catalog is `org.apache.iceberg.spark.SparkCatalog` with `type` set to `hadoo
 
 The runtime jar is `org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.7.1` (Spark 3.5, Scala 2.12). AWS Glue 5.0 ships Iceberg 1.7.1 with Spark 3.5.4, as listed in the AWS Glue versions documentation. Spark downloads the jar from Maven Central the first time a session is started for an Iceberg spec, and stores it in the Ivy cache (`~/.cache/qa-core-recon/ivy`, or `QA_CORE_RECON_IVY`). Later runs reuse the cache. CSV and Parquet do not download it. When Spark reports an unresolved dependency or an Ivy failure, and the jar is not already in that cache, `--check-data` and `run` print a read error that names the runtime and the cache directory, and exit 2. Any other failure to start the session prints `cannot start the local Spark session` and exits 2.
 
-Iceberg on a local warehouse is supported. An `s3://` warehouse is read through the same Hadoop catalog, with the path mapped to `s3a://`. See S3 for credentials and the endpoint. This is not the Glue catalog. The tool does not write to S3.
+Iceberg on a local warehouse is supported. An `s3://` warehouse is read through the same Hadoop catalog, with the path mapped to `s3a://`. Tables written by Glue, EMR, or Athena still store each metadata and data file as `s3://`. Those paths use the same S3A client. See S3 for credentials and the endpoint. This is not the Glue catalog. The tool does not write to S3.
 
 After the table is open, Iceberg uses the same checks as Parquet. Decimal columns are typed to `decimal(38, scale)` and must already fit that scale. A float or double amount is `float-amount` unless the spec sets `cast`. A missing column is `unmapped-column`. A missing table, a missing warehouse, or a snapshot id that is not in the table is a read error (`qa-core-recon: error:`), exit 2.
 
@@ -370,7 +448,7 @@ Each amount column is read as Spark `decimal(38, scale)`. 38 is Spark's maximum 
 
 Parsing is exact. A value is accepted when it equals the same number quantized to the spec scale. At scale 2, `10`, `10.5`, `10.50`, and `10.500` are exact (`10.00` or `10.50`). `10.005` is refused. Trailing zeros add no new information. Extra non-zero fractional digits would have to be rounded, and this tool does not invent a rounded amount. Equivalent spellings of one number, such as `100` and `1e2`, are the same value.
 
-A text amount is ASCII only: optional surrounding whitespace, an optional sign, digits, an optional fraction, and an optional exponent such as `1e2` or `+10.5`. `1_000`, Arabic-Indic digits, and fullwidth digits are `inexact-amount`.
+A text amount is ASCII only: optional surrounding spaces or tabs (not line breaks), an optional sign, digits, an optional fraction, and an optional exponent such as `1e2` or `+10.5`. `1_000`, Arabic-Indic digits, and fullwidth digits are `inexact-amount`.
 
 That refusal is `inexact-amount`, exit 2. It is not a mismatch. A mismatch means the target differs from the source, and exit 1 is reserved for `run`. A value that does not fit the declared scale gives the tool no amount to compare.
 

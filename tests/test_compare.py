@@ -137,6 +137,6 @@ def test_refused_markdown_uses_title_case_and_no_em_dash():
     for heading in headings:
         assert heading == heading.title()
     assert "Status: Refused" in markdown
-    assert "missing-key: the spec has no business key" in markdown
+    assert "missing-key: `the spec has no business key`" in markdown
     assert "No checks were run." in markdown
     assert "not counted" in markdown

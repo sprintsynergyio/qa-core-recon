@@ -32,6 +32,7 @@ def test_blank_is_null_and_not_zero():
     assert to_decimal(None, 2, None) is None
     assert to_decimal("", 2, None) is None
     assert to_decimal("   ", 2, None) is None
+    assert to_decimal(" \t ", 2, None) is None
 
 
 def test_extra_fractional_digits_are_refused():
@@ -111,6 +112,18 @@ def test_underscore_and_non_ascii_digits_are_inexact(text):
     with pytest.raises(InexactAmount) as caught:
         to_decimal(text, 2, None)
     assert caught.value.display == text
+
+
+@pytest.mark.parametrize("text", ["1\n", "1\r", "1\r\n"])
+def test_line_breaks_are_not_amount_whitespace(text):
+    with pytest.raises(InexactAmount):
+        to_decimal(text, 2, None)
+
+
+@pytest.mark.parametrize("text", ["\n", "\r", "\r\n", " \n ", "\u00a0", "\u2028", "\x85", "\x1c"])
+def test_line_break_or_unicode_space_alone_is_not_blank(text):
+    with pytest.raises(InexactAmount):
+        to_decimal(text, 2, None)
 
 
 def test_long_offending_text_is_clipped():

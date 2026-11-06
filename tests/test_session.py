@@ -314,6 +314,7 @@ def test_s3_session_sets_s3_builder_settings(spark, monkeypatch):
     with pytest.raises(SessionStartError, match="stopped before the jvm"):
         local_session(iceberg=False, s3=True)
     assert seen["spark.jars.packages"] == jars_packages(s3=True)
+    assert seen["spark.hadoop.fs.s3.impl"] == "org.apache.hadoop.fs.s3a.S3AFileSystem"
     assert seen["spark.hadoop.fs.s3a.impl"] == "org.apache.hadoop.fs.s3a.S3AFileSystem"
     assert seen["spark.hadoop.fs.s3a.path.style.access"] == "true"
     assert seen["spark.hadoop.fs.s3a.endpoint"] == os.environ["QA_CORE_RECON_S3_ENDPOINT"]

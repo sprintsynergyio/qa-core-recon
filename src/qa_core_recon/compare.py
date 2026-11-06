@@ -30,6 +30,10 @@ SUM_PRECISION = 200
 
 DUPLICATE_EXAMPLE_LIMIT = 20
 
+# Same cap as duplicate-key examples. The count in the report is the full
+# number. The examples are the first 20 keys in sorted order, nulls first.
+KEY_DIFF_EXAMPLE_LIMIT = 20
+
 
 class GroupNaN:
     """The one group key used for every float NaN.

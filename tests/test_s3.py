@@ -132,6 +132,38 @@ def _write_iceberg(spark, bucket: str, rows, schema) -> None:
         scrub_s3_credentials(spark)
 
 
+def _write_iceberg_with_s3_scheme(spark, bucket: str, rows, schema) -> None:
+    """Write a table the way Glue does: metadata and data paths stay ``s3://``."""
+    from qa_core_recon.spark import apply_s3_config, hadoop_catalog, scrub_s3_credentials
+
+    apply_s3_config(spark)
+    warehouse = f"s3://{bucket}/warehouse"
+    catalog = hadoop_catalog(spark, warehouse)
+    try:
+        spark.createDataFrame(rows, schema).writeTo(f"{catalog}.{TABLE}").createOrReplace()
+    finally:
+        scrub_s3_credentials(spark)
+
+
+def _iceberg_metadata_text(bucket: str) -> str:
+    client = _client()
+    names: list[str] = []
+    token = None
+    while True:
+        kwargs: dict = {"Bucket": bucket}
+        if token:
+            kwargs["ContinuationToken"] = token
+        page = client.list_objects_v2(**kwargs)
+        names.extend(item["Key"] for item in page.get("Contents", []))
+        if not page.get("IsTruncated"):
+            break
+        token = page["NextContinuationToken"]
+    metadata = [name for name in names if name.endswith(".metadata.json")]
+    assert metadata, names
+    body = client.get_object(Bucket=bucket, Key=metadata[0])["Body"].read()
+    return body.decode("utf-8")
+
+
 def test_check_data_csv_on_s3_prints_data_ok(spark, tmp_path, capsys):
     bucket = _bucket("csv")
     _put_csv(bucket, "raw/a.csv", CSV)
@@ -391,6 +423,7 @@ def test_s3_settings_follow_the_endpoint_and_region(monkeypatch):
     blob = " ".join(settings.values())
     assert "qa-core-recon-test-secret-key" not in blob
     assert "qa-core-recon-test-access-key" not in blob
+    assert settings["fs.s3.impl"] == "org.apache.hadoop.fs.s3a.S3AFileSystem"
     assert settings["fs.s3a.endpoint"] == "http://127.0.0.1:9"
     assert settings["fs.s3a.path.style.access"] == "true"
     assert settings["fs.s3a.connection.ssl.enabled"] == "false"
@@ -684,6 +717,17 @@ def test_s3_read_unsets_access_and_secret_keys(spark, tmp_path):
     assert conf.get("fs.s3a.secret.key") in (None, "")
 
 
+def test_scrub_removes_fs_s3_credential_keys(spark):
+    conf = spark.sparkContext._jsc.hadoopConfiguration()
+    conf.set("fs.s3.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
+    conf.set("fs.s3.awsAccessKeyId", "qa-core-recon-test-access-key")
+    conf.set("fs.s3.awsSecretAccessKey", "qa-core-recon-test-secret-key")
+    scrub_s3_credentials(spark)
+    assert conf.get("fs.s3.awsAccessKeyId") in (None, "")
+    assert conf.get("fs.s3.awsSecretAccessKey") in (None, "")
+    assert conf.get("fs.s3.impl") == "org.apache.hadoop.fs.s3a.S3AFileSystem"
+
+
 def test_scrub_removes_a_secret_stored_under_an_unmarked_name(spark):
     conf = spark.sparkContext._jsc.hadoopConfiguration()
     secret = os.environ["AWS_SECRET_ACCESS_KEY"]
@@ -717,6 +761,43 @@ def test_holds_credential_matches_a_value_only():
     secret = "qa-core-recon-test-secret-key"
     assert _holds_credential("com.example.note", secret, (secret,)) is True
     assert _holds_credential("fs.s3a.endpoint", "http://127.0.0.1:9", (secret,)) is False
+
+
+def test_run_reads_iceberg_metadata_stored_as_s3_urls(spark, tmp_path, capsys):
+    bucket = _bucket("glue")
+    _write_iceberg_with_s3_scheme(
+        spark,
+        bucket,
+        [("1", Decimal("10.50"), "2024-01-01", "a")],
+        _schema(DecimalType(10, 2)),
+    )
+    metadata = _iceberg_metadata_text(bucket)
+    assert "s3://" in metadata
+    assert "s3a://" not in metadata
+    source = _local_csv(tmp_path, "source.csv", CSV)
+    data = _spec(
+        tmp_path,
+        {"path": str(source), "format": "csv"},
+        {"path": f"s3://{bucket}/warehouse", "format": "iceberg", "table": TABLE},
+        [str(tmp_path), f"s3://{bucket}"],
+    )
+    spec = write_spec_file(tmp_path, data)
+    out = tmp_path / "out"
+    code = main(["run", "--spec", str(spec), "--out", str(out)])
+    captured = capsys.readouterr()
+    assert code is ExitCode.MATCH, captured.err
+    assert captured.out == "match\n"
+    assert captured.err == ""
+    assert "No FileSystem for scheme" not in captured.err
+
+    _put_csv(bucket, "raw/payments.csv", CSV)
+    csv_data = _spec(
+        tmp_path,
+        {"path": f"s3://{bucket}/raw/payments.csv", "format": "csv"},
+        {"path": str(source), "format": "csv"},
+        [str(tmp_path), f"s3://{bucket}"],
+    )
+    _assert_data_ok(tmp_path, csv_data, capsys)
 
 
 def test_run_matches_and_mismatches_csv_on_s3(spark, tmp_path, capsys):
@@ -763,6 +844,35 @@ def test_run_matches_and_mismatches_csv_on_s3(spark, tmp_path, capsys):
     assert report["status"] == "mismatch"
     published = (other_out / "report.json").read_text(encoding="utf-8")
     assert secret not in published
+
+
+def test_run_s3_changed_row_is_key_diff(spark, tmp_path, capsys):
+    bucket = _bucket("changed")
+    _put_csv(bucket, "raw/payments.csv", CSV)
+    _put_csv(bucket, "curated/other.csv", OTHER)
+    data = _spec(
+        tmp_path,
+        {"path": f"s3://{bucket}/raw/payments.csv", "format": "csv"},
+        {"path": f"s3://{bucket}/curated/other.csv", "format": "csv"},
+        [f"s3://{bucket}"],
+    )
+    spec = write_spec_file(tmp_path, data)
+    out = tmp_path / "out"
+    code = main(["run", "--spec", str(spec), "--out", str(out)])
+    captured = capsys.readouterr()
+    assert code is ExitCode.MISMATCH
+    assert captured.out == "mismatch\n"
+    assert captured.err == ""
+    report = json.loads((out / "report.json").read_text(encoding="utf-8"))
+    checks = {check["name"]: check for check in report["checks"]}
+    assert checks["key_diff"]["status"] == "mismatch"
+    assert checks["key_diff"]["details"]["changed"]["count"] == 1
+    assert checks["key_diff"]["details"]["changed"]["examples"] == [["1"]]
+    assert checks["key_diff"]["details"]["missing"]["count"] == 0
+    assert checks["key_diff"]["details"]["extra"]["count"] == 0
+    columns = [column["column"] for column in checks["changed_columns"]["details"]["columns"]]
+    assert columns == ["amount", "note"]
+    assert checks["changed_columns"]["status"] == "mismatch"
 
 
 def test_local_only_process_does_not_request_s3_packages(tmp_path):

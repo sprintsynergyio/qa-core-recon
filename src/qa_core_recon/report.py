@@ -36,6 +36,8 @@ _CHECK_HEADINGS = {
     "amount_sum": "Amount Sum",
     "null_keys": "Null Keys",
     "duplicate_keys": "Duplicate Keys",
+    "key_diff": "Key Diff",
+    "changed_columns": "Changed Columns",
 }
 
 
@@ -49,7 +51,8 @@ def spec_sha256(path: Path) -> str:
 
 
 # publish writes ``.report.json.<pid>.tmp`` and ``.report.md.<pid>.tmp``.
-_REPORT_TEMP = re.compile(r"^\.report\.(json|md)\.\d+\.tmp$")
+# ``\Z`` is the end of the name. ``$`` also matches before a trailing newline.
+_REPORT_TEMP = re.compile(r"^\.report\.(json|md)\.\d+\.tmp\Z")
 
 
 def _is_report_temp(name: str) -> bool:
@@ -176,7 +179,7 @@ def render_markdown(report: dict) -> str:
             ]
         )
         for refusal in report["refusals"]:
-            lines.append(f"- {refusal['code']}: {refusal['message']}")
+            lines.append(f"- {refusal['code']}: {_md(refusal['message'])}")
         lines.extend(
             [
                 "",
@@ -214,24 +217,43 @@ def reject_output_overlap(out: Path, source_path: str, target_path: str) -> None
 
     Writing the report into a dataset directory makes the next read treat
     ``report.json`` as another data file. ``s3://`` paths are not local, so
-    they do not overlap a local output directory.
+    they do not overlap a local output directory. A symlink loop on the
+    output path is an output error. A symlink loop on the source or the
+    target is a read error. Neither one is an unexpected error.
     """
     for side, dataset_path in (("source", source_path), ("target", target_path)):
-        if _local_paths_overlap(out, dataset_path):
+        if _local_paths_overlap(out, dataset_path, side):
             raise OutputError(f"output path {out} overlaps {side} path {dataset_path}")
 
 
-def _local_paths_overlap(out: Path, dataset_path: str) -> bool:
+def _local_paths_overlap(out: Path, dataset_path: str, side: str) -> bool:
     if _has_scheme(dataset_path) or dataset_path.startswith("s3:"):
         return False
     # resolve follows symlinks and folds "..". absolute() leaves both in place,
     # so a link to the dataset, or "<data>/other/../src", would miss the check.
+    # A symlink loop raises RuntimeError, not OSError.
     try:
-        left = out.resolve(strict=False).parts
-        right = Path(dataset_path).resolve(strict=False).parts
-    except OSError as exc:
-        raise OutputError(_cannot_use(out, exc)) from None
+        left = _resolve_parts(out)
+    except _PathResolveError as exc:
+        raise OutputError(f"cannot write {out}: {exc.detail}") from None
+    try:
+        right = _resolve_parts(Path(dataset_path))
+    except _PathResolveError as exc:
+        raise OutputError(f"cannot read {side} path {dataset_path!r}: {exc.detail}") from None
     return left == right or _is_prefix(left, right) or _is_prefix(right, left)
+
+
+class _PathResolveError(Exception):
+    def __init__(self, detail: str) -> None:
+        self.detail = detail
+
+
+def _resolve_parts(path: Path) -> tuple[str, ...]:
+    try:
+        return path.resolve(strict=False).parts
+    except (OSError, RuntimeError) as exc:
+        detail = getattr(exc, "strerror", None) or str(exc) or exc.__class__.__name__
+        raise _PathResolveError(detail) from None
 
 
 def _is_prefix(prefix: tuple[str, ...], path: tuple[str, ...]) -> bool:
@@ -293,6 +315,10 @@ def _check_lines(check: dict) -> list[str]:
         )
     elif name == "duplicate_keys":
         lines.extend(_duplicate_lines(details))
+    elif name == "key_diff":
+        lines.extend(_key_diff_lines(details))
+    elif name == "changed_columns":
+        lines.extend(_changed_column_lines(details))
     return lines
 
 
@@ -303,7 +329,7 @@ def _row_count_lines(details: dict) -> list[str]:
     ]
     if not details["group_by"]:
         return lines
-    names = ", ".join(details["group_by"])
+    names = ", ".join(_md(name) for name in details["group_by"])
     lines.extend([f"Grouped by {names}.", ""])
     if not details["groups"]:
         lines.extend(["No groups were present on either side.", ""])
@@ -328,7 +354,7 @@ def _amount_lines(details: dict) -> list[str]:
         return lines
     for column in details["columns"]:
         parts = [
-            f"Column {column['column']}, scale {column['scale']}.",
+            f"Column {_md(column['column'])}, scale {column['scale']}.",
             f"Source sum: {_shown(column['source'])}.",
             f"Target sum: {_shown(column['target'])}.",
             f"Difference: {_shown(column['difference'])}.",
@@ -336,7 +362,7 @@ def _amount_lines(details: dict) -> list[str]:
         ]
         reason = column["reason"].strip()
         if reason:
-            parts.append(f"Reason: {reason}.")
+            parts.append(f"Reason: {_md(reason)}.")
         parts.append(f"{_STATUS_LABELS[column['status']]}.")
         lines.extend([" ".join(parts), ""])
         if not column["groups"]:
@@ -377,6 +403,83 @@ def _duplicate_side(label: str, keys: list[str], payload: dict) -> list[str]:
     return lines
 
 
+def _key_diff_lines(details: dict) -> list[str]:
+    lines: list[str] = []
+    columns = details["columns"]
+    if columns:
+        shown = ", ".join(_md(name) for name in columns)
+        lines.append(f"Compared columns, in hash order: {shown}.")
+    else:
+        lines.append(details["changed_detection"])
+    lines.append("")
+    mismatches = details.get("type_mismatches") or []
+    if mismatches:
+        lines.append("Type mismatches. These columns are compared by their string rendering.")
+        lines.append("")
+        for item in mismatches:
+            lines.append(
+                f"- {_md(item['column'])} ({item['role']}). "
+                f"Source type: {_md(item['source_type'])}. Target type: {_md(item['target_type'])}."
+            )
+        lines.append("")
+    for rule in details["rules"]:
+        lines.append(rule)
+    lines.append("")
+    if details["duplicates_present"]:
+        lines.append("Duplicate keys were found, so each distinct key is counted once.")
+        lines.append("")
+    lines.append(f"Example limit: {details['example_limit']}.")
+    lines.append("")
+    for label, name in (("Missing", "missing"), ("Extra", "extra"), ("Changed", "changed")):
+        lines.extend(_key_bucket_lines(label, details["keys"], details[name]))
+    return lines
+
+
+def _key_bucket_lines(label: str, keys: list[str], payload: dict) -> list[str]:
+    count = payload["count"]
+    examples = payload["examples"]
+    lines = [f"{label} keys: {count}."]
+    if count > len(examples):
+        lines.append(f"The first {len(examples)} of {count} are listed in sorted order.")
+    lines.append("")
+    for example in examples:
+        lines.append(f"- {_example_label(keys, example)}")
+    if examples:
+        lines.append("")
+    return lines
+
+
+def _changed_column_lines(details: dict) -> list[str]:
+    lines = [
+        f"Example limit: {details['example_limit']}.",
+        "",
+        details["rule"],
+        "",
+    ]
+    columns = details["columns"]
+    if not columns:
+        lines.extend(["No compared column differs.", ""])
+        return lines
+    for column in columns:
+        count = column["count"]
+        examples = column["examples"]
+        lines.append(f"Column {_md(column['column'])}. Distinct keys that differ: {count}.")
+        if count > len(examples):
+            lines.append(f"The first {len(examples)} of {count} are listed in sorted order.")
+        lines.append("")
+        for example in examples:
+            key = _example_label(details["keys"], example["key"])
+            lines.append(
+                f"- {key}. Source: {_cell(example['source'])}. "
+                f"Target: {_cell(example['target'])}. "
+                f"Source token: {_md(example['source_token'])}. "
+                f"Target token: {_md(example['target_token'])}."
+            )
+        if examples:
+            lines.append("")
+    return lines
+
+
 def _missing_sentence(missing: str | None) -> str:
     if missing == "source":
         return " This group is missing on the source."
@@ -388,17 +491,64 @@ def _missing_sentence(missing: str | None) -> str:
 def _group_label(group: dict) -> str:
     parts = []
     for name, value in group.items():
-        shown = "null" if value is None else str(value)
-        parts.append(f"{name}={shown}")
+        shown = "null" if value is None else _md(value)
+        parts.append(f"{_md(name)}={shown}")
     return ", ".join(parts)
 
 
 def _example_label(keys: list[str], example: list) -> str:
     parts = []
     for name, value in zip(keys, example, strict=True):
-        shown = "null" if value is None else str(value)
-        parts.append(f"{name}={shown}")
+        shown = "null" if value is None else _md(value)
+        parts.append(f"{_md(name)}={shown}")
     return ", ".join(parts)
+
+
+def _cell(value: object) -> str:
+    if value is None:
+        return "null"
+    return _md(value)
+
+
+def _md(value: object) -> str:
+    """Return one markdown code span for text that came from the datasets.
+
+    The fence is longer than any run of backticks in the text. Line breaks,
+    tabs, other controls, and ``|`` are written as visible escapes, so the
+    span stays inside one line and one table cell.
+    """
+    visible = _visible(str(value))
+    longest = 0
+    run = 0
+    for char in visible:
+        if char == "`":
+            run += 1
+            longest = max(longest, run)
+        else:
+            run = 0
+    fence = "`" * (longest + 1)
+    if visible.startswith("`") or visible.endswith("`"):
+        visible = f" {visible} "
+    return f"{fence}{visible}{fence}"
+
+
+def _visible(text: str) -> str:
+    parts = []
+    for char in text:
+        code = ord(char)
+        if char == "\n":
+            parts.append("\\n")
+        elif char == "\r":
+            parts.append("\\r")
+        elif char == "\t":
+            parts.append("\\t")
+        elif char == "|":
+            parts.append("\\|")
+        elif code < 32 or code == 127:
+            parts.append(f"\\x{code:02x}")
+        else:
+            parts.append(char)
+    return "".join(parts)
 
 
 def _shown(value: object) -> str:
