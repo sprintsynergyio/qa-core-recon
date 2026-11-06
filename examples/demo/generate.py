@@ -102,11 +102,7 @@ def missing_target(rows: list[dict[str, str]]) -> list[dict[str, str]]:
 
 
 def changed_target(rows: list[dict[str, str]]) -> list[dict[str, str]]:
-    """Keep every key. Change the amount and type on the five chosen rows.
-
-    TODO(key-diff): the key diff and row hashes PR will list these txn_id
-    values as changed. The amount shift is what the sum check can see today.
-    """
+    """Keep every key. Change the amount and type on the five chosen rows."""
     copied = _copy(rows)
     for row in copied:
         if row["txn_id"] not in CHANGED_IDS:

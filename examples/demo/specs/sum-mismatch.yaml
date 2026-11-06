@@ -1,6 +1,4 @@
 # Every target amount is 0.50 higher than the source. The row count matches.
-# TODO(key-diff): the key diff and row hashes PR will list every txn_id as
-# changed. Until that PR is merged, this case shows up through the amount sum.
 version: 1
 
 source:
@@ -19,8 +17,6 @@ amounts:
 
 group_by: [txn_date]
 
-# TODO(key-diff): the key diff and row hashes PR will hash these columns
-# per txn_id. The sum check is what the report can show today.
 hash_columns: [account_id, txn_type, amount, currency, txn_date]
 
 tolerance:

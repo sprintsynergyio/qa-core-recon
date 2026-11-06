@@ -156,6 +156,306 @@
       },
       "name": "duplicate_keys",
       "status": "match"
+    },
+    {
+      "details": {
+        "changed": {
+          "count": 200,
+          "examples": [
+            [
+              "TXN000001"
+            ],
+            [
+              "TXN000002"
+            ],
+            [
+              "TXN000003"
+            ],
+            [
+              "TXN000004"
+            ],
+            [
+              "TXN000005"
+            ],
+            [
+              "TXN000006"
+            ],
+            [
+              "TXN000007"
+            ],
+            [
+              "TXN000008"
+            ],
+            [
+              "TXN000009"
+            ],
+            [
+              "TXN000010"
+            ],
+            [
+              "TXN000011"
+            ],
+            [
+              "TXN000012"
+            ],
+            [
+              "TXN000013"
+            ],
+            [
+              "TXN000014"
+            ],
+            [
+              "TXN000015"
+            ],
+            [
+              "TXN000016"
+            ],
+            [
+              "TXN000017"
+            ],
+            [
+              "TXN000018"
+            ],
+            [
+              "TXN000019"
+            ],
+            [
+              "TXN000020"
+            ]
+          ]
+        },
+        "changed_detection": null,
+        "columns": [
+          "account_id",
+          "amount",
+          "currency",
+          "txn_date",
+          "txn_type"
+        ],
+        "counting": "distinct_key",
+        "duplicates_present": false,
+        "example_limit": 20,
+        "extra": {
+          "count": 0,
+          "examples": []
+        },
+        "keys": [
+          "txn_id"
+        ],
+        "missing": {
+          "count": 0,
+          "examples": []
+        },
+        "null_keys": "excluded",
+        "rules": [
+          "Rows with a null in any key column are excluded.",
+          "Counts are by distinct key value.",
+          "When a key is duplicated, the row with the smallest row hash is used."
+        ],
+        "type_mismatches": []
+      },
+      "name": "key_diff",
+      "status": "mismatch"
+    },
+    {
+      "details": {
+        "columns": [
+          {
+            "column": "amount",
+            "count": 200,
+            "examples": [
+              {
+                "key": [
+                  "TXN000001"
+                ],
+                "source": "143.06",
+                "source_token": "decimal:6:143.06",
+                "target": "143.56",
+                "target_token": "decimal:6:143.56"
+              },
+              {
+                "key": [
+                  "TXN000002"
+                ],
+                "source": "-562.37",
+                "source_token": "decimal:7:-562.37",
+                "target": "-561.87",
+                "target_token": "decimal:7:-561.87"
+              },
+              {
+                "key": [
+                  "TXN000003"
+                ],
+                "source": "1347.58",
+                "source_token": "decimal:7:1347.58",
+                "target": "1348.08",
+                "target_token": "decimal:7:1348.08"
+              },
+              {
+                "key": [
+                  "TXN000004"
+                ],
+                "source": "1638.15",
+                "source_token": "decimal:7:1638.15",
+                "target": "1638.65",
+                "target_token": "decimal:7:1638.65"
+              },
+              {
+                "key": [
+                  "TXN000005"
+                ],
+                "source": "611.98",
+                "source_token": "decimal:6:611.98",
+                "target": "612.48",
+                "target_token": "decimal:6:612.48"
+              },
+              {
+                "key": [
+                  "TXN000006"
+                ],
+                "source": "-375.17",
+                "source_token": "decimal:7:-375.17",
+                "target": "-374.67",
+                "target_token": "decimal:7:-374.67"
+              },
+              {
+                "key": [
+                  "TXN000007"
+                ],
+                "source": "1947.65",
+                "source_token": "decimal:7:1947.65",
+                "target": "1948.15",
+                "target_token": "decimal:7:1948.15"
+              },
+              {
+                "key": [
+                  "TXN000008"
+                ],
+                "source": "854.55",
+                "source_token": "decimal:6:854.55",
+                "target": "855.05",
+                "target_token": "decimal:6:855.05"
+              },
+              {
+                "key": [
+                  "TXN000009"
+                ],
+                "source": "618.54",
+                "source_token": "decimal:6:618.54",
+                "target": "619.04",
+                "target_token": "decimal:6:619.04"
+              },
+              {
+                "key": [
+                  "TXN000010"
+                ],
+                "source": "-1932.24",
+                "source_token": "decimal:8:-1932.24",
+                "target": "-1931.74",
+                "target_token": "decimal:8:-1931.74"
+              },
+              {
+                "key": [
+                  "TXN000011"
+                ],
+                "source": "1278.19",
+                "source_token": "decimal:7:1278.19",
+                "target": "1278.69",
+                "target_token": "decimal:7:1278.69"
+              },
+              {
+                "key": [
+                  "TXN000012"
+                ],
+                "source": "1010.79",
+                "source_token": "decimal:7:1010.79",
+                "target": "1011.29",
+                "target_token": "decimal:7:1011.29"
+              },
+              {
+                "key": [
+                  "TXN000013"
+                ],
+                "source": "916.47",
+                "source_token": "decimal:6:916.47",
+                "target": "916.97",
+                "target_token": "decimal:6:916.97"
+              },
+              {
+                "key": [
+                  "TXN000014"
+                ],
+                "source": "-229.05",
+                "source_token": "decimal:7:-229.05",
+                "target": "-228.55",
+                "target_token": "decimal:7:-228.55"
+              },
+              {
+                "key": [
+                  "TXN000015"
+                ],
+                "source": "1903.19",
+                "source_token": "decimal:7:1903.19",
+                "target": "1903.69",
+                "target_token": "decimal:7:1903.69"
+              },
+              {
+                "key": [
+                  "TXN000016"
+                ],
+                "source": "1934.52",
+                "source_token": "decimal:7:1934.52",
+                "target": "1935.02",
+                "target_token": "decimal:7:1935.02"
+              },
+              {
+                "key": [
+                  "TXN000017"
+                ],
+                "source": "1992.74",
+                "source_token": "decimal:7:1992.74",
+                "target": "1993.24",
+                "target_token": "decimal:7:1993.24"
+              },
+              {
+                "key": [
+                  "TXN000018"
+                ],
+                "source": "-991.24",
+                "source_token": "decimal:7:-991.24",
+                "target": "-990.74",
+                "target_token": "decimal:7:-990.74"
+              },
+              {
+                "key": [
+                  "TXN000019"
+                ],
+                "source": "1339.41",
+                "source_token": "decimal:7:1339.41",
+                "target": "1339.91",
+                "target_token": "decimal:7:1339.91"
+              },
+              {
+                "key": [
+                  "TXN000020"
+                ],
+                "source": "1080.60",
+                "source_token": "decimal:6:1080.6",
+                "target": "1081.10",
+                "target_token": "decimal:6:1081.1"
+              }
+            ]
+          }
+        ],
+        "counting": "distinct_key",
+        "example_limit": 20,
+        "keys": [
+          "txn_id"
+        ],
+        "rule": "Each count is the number of distinct keys whose value differs. Examples are listed in sorted order. When a key is duplicated, the compared row is the one with the smallest row hash."
+      },
+      "name": "changed_columns",
+      "status": "mismatch"
     }
   ],
   "refusals": [],
@@ -163,7 +463,7 @@
     "source": 200,
     "target": 200
   },
-  "spec_sha256": "ed9c8b7f2f787831073ef59a465a9625ce9b4fe64fe8e6bb2eaf654c18bef7c2",
+  "spec_sha256": "941f566d39b36363fe0cb08d9fd76b6661167ae68bbc4cd7d74595bbba1e0d67",
   "status": "mismatch",
   "tool": "qa-core-recon",
   "version": "0.1.0"

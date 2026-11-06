@@ -33,10 +33,10 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/sprintsynergyhq/qa-core-recon"
-Repository = "https://github.com/sprintsynergyhq/qa-core-recon"
-Issues = "https://github.com/sprintsynergyhq/qa-core-recon/issues"
-Changelog = "https://github.com/sprintsynergyhq/qa-core-recon/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/sprintsynergyio/qa-core-recon"
+Repository = "https://github.com/sprintsynergyio/qa-core-recon"
+Issues = "https://github.com/sprintsynergyio/qa-core-recon/issues"
+Changelog = "https://github.com/sprintsynergyio/qa-core-recon/blob/main/CHANGELOG.md"
 
 [project.scripts]
 qa-core-recon = "qa_core_recon.cli:main"

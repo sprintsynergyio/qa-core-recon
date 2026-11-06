@@ -15,7 +15,7 @@ Sign in to pypi.org. Open the account menu, then Publishing, and add a pending p
 | Field | Value |
 | ----- | ----- |
 | PyPI project name | `qa-core-recon` |
-| Owner | `sprintsynergyhq` |
+| Owner | `sprintsynergyio` |
 | Repository name | `qa-core-recon` |
 | Workflow name | `publish.yml` |
 | Environment name | `pypi` |

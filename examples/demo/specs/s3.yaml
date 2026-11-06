@@ -1,7 +1,5 @@
 # The matching CSV files, read from s3://demo-bucket.
 # The test uploads examples/demo/data/match to moto. This spec does not call AWS.
-# TODO(key-diff): the key diff and row hashes PR will hash these columns
-# per txn_id. This pair matches, so that check will have nothing to list.
 version: 1
 
 source:

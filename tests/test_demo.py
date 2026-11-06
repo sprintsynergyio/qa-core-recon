@@ -7,9 +7,9 @@ Each spec is run through the CLI. ``match``, the Iceberg spec, and the S3
 spec exit 0. The other cases exit 1. Reports are compared byte for byte with
 ``examples/demo/expected``.
 
-TODO(key-diff): the key diff and row hashes PR will list missing, extra, and
-changed txn_id values. Until that PR is merged, those cases show up through
-row counts and amount sums. The report checks stay the four aggregate checks.
+The report checks are row count, amount sum, null keys, duplicate keys, key
+diff, and changed columns. Missing, extra, and changed txn_id values appear
+in the key-diff and changed-column sections.
 """
 
 import ast
@@ -37,7 +37,14 @@ GENERATOR = DEMO / "generate.py"
 WAREHOUSE = "examples/demo/data/iceberg/warehouse"
 BUCKET = "demo-bucket"
 S3_PREFIX = "payments/match"
-AGGREGATE_CHECKS = ["row_count", "amount_sum", "null_keys", "duplicate_keys"]
+REPORT_CHECKS = [
+    "row_count",
+    "amount_sum",
+    "null_keys",
+    "duplicate_keys",
+    "key_diff",
+    "changed_columns",
+]
 COLUMNS = ["txn_id", "account_id", "txn_type", "amount", "currency", "txn_date"]
 LOCAL_CASES = ("match", "missing-rows", "extra-rows", "changed-rows", "sum-mismatch")
 EXIT_CODES = {
@@ -125,17 +132,20 @@ def _assert_report(out: Path, case: str, code, captured) -> None:
     assert (out / "report.json").read_bytes() == (expected / "report.json").read_bytes()
     assert (out / "report.md").read_bytes() == (expected / "report.md").read_bytes()
     report = json.loads((out / "report.json").read_text(encoding="utf-8"))
-    # TODO(key-diff): the key diff and row hashes PR adds a check that lists
-    # missing, extra, and changed txn_id values. Until that PR is merged, the
-    # report has these four aggregate checks, and the row cases below show up
-    # through row counts and amount sums.
-    assert [item["name"] for item in report["checks"]] == AGGREGATE_CHECKS
+    assert [item["name"] for item in report["checks"]] == REPORT_CHECKS
+    by_name = {item["name"]: item for item in report["checks"]}
     if case in {"missing-rows", "extra-rows"}:
-        assert report["checks"][0]["status"] == "mismatch"
-        assert report["checks"][1]["status"] == "mismatch"
+        assert by_name["row_count"]["status"] == "mismatch"
+        assert by_name["amount_sum"]["status"] == "mismatch"
+        assert by_name["key_diff"]["status"] == "mismatch"
+        assert by_name["changed_columns"]["status"] == "match"
     elif case in {"changed-rows", "sum-mismatch"}:
-        assert report["checks"][0]["status"] == "match"
-        assert report["checks"][1]["status"] == "mismatch"
+        assert by_name["row_count"]["status"] == "match"
+        assert by_name["amount_sum"]["status"] == "mismatch"
+        assert by_name["key_diff"]["status"] == "mismatch"
+        assert by_name["changed_columns"]["status"] == "mismatch"
+    elif case in {"match", "iceberg", "s3"}:
+        assert all(item["status"] == "match" for item in report["checks"])
 
 
 def _run(case: str, out: Path):

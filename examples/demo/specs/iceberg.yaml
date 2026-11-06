@@ -1,8 +1,6 @@
 # CSV source and Iceberg target for the matching payments rows.
 # The test builds the warehouse at target.path from the matching CSV.
 # That warehouse is not committed. Iceberg metadata changes between writes.
-# TODO(key-diff): the key diff and row hashes PR will hash these columns
-# per txn_id. This pair matches, so that check will have nothing to list.
 version: 1
 
 source:

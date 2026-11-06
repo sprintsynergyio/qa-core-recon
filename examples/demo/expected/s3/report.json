@@ -156,6 +156,58 @@
       },
       "name": "duplicate_keys",
       "status": "match"
+    },
+    {
+      "details": {
+        "changed": {
+          "count": 0,
+          "examples": []
+        },
+        "changed_detection": null,
+        "columns": [
+          "account_id",
+          "amount",
+          "currency",
+          "txn_date",
+          "txn_type"
+        ],
+        "counting": "distinct_key",
+        "duplicates_present": false,
+        "example_limit": 20,
+        "extra": {
+          "count": 0,
+          "examples": []
+        },
+        "keys": [
+          "txn_id"
+        ],
+        "missing": {
+          "count": 0,
+          "examples": []
+        },
+        "null_keys": "excluded",
+        "rules": [
+          "Rows with a null in any key column are excluded.",
+          "Counts are by distinct key value.",
+          "When a key is duplicated, the row with the smallest row hash is used."
+        ],
+        "type_mismatches": []
+      },
+      "name": "key_diff",
+      "status": "match"
+    },
+    {
+      "details": {
+        "columns": [],
+        "counting": "distinct_key",
+        "example_limit": 20,
+        "keys": [
+          "txn_id"
+        ],
+        "rule": "Each count is the number of distinct keys whose value differs. Examples are listed in sorted order. When a key is duplicated, the compared row is the one with the smallest row hash."
+      },
+      "name": "changed_columns",
+      "status": "match"
     }
   ],
   "refusals": [],
@@ -163,7 +215,7 @@
     "source": 200,
     "target": 200
   },
-  "spec_sha256": "ae3697cc74f02dea6bce72fef252a957a8265d236a4c53865b90f3329552bb38",
+  "spec_sha256": "8d68ac8e5fc04de3b944c99a3b6578c23fcac9d6edcc80c99447471c6c3c9683",
   "status": "match",
   "tool": "qa-core-recon",
   "version": "0.1.0"

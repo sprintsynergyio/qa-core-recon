@@ -17,8 +17,6 @@ amounts:
 
 group_by: [txn_date]
 
-# TODO(key-diff): the key diff and row hashes PR will hash these columns
-# per txn_id. A matching pair has nothing to list.
 hash_columns: [account_id, txn_type, amount, currency, txn_date]
 
 tolerance:
