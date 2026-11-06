@@ -846,6 +846,35 @@ def test_run_matches_and_mismatches_csv_on_s3(spark, tmp_path, capsys):
     assert secret not in published
 
 
+def test_run_s3_changed_row_is_key_diff(spark, tmp_path, capsys):
+    bucket = _bucket("changed")
+    _put_csv(bucket, "raw/payments.csv", CSV)
+    _put_csv(bucket, "curated/other.csv", OTHER)
+    data = _spec(
+        tmp_path,
+        {"path": f"s3://{bucket}/raw/payments.csv", "format": "csv"},
+        {"path": f"s3://{bucket}/curated/other.csv", "format": "csv"},
+        [f"s3://{bucket}"],
+    )
+    spec = write_spec_file(tmp_path, data)
+    out = tmp_path / "out"
+    code = main(["run", "--spec", str(spec), "--out", str(out)])
+    captured = capsys.readouterr()
+    assert code is ExitCode.MISMATCH
+    assert captured.out == "mismatch\n"
+    assert captured.err == ""
+    report = json.loads((out / "report.json").read_text(encoding="utf-8"))
+    checks = {check["name"]: check for check in report["checks"]}
+    assert checks["key_diff"]["status"] == "mismatch"
+    assert checks["key_diff"]["details"]["changed"]["count"] == 1
+    assert checks["key_diff"]["details"]["changed"]["examples"] == [["1"]]
+    assert checks["key_diff"]["details"]["missing"]["count"] == 0
+    assert checks["key_diff"]["details"]["extra"]["count"] == 0
+    columns = [column["column"] for column in checks["changed_columns"]["details"]["columns"]]
+    assert columns == ["amount", "note"]
+    assert checks["changed_columns"]["status"] == "mismatch"
+
+
 def test_local_only_process_does_not_request_s3_packages(tmp_path):
     source = _local_csv(tmp_path, "source.csv", CSV)
     target = _local_csv(tmp_path, "target.csv", CSV)

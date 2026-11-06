@@ -46,11 +46,13 @@ CAST_ROUNDING = {
 # context (28 digits) rounding it first. The digit check then refuses it.
 _CONTEXT = Context(prec=100)
 
-# ASCII only. ``re.ASCII`` keeps ``\\d`` and ``\\s`` off Unicode digits and
-# Unicode whitespace, so ``1_000``, Arabic-Indic digits, and fullwidth digits
-# fail closed. ``1e2`` and ``+10.5`` still match.
+# ASCII only. ``re.ASCII`` keeps ``\\d`` off Unicode digits, so ``1_000``,
+# Arabic-Indic digits, and fullwidth digits fail closed. Space and tab may
+# surround the number. A line break is not whitespace here: ``\\s`` would
+# accept ``1\\n``, and ``\\Z`` would not save it because the break was already
+# consumed. ``1e2`` and ``+10.5`` still match.
 _AMOUNT_TEXT = re.compile(
-    r"\s*[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?\s*\Z",
+    r"[ \t]*[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?[ \t]*\Z",
     re.ASCII,
 )
 
@@ -73,7 +75,7 @@ def to_decimal(raw: object, scale: int, cast: str | None) -> Decimal | None:
     if raw is None:
         return None
     if isinstance(raw, str):
-        if raw.strip() == "":
+        if raw.strip(" \t") == "":
             return None
         if _AMOUNT_TEXT.fullmatch(raw) is None:
             raise InexactAmount(raw.strip())

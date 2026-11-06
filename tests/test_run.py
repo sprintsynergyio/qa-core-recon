@@ -24,7 +24,14 @@ from tests.test_readers import _write_parquet
 
 HEADER = "txn_id,amount,day,note\n"
 ROW = "1,10.50,2024-01-01,a\n"
-_CHECK_NAMES = ["row_count", "amount_sum", "null_keys", "duplicate_keys"]
+_CHECK_NAMES = [
+    "row_count",
+    "amount_sum",
+    "null_keys",
+    "duplicate_keys",
+    "key_diff",
+    "changed_columns",
+]
 
 
 def _invoke(spec, out, force=False):
@@ -130,7 +137,7 @@ def test_match_csv_and_parquet_writes_a_canonical_report(spark, tmp_path, capsys
     assert str(spec) not in raw.decode() + markdown
     assert str(source) not in raw.decode() + markdown
     assert [check["name"] for check in report["checks"]] == _CHECK_NAMES
-    assert [check["status"] for check in report["checks"]] == ["match", "match", "match", "match"]
+    assert [check["status"] for check in report["checks"]] == ["match"] * len(_CHECK_NAMES)
     assert report["row_counts"] == {"source": 1, "target": 1}
     assert report["refusals"] == []
     amount = report["checks"][1]["details"]["columns"][0]
@@ -145,7 +152,7 @@ def test_match_csv_and_parquet_writes_a_canonical_report(spark, tmp_path, capsys
     assert group["status"] == "match"
     assert "Status: Match" in markdown
     assert "10.50" in markdown
-    assert "Grouped by day." in markdown
+    assert "Grouped by `day`." in markdown
 
     other = tmp_path / "other"
     assert _invoke(spec, other) is ExitCode.MATCH
@@ -238,7 +245,8 @@ def test_tolerance_within_and_outside_its_range(tmp_path):
         tolerance={"value": "0.01", "reason": "penny rounding"},
     )
     within_out = tmp_path / "within"
-    assert _invoke(within, within_out) is ExitCode.MATCH
+    # The sums are inside the tolerance. The row hash is not, so the run mismatches.
+    assert _invoke(within, within_out) is ExitCode.MISMATCH
     report, _raw, markdown = _load(within_out)
     amount = report["checks"][1]["details"]["columns"][0]
     assert amount["status"] == "match"
@@ -246,8 +254,10 @@ def test_tolerance_within_and_outside_its_range(tmp_path):
     assert amount["tolerance"] == "0.01"
     assert amount["reason"] == "penny rounding"
     assert amount["groups"][0]["status"] == "match"
-    assert "Reason: penny rounding." in markdown
-    assert report["status"] == "match"
+    assert "Reason: `penny rounding`." in markdown
+    assert report["status"] == "mismatch"
+    assert report["checks"][4]["status"] == "mismatch"
+    assert report["checks"][4]["details"]["changed"]["count"] == 1
 
     outside_dir = tmp_path / "outside-data"
     outside_dir.mkdir()
@@ -264,7 +274,7 @@ def test_tolerance_within_and_outside_its_range(tmp_path):
     assert amount["difference"] == "0.02"
     assert amount["status"] == "mismatch"
     assert amount["reason"] == "penny rounding"
-    assert "Reason: penny rounding." in markdown
+    assert "Reason: `penny rounding`." in markdown
 
 
 def test_tolerance_applies_to_the_total_and_to_each_group(tmp_path):
@@ -311,7 +321,7 @@ def test_missing_group_is_listed_in_sorted_order(tmp_path):
     assert report["checks"][1]["status"] == "mismatch"
     assert "This group is missing on the target." in markdown
     assert "This group is missing on the source." in markdown
-    assert markdown.index("day=2024-01-01") < markdown.index("day=2024-01-04")
+    assert markdown.index("`day`=`2024-01-01`") < markdown.index("`day`=`2024-01-04`")
 
 
 def test_null_key_is_a_mismatch(spark, tmp_path):
@@ -972,6 +982,46 @@ def test_unlinking_a_report_directory_is_an_output_error(tmp_path, capsys):
     captured = capsys.readouterr()
     _assert_error(code, captured, f"cannot write {out}: Is a directory")
     assert report_dir.is_dir()
+
+
+def test_symlink_loop_is_a_read_error(tmp_path, capsys):
+    target = tmp_path / "target.csv"
+    write_csv(target, ROW)
+    source_loop = tmp_path / "source-loop"
+    source_loop.symlink_to(source_loop)
+    spec = write_spec_file(
+        tmp_path,
+        spec_data(tmp_path, source_loop, target, source_format="csv", target_format="csv"),
+    )
+    out = tmp_path / "out"
+    code = _invoke(spec, out)
+    captured = capsys.readouterr()
+    _assert_error(
+        code,
+        captured,
+        f"cannot read source path '{source_loop}': Symlink loop from '{source_loop}'",
+    )
+    assert not (out / "report.json").exists()
+    assert not (out / "report.md").exists()
+
+    source = tmp_path / "source.csv"
+    write_csv(source, ROW)
+    left = tmp_path / "left"
+    right = tmp_path / "right"
+    left.symlink_to("right")
+    right.symlink_to("left")
+    spec = write_spec_file(
+        tmp_path,
+        spec_data(tmp_path, source, left, source_format="csv", target_format="csv"),
+    )
+    code = _invoke(spec, out)
+    captured = capsys.readouterr()
+    _assert_error(
+        code,
+        captured,
+        f"cannot read target path '{left}': Symlink loop from '{left}'",
+    )
+    assert not (out / "report.json").exists()
 
 
 def test_csv_session_start_failure_is_a_read_error(monkeypatch, tmp_path, capsys):
