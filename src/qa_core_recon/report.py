@@ -419,7 +419,7 @@ def _key_diff_lines(details: dict) -> list[str]:
         for item in mismatches:
             lines.append(
                 f"- {_md(item['column'])} ({item['role']}). "
-                f"Source type: {item['source_type']}. Target type: {item['target_type']}."
+                f"Source type: {_md(item['source_type'])}. Target type: {_md(item['target_type'])}."
             )
         lines.append("")
     for rule in details["rules"]:

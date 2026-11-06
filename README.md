@@ -350,7 +350,7 @@ Parquet is read from a file or a directory, with `mergeSchema` off. The file sch
 
 Readers read every row. They do not sample, limit, or keep a head. `sampled: true` is refused even when the files contain a full extract, because the spec declared a sample.
 
-Blank amount cells are null. They are not turned into zero. `run` leaves a null amount out of the sum, and it counts null keys separately.
+Blank amount cells are null. They are not turned into zero. A blank cell is empty or holds only spaces and tabs. A cell that holds only a line break or a Unicode space such as U+00A0 is `inexact-amount`. `run` leaves a null amount out of the sum, and it counts null keys separately.
 
 A missing path, a missing S3 bucket or key, access denied, an S3 endpoint that cannot be reached, a CSV file that is not UTF-8, a malformed CSV row, or a file that Spark cannot read is a read error (`qa-core-recon: error:`), exit 2. It is not a refusal code. The message names the side and the path. It does not include a stack trace. A symlink loop in a source or target path is also a read error. The message is `cannot read <side> path ...: Symlink loop from ...`. It is not reported as a missing path, and it is not an unexpected error.
 
@@ -401,7 +401,7 @@ Each amount column is read as Spark `decimal(38, scale)`. 38 is Spark's maximum 
 
 Parsing is exact. A value is accepted when it equals the same number quantized to the spec scale. At scale 2, `10`, `10.5`, `10.50`, and `10.500` are exact (`10.00` or `10.50`). `10.005` is refused. Trailing zeros add no new information. Extra non-zero fractional digits would have to be rounded, and this tool does not invent a rounded amount. Equivalent spellings of one number, such as `100` and `1e2`, are the same value.
 
-A text amount is ASCII only: optional surrounding whitespace, an optional sign, digits, an optional fraction, and an optional exponent such as `1e2` or `+10.5`. `1_000`, Arabic-Indic digits, and fullwidth digits are `inexact-amount`.
+A text amount is ASCII only: optional surrounding spaces or tabs (not line breaks), an optional sign, digits, an optional fraction, and an optional exponent such as `1e2` or `+10.5`. `1_000`, Arabic-Indic digits, and fullwidth digits are `inexact-amount`.
 
 That refusal is `inexact-amount`, exit 2. It is not a mismatch. A mismatch means the target differs from the source, and exit 1 is reserved for `run`. A value that does not fit the declared scale gives the tool no amount to compare.
 

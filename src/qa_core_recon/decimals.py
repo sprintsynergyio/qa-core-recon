@@ -75,7 +75,7 @@ def to_decimal(raw: object, scale: int, cast: str | None) -> Decimal | None:
     if raw is None:
         return None
     if isinstance(raw, str):
-        if raw.strip() == "":
+        if raw.strip(" \t") == "":
             return None
         if _AMOUNT_TEXT.fullmatch(raw) is None:
             raise InexactAmount(raw.strip())

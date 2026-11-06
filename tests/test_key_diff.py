@@ -735,7 +735,7 @@ def test_float_and_double_are_a_type_mismatch(spark, tmp_path):
         }
     ]
     assert "Type mismatches." in markdown
-    assert "Source type: float. Target type: double." in markdown
+    assert "Source type: `float`. Target type: `double`." in markdown
 
 
 def test_string_key_does_not_join_a_wider_integer(spark, tmp_path):
@@ -1511,3 +1511,59 @@ def _note_schema(amount):
             StructField("note", StringType(), True),
         ]
     )
+
+
+def test_report_markdown_escapes_nested_field_names_in_type_mismatches(spark, tmp_path):
+    forged = "a\n\n## Forged\n\nStatus: Match\n<b>x</b>"
+    source_schema = StructType(
+        [
+            StructField("txn_id", StringType(), True),
+            StructField("note", StructType([StructField(forged, LongType(), True)]), True),
+        ]
+    )
+    target_schema = StructType(
+        [
+            StructField("txn_id", StringType(), True),
+            StructField("note", StringType(), True),
+        ]
+    )
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    _write_frame(spark, source, [("1", (1,))], source_schema)
+    _write_frame(spark, target, [("1", "x")], target_schema)
+    data = spec_data(tmp_path, source, target, source_format="parquet", target_format="parquet")
+    data.update(amounts=[], group_by=[], hash_columns=["note"], keys=["txn_id"])
+    spec = write_spec_file(tmp_path, data)
+    out = tmp_path / "out"
+    assert _invoke(spec, out) is ExitCode.MISMATCH
+    report, _raw, markdown = _load(out)
+    mismatch = _key_diff(report)["details"]["type_mismatches"][0]
+    assert mismatch["source_type"] == f"struct<{forged}:bigint>"
+    lines = markdown.splitlines()
+    assert "## Forged" not in lines
+    assert lines.count("Status: Match") == sum(
+        1 for check in report["checks"] if check["status"] == "match"
+    )
+    assert all(not line.startswith("<b>") for line in lines)
+    assert (
+        r"Source type: `struct<a\n\n## Forged\n\nStatus: Match\n<b>x</b>:bigint>`. "
+        "Target type: `string`."
+    ) in markdown
+
+
+def test_amount_cell_of_only_a_line_break_or_unicode_space_is_refused(spark, tmp_path):
+    source_schema = _note_schema(StringType())
+    target_schema = _note_schema(DecimalType(12, 2))
+    for label, cell in (("lf", "\n"), ("crlf", "\r\n"), ("nbsp", "\u00a0"), ("ls", "\u2028")):
+        source = tmp_path / label / "source"
+        target = tmp_path / label / "target"
+        _write_frame(spark, source, [("1", cell, "d", "a")], source_schema)
+        _write_frame(spark, target, [("1", None, "d", "a")], target_schema)
+        data = spec_data(tmp_path, source, target, source_format="parquet", target_format="parquet")
+        data.update(group_by=[], hash_columns=["note"], keys=["txn_id"])
+        spec = write_spec_file(tmp_path / label, data)
+        out = tmp_path / label / "out"
+        assert _invoke(spec, out) is ExitCode.REFUSED, label
+        report = _load(out)[0]
+        assert report["status"] == "refused", label
+        assert report["refusals"][0]["code"] == "inexact-amount", label
