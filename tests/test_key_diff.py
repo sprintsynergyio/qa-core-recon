@@ -1567,3 +1567,116 @@ def test_amount_cell_of_only_a_line_break_or_unicode_space_is_refused(spark, tmp
         report = _load(out)[0]
         assert report["status"] == "refused", label
         assert report["refusals"][0]["code"] == "inexact-amount", label
+
+
+def _typed_target(spark, path, rows, group_type):
+    schema = StructType(
+        [
+            StructField("txn_id", StringType(), True),
+            StructField("amount", DecimalType(12, 2), True),
+            StructField("day", group_type, True),
+            StructField("note", StringType(), True),
+        ]
+    )
+    _write_frame(spark, path, rows, schema)
+
+
+def _group_run(tmp_path, source_path, target_path, source_format, target_format, allow=None):
+    data = spec_data(
+        tmp_path,
+        source_path,
+        target_path,
+        source_format=source_format,
+        target_format=target_format,
+    )
+    if allow is not None:
+        data["allowlist"] = [str(allow)]
+    spec = write_spec_file(tmp_path, data)
+    out = tmp_path / "out"
+    code = _invoke(spec, out)
+    report, _raw, markdown = _load(out)
+    return code, report, markdown
+
+
+def test_csv_group_text_matches_a_typed_parquet_group(spark, tmp_path):
+    # A raw CSV day is a string. The curated Parquet day is a date. They are
+    # the same group, so a correct load is a match.
+    cases = {
+        "date": (
+            DateType(),
+            "1,10.50,2024-01-01,a\n2,1.25,2024-01-01,b\n3,5.00,2024-01-02,c\n",
+            [date(2024, 1, 1), date(2024, 1, 1), date(2024, 1, 2)],
+            [{"day": "2024-01-01"}, {"day": "2024-01-02"}],
+        ),
+        "long": (
+            LongType(),
+            "1,10.50,7,a\n2,1.25,7,b\n3,5.00,9,c\n",
+            [7, 7, 9],
+            [{"day": 7}, {"day": 9}],
+        ),
+        "decimal": (
+            DecimalType(10, 2),
+            "1,10.50,1.5,a\n2,1.25,1.50,b\n3,5.00,2,c\n",
+            [Decimal("1.50"), Decimal("1.50"), Decimal("2.00")],
+            [{"day": "1.50"}, {"day": "2.00"}],
+        ),
+        "timestamp": (
+            TimestampType(),
+            "1,10.50,2024-01-01 10:00:00,a\n2,1.25,2024-01-01 10:00:00,b\n"
+            "3,5.00,2024-01-02 00:00:00,c\n",
+            [_utc(2024, 1, 1, 10), _utc(2024, 1, 1, 10), _utc(2024, 1, 2)],
+            [{"day": "2024-01-01T10:00:00.000000Z"}, {"day": "2024-01-02T00:00:00.000000Z"}],
+        ),
+    }
+    notes = ["a", "b", "c"]
+    amounts = [Decimal("10.50"), Decimal("1.25"), Decimal("5.00")]
+    for name, (group_type, body, values, expected) in cases.items():
+        case = tmp_path / name
+        source = case / "source.csv"
+        target = case / "target"
+        write_csv(source, body)
+        rows = [(str(index + 1), amounts[index], values[index], notes[index]) for index in range(3)]
+        _typed_target(spark, target, rows, group_type)
+        for flipped in (False, True):
+            run_dir = case / ("flipped" if flipped else "forward")
+            run_dir.mkdir()
+            if flipped:
+                code, report, _md = _group_run(
+                    run_dir, target, source, "parquet", "csv", allow=case
+                )
+            else:
+                code, report, _md = _group_run(
+                    run_dir, source, target, "csv", "parquet", allow=case
+                )
+            assert code is ExitCode.MATCH, (name, flipped)
+            row_count = report["checks"][0]
+            assert row_count["status"] == "match", (name, flipped)
+            groups = [group["group"] for group in row_count["details"]["groups"]]
+            assert groups == expected, (name, flipped)
+            amount_sum = report["checks"][1]
+            assert amount_sum["status"] == "match", (name, flipped)
+
+
+def test_csv_group_text_that_does_not_parse_stays_its_own_group(spark, tmp_path):
+    source = tmp_path / "source.csv"
+    target = tmp_path / "target"
+    write_csv(source, "1,10.50,2024-01-01,a\n2,1.25,not-a-day,b\n")
+    _typed_target(
+        spark,
+        target,
+        [
+            ("1", Decimal("10.50"), date(2024, 1, 1), "a"),
+            ("2", Decimal("1.25"), date(2024, 1, 2), "b"),
+        ],
+        DateType(),
+    )
+    code, report, markdown = _group_run(tmp_path, source, target, "csv", "parquet")
+    assert code is ExitCode.MISMATCH
+    row_count = report["checks"][0]
+    assert row_count["status"] == "mismatch"
+    groups = {
+        group["group"]["day"]: (group["source"], group["target"])
+        for group in row_count["details"]["groups"]
+    }
+    assert groups == {"2024-01-01": (1, 1), "2024-01-02": (0, 1), "not-a-day": (1, 0)}
+    assert "`day`=`not-a-day`" in markdown
