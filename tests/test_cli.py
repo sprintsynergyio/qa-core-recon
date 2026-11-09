@@ -20,6 +20,52 @@ def test_version(capsys):
     assert capsys.readouterr().out == "qa-core-recon 0.1.0\n"
 
 
+_HELP_EXIT_CODES = (
+    "exit codes:\n"
+    "  0  init wrote the file, validate passed, or run matched.\n"
+    "  1  run found a difference. init and validate never use this code.\n"
+    "  2  refused, or a dataset or the output directory could not be used.\n"
+)
+
+
+def test_help_states_exit_codes():
+    result = subprocess.run(
+        [sys.executable, "-m", "qa_core_recon", "--help"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0
+    assert result.stderr == ""
+    assert _HELP_EXIT_CODES in result.stdout
+    assert "A missing command prints help to stderr and exits 2." in result.stdout
+
+
+@pytest.mark.parametrize("command", ["init", "validate", "run"])
+def test_command_help_states_exit_codes(command):
+    result = subprocess.run(
+        [sys.executable, "-m", "qa_core_recon", command, "--help"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0
+    assert result.stderr == ""
+    assert _HELP_EXIT_CODES in result.stdout
+    assert "A missing command" not in result.stdout
+
+
+def test_missing_command_prints_help_and_exits_refused(capsys):
+    code = main([])
+    captured = capsys.readouterr()
+    assert code is ExitCode.REFUSED
+    assert captured.out == ""
+    assert captured.err.startswith("usage: qa-core-recon")
+    assert _HELP_EXIT_CODES in captured.err
+    assert "A missing command prints help to stderr and exits 2." in captured.err
+    assert "Traceback" not in captured.err
+
+
 def test_version_via_python_m():
     result = subprocess.run(
         [sys.executable, "-m", "qa_core_recon", "--version"],

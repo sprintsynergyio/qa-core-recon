@@ -1,6 +1,6 @@
 # Releasing
 
-These steps publish `qa-core-recon` 0.1.0 to PyPI. The publish workflow uses a Trusted Publisher. It does not use an API token.
+These steps publish `qa-core-recon` 0.1.0 to PyPI. The publish workflow uses a Trusted Publisher. It does not use an API token. What this version ships, and what it leaves out, is in `docs/release-acceptance.md`.
 
 ## Check The Project Name
 

@@ -9,7 +9,8 @@ spec exit 0. The other cases exit 1. Reports are compared byte for byte with
 
 The report checks are row count, amount sum, null keys, duplicate keys, key
 diff, and changed columns. Missing, extra, and changed txn_id values appear
-in the key-diff and changed-column sections.
+in the key diff. A list longer than 20 examples keeps the full count and the
+first 20 ids in sorted order.
 """
 
 import ast
@@ -146,6 +147,36 @@ def _assert_report(out: Path, case: str, code, captured) -> None:
         assert by_name["changed_columns"]["status"] == "mismatch"
     elif case in {"match", "iceberg", "s3"}:
         assert all(item["status"] == "match" for item in report["checks"])
+    _assert_key_ids(case, by_name["key_diff"]["details"])
+
+
+def _example_ids(payload: dict) -> list[str]:
+    return [row[0] for row in payload["examples"]]
+
+
+def _assert_key_ids(case: str, details: dict) -> None:
+    """The difference cases name the txn ids the generator wrote."""
+    missing = details["missing"]
+    extra = details["extra"]
+    changed = details["changed"]
+    if case == "missing-rows":
+        assert missing["count"] == 40
+        assert _example_ids(missing) == [f"TXN{index:06d}" for index in range(1, 97, 5)]
+        assert extra["count"] == 0 and changed["count"] == 0
+    elif case == "extra-rows":
+        assert extra["count"] == 3
+        assert _example_ids(extra) == ["TXN900001", "TXN900002", "TXN900003"]
+        assert missing["count"] == 0 and changed["count"] == 0
+    elif case == "changed-rows":
+        assert changed["count"] == 5
+        assert _example_ids(changed) == [f"TXN{index:06d}" for index in range(1, 6)]
+        assert missing["count"] == 0 and extra["count"] == 0
+    elif case == "sum-mismatch":
+        assert changed["count"] == 200
+        assert _example_ids(changed) == [f"TXN{index:06d}" for index in range(1, 21)]
+        assert missing["count"] == 0 and extra["count"] == 0
+    elif case in {"match", "iceberg", "s3"}:
+        assert missing["count"] == extra["count"] == changed["count"] == 0
 
 
 def _run(case: str, out: Path):
