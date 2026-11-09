@@ -22,7 +22,7 @@ The README Quick Start, the refusal summary, and `--help` were corrected so they
 | Item | v0.1 behavior | Decision |
 | ---- | ------------- | -------- |
 | Order | Row count, amount sum, null keys, duplicate keys, key diff, changed columns. A mismatch does not skip the later checks. | Shipped. |
-| Row count | Totals, and one row per `group_by` value. A group missing on either side is a mismatch. | Shipped. |
+| Row count | Totals, and one row per `group_by` value. A group missing on either side is a mismatch. A string group column is parsed into the other side's type (CSV text against a Parquet date, timestamp, integer, or decimal), with the compared-column rules. A string that does not parse stays its own group. | Shipped. `tests/test_key_diff.py` (`test_csv_group_text_*`). |
 | Amount sum | Exact `decimal(38, scale)` per total and per group. Null amounts are left out. Two null sums match. Tolerance applies to each sum on its own, not to the key diff. | Shipped. |
 | Null keys | Any null in a key column is a mismatch. The report gives both counts. Those rows are excluded from the key diff. | Shipped. `tests/test_run.py`, `tests/test_key_diff.py`. The demo rows have no null keys. |
 | Duplicate keys | Any duplicated key value is a mismatch. The count is complete. Examples are the first 20 in sorted order, nulls first. | Shipped. The demo rows have no duplicate keys. |

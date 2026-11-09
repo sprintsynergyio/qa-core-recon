@@ -178,6 +178,33 @@ def example_key(plan: FieldPlan, side: str) -> Column:
     return format_example_value(_column(plan.name), _dtype(plan, side))
 
 
+def group_value(plan: FieldPlan, side: str) -> tuple[Column, Column | None]:
+    """Return the group column for one side, and a parse flag or None.
+
+    A ``group_by`` column that is a string on this side and a parsable type on
+    the other side is parsed into the other side's type, with the same rules
+    as a compared column: surrounding spaces are allowed and a decimal must be
+    exact at the other side's scale. The flag is true when the parse succeeded.
+    When it is false the caller keeps the raw string, so a value that does not
+    parse stays its own group and the row count reports it. Every other column
+    is returned as it is, with timestamps formatted under the UTC session.
+    """
+    if plan.kind == "parse" and plan.string_side == side:
+        typed = _other_type(plan, side)
+        column = _column(plan.name)
+        if isinstance(typed, DecimalType):
+            payload = _DECIMAL_PAYLOAD(trim(column), lit(typed.precision), lit(typed.scale))
+            parsed = when(payload.isNotNull(), payload).cast(
+                DecimalType(typed.precision, typed.scale)
+            )
+            ok = column.isNotNull() & payload.isNotNull()
+        else:
+            parsed, ok = _parse(plan.name, typed, lossless=False)
+            ok = column.isNotNull() & ok
+        return format_example_value(parsed, typed), ok
+    return format_example_value(_column(plan.name), _dtype(plan, side)), None
+
+
 def format_example_value(column: Column, dtype: DataType) -> Column:
     """Format a timestamp for an example. Other types stay as they are."""
     if isinstance(dtype, TimestampNTZType):

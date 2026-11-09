@@ -54,6 +54,7 @@ from pyspark.sql.functions import sum as spark_sum
 from qa_core_recon.alignment import (
     example_key,
     format_example_value,
+    group_value,
     join_key,
     plan_fields,
     type_mismatches,
@@ -124,8 +125,11 @@ def execute_checks(
     source = source.cache()
     target = target.cache()
     try:
-        source_side = _profile(source, spec, "source")
-        target_side = _profile(target, spec, "target")
+        group_plans = plan_fields(
+            _field_types(source), _field_types(target), spec.group_by, "group"
+        )
+        source_side = _profile(source, spec, "source", group_plans)
+        target_side = _profile(target, spec, "target", group_plans)
         nulls = {
             "source": _null_key_count(source, spec),
             "target": _null_key_count(target, spec),
@@ -154,9 +158,9 @@ def execute_checks(
     return checks, {"source": source_side.rows, "target": target_side.rows}
 
 
-def _profile(frame: DataFrame, spec: Spec, side: str) -> _Side:
+def _profile(frame: DataFrame, spec: Spec, side: str, group_plans: tuple) -> _Side:
     if spec.group_by:
-        groups = _aggregate_groups(frame, spec, side)
+        groups = _aggregate_groups(frame, spec, side, group_plans)
         rows, sums = _totals_from_groups(groups, spec, side)
         return _Side(rows=rows, sums=sums, groups=tuple(groups))
     rows, sums = _aggregate_total(frame, spec, side)
@@ -175,24 +179,43 @@ def _aggregate_total(
     return rows, _accept_all(sums, spec, side, group=False)
 
 
-def _aggregate_groups(frame: DataFrame, spec: Spec, side: str) -> list[_GroupSum]:
+def _aggregate_groups(
+    frame: DataFrame, spec: Spec, side: str, group_plans: tuple
+) -> list[_GroupSum]:
     group_names = list(spec.group_by)
     amount_names = [amount.column for amount in spec.amounts]
     width = len(group_names)
     # Format timestamps in Spark. A collected TimestampType is a naive local
-    # datetime, so the group text would follow the host zone.
-    types = _field_types(frame)
-    group_columns = [
-        format_example_value(_column(name), types[name]).alias(name) for name in group_names
-    ]
+    # datetime, so the group text would follow the host zone. A string group
+    # column is parsed into the other side's type, so a CSV day such as
+    # 2024-01-01 is the same group as a Parquet date. A value that does not
+    # parse keeps its raw text and stays its own group.
+    group_columns = []
+    parse_columns = []
+    parsed_at = []
+    for index, plan in enumerate(group_plans):
+        value, ok = group_value(plan, side)
+        group_columns.append(value.alias(f"__qa_group_{index}"))
+        if ok is not None:
+            raw = _column(plan.name).alias(f"__qa_group_raw_{index}")
+            parse_columns.extend([ok.alias(f"__qa_group_ok_{index}"), raw])
+            parsed_at.append(index)
     amount_columns = [_column(name) for name in amount_names]
-    selected = frame.select(*group_columns, *amount_columns)
+    selected = frame.select(*group_columns, *amount_columns, *parse_columns)
+    amount_end = width + len(amount_names)
+    parsed_positions = tuple(parsed_at)
 
     def to_pair(row):
         values = tuple(row)
+        keys = list(values[:width])
+        extra = values[amount_end:]
+        for offset, index in enumerate(parsed_positions):
+            ok, raw = extra[2 * offset], extra[2 * offset + 1]
+            if not ok:
+                keys[index] = raw
         # NaN is not equal to itself, so each raw NaN would be its own group.
-        key = tuple(normalize_group_value(value) for value in values[:width])
-        return key, values[width:]
+        key = tuple(normalize_group_value(value) for value in keys)
+        return key, values[width:amount_end]
 
     def create(amounts):
         return _merge_row(_empty_state(len(amount_names)), tuple(amounts))

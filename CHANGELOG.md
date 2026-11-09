@@ -16,6 +16,7 @@ First release.
 
 - Checks, in order: row count, amount sum, null keys, duplicate keys, key diff, and changed columns. A mismatch does not skip later checks.
 - Row counts and amount sums are reported for the whole side and for each `group_by` value.
+- A `group_by` column that is a string on one side and a typed column on the other (a raw CSV against a typed Parquet or Iceberg table) is parsed into the typed side's type before grouping, so a CSV `2024-01-01` and a Parquet date are one group. A string that does not parse stays its own group.
 - Amounts are exact decimals at the spec scale. A YAML float or integer tolerance is rejected. Null amounts are left out of a sum. A blank amount cell is empty or holds only spaces and tabs. A cell that is only a line break or a Unicode space is `inexact-amount`.
 - An optional `cast` of `half-even` or `half-up` applies only to a Parquet or Iceberg float or double amount.
 - Tolerance is a quoted decimal. It applies to each total and each group sum on its own. It does not apply to the row hash or the key diff.
