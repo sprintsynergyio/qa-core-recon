@@ -28,3 +28,6 @@ jobs:
       - run: ruff check .
       - run: ruff format --check .
       - run: pytest -q
+      - run: python -m build
+      - run: twine check dist/*
+      - run: python scripts/check_distributions.py

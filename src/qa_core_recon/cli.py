@@ -12,6 +12,14 @@ from qa_core_recon.spec import SpecError, load_spec, uses_s3
 
 PROG = "qa-core-recon"
 DEFAULT_SPEC_PATH = "recon.yaml"
+# Shown by --help. The wording matches the Exit Codes section of the README.
+_EXIT_CODES = """\
+exit codes:
+  0  init wrote the file, validate passed, or run matched.
+  1  run found a difference. init and validate never use this code.
+  2  refused, or a dataset or the output directory could not be used.
+"""
+_MISSING_COMMAND = "A missing command prints help to stderr and exits 2.\n"
 
 
 def load_template() -> bytes:
@@ -218,19 +226,32 @@ def _validate(args: argparse.Namespace) -> ExitCode:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog=PROG, description="Prove a target dataset matches its source."
+        prog=PROG,
+        description="Prove a target dataset matches its source.",
+        epilog=_EXIT_CODES + _MISSING_COMMAND,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--version", action="store_true", help="print the version and exit")
     commands = parser.add_subparsers(dest="command", metavar="COMMAND")
 
-    init = commands.add_parser("init", help="write a recon.yaml spec template")
+    init = commands.add_parser(
+        "init",
+        help="write a recon.yaml spec template",
+        epilog=_EXIT_CODES,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     init.add_argument(
         "--path", default=DEFAULT_SPEC_PATH, help=f"file to write (default: {DEFAULT_SPEC_PATH})"
     )
     init.add_argument("--force", action="store_true", help="overwrite the file if it exists")
     init.set_defaults(handler=_init)
 
-    validate = commands.add_parser("validate", help="check that a recon.yaml spec is usable")
+    validate = commands.add_parser(
+        "validate",
+        help="check that a recon.yaml spec is usable",
+        epilog=_EXIT_CODES,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     validate.add_argument("--spec", required=True, help="path to the spec file")
     validate.add_argument(
         "--check-data",
@@ -239,7 +260,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     validate.set_defaults(handler=_validate)
 
-    run = commands.add_parser("run", help="compare source and target and write a report")
+    run = commands.add_parser(
+        "run",
+        help="compare source and target and write a report",
+        epilog=_EXIT_CODES,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     run.add_argument("--spec", required=True, help="path to the spec file")
     run.add_argument("--out", required=True, help="directory for report.json and report.md")
     run.add_argument(

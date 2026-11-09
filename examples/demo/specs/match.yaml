@@ -1,0 +1,28 @@
+# Made-up payments. The source and the target are the same rows.
+version: 1
+
+source:
+  path: examples/demo/data/match/source.csv
+  format: csv
+
+target:
+  path: examples/demo/data/match/target.csv
+  format: csv
+
+keys: [txn_id]
+
+amounts:
+  - column: amount
+    scale: 2
+
+group_by: [txn_date]
+
+hash_columns: [account_id, txn_type, amount, currency, txn_date]
+
+tolerance:
+  value: "0"
+  reason: ""
+
+sampled: false
+
+allowlist: ["examples/demo/data"]

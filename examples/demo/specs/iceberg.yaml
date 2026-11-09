@@ -1,0 +1,31 @@
+# CSV source and Iceberg target for the matching payments rows.
+# The test builds the warehouse at target.path from the matching CSV.
+# That warehouse is not committed. Iceberg metadata changes between writes.
+version: 1
+
+source:
+  path: examples/demo/data/match/source.csv
+  format: csv
+
+target:
+  path: examples/demo/data/iceberg/warehouse
+  format: iceberg
+  table: payments.txn
+
+keys: [txn_id]
+
+amounts:
+  - column: amount
+    scale: 2
+
+group_by: [txn_date]
+
+hash_columns: [account_id, txn_type, amount, currency, txn_date]
+
+tolerance:
+  value: "0"
+  reason: ""
+
+sampled: false
+
+allowlist: ["examples/demo/data"]

@@ -7,11 +7,36 @@ name = "qa-core-recon"
 dynamic = ["version"]
 description = "Prove a target dataset matches its source after a Glue or PySpark job."
 readme = "README.md"
-requires-python = ">=3.11,<3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+authors = [{ name = "SprintSynergy", email = "usman@sprintsynergy.com" }]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Topic :: Software Development :: Quality Assurance",
+  "Topic :: Software Development :: Testing",
+]
 dependencies = ["pyyaml>=6", "pyspark>=3.5,<3.6"]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "ruff>=0.6", "moto[server]>=5.0,<6"]
+dev = [
+  "pytest>=8",
+  "ruff>=0.6",
+  "moto[server]>=5.0,<6",
+  "build>=1.2",
+  "twine>=5",
+]
+
+[project.urls]
+Homepage = "https://github.com/sprintsynergyio/qa-core-recon"
+Repository = "https://github.com/sprintsynergyio/qa-core-recon"
+Issues = "https://github.com/sprintsynergyio/qa-core-recon/issues"
+Changelog = "https://github.com/sprintsynergyio/qa-core-recon/blob/main/CHANGELOG.md"
 
 [project.scripts]
 qa-core-recon = "qa_core_recon.cli:main"
@@ -21,6 +46,12 @@ path = "src/qa_core_recon/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/qa_core_recon"]
+
+[tool.hatch.build.targets.sdist]
+exclude = [
+  "examples/demo/data/iceberg",
+  "examples/demo/out",
+]
 
 [tool.ruff]
 line-length = 100

@@ -2,14 +2,61 @@
 
 Prove that a target dataset matches its source after a Glue or PySpark job, using deterministic checks. No AI model decides pass or fail.
 
-**Status: key diff and S3 reads.** `--version`, `init`, `validate`, and `run` work. `validate --check-data` and `run` open CSV, Parquet, and Iceberg on local disk and on S3. `run` compares row counts, amount sums, null keys, duplicate keys, and the key diff, and writes `report.json` and `report.md`. The demo is not in this release.
+**Status: key diff, S3 reads, and a synthetic demo.** `--version`, `init`, `validate`, and `run` work. `validate --check-data` and `run` open CSV, Parquet, and Iceberg on local disk and on S3. `run` compares row counts, amount sums, null keys, duplicate keys, the key diff, and changed columns, and writes `report.json` and `report.md`. The made-up demo dataset is under `examples/demo`.
+
+## Quick Start
+
+The demo uses a made-up payments dataset of a few hundred rows. From the repository root, install the package, generate the CSV files, run the matching spec, and read the report.
+
+### Install
+
+Requires Python 3.11 and Java 17.
+
+```bash
+python3.11 -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev]"
+```
+
+### Generate
+
+```bash
+python examples/demo/generate.py
+```
+
+The generator uses the Python standard library and a fixed seed. Every run writes the same bytes. The files under `examples/demo/data/` are that output.
+
+### Run
+
+```bash
+qa-core-recon run --spec examples/demo/specs/match.yaml --out /tmp/qa-core-recon-match
+```
+
+The command prints `match` and exits 0. `report.json` and `report.md` are in `/tmp/qa-core-recon-match`.
+
+These specs exit 1. Each key-diff list holds at most 20 examples. The count in the report is the full number.
+
+- `examples/demo/specs/missing-rows.yaml` drops every target row dated 2024-03-01. The row count, the amount sum, and the key diff all differ. Forty `txn_id` values are missing. The report lists the first 20, from `TXN000001` through `TXN000096` in steps of 5.
+- `examples/demo/specs/extra-rows.yaml` adds three target rows on 2024-03-06. The row count, the amount sum, and the key diff all differ. The report lists `TXN900001`, `TXN900002`, and `TXN900003`.
+- `examples/demo/specs/changed-rows.yaml` keeps every `txn_id` and changes the amount and `txn_type` on `TXN000001` through `TXN000005`. The row count matches. The amount sum, the key diff, and the changed-column check differ. The report lists those five `txn_id` values.
+- `examples/demo/specs/sum-mismatch.yaml` adds 0.50 to every target amount. The row count matches. The amount sum, the key diff, and the changed-column check differ. All 200 keys are changed. The report lists the first 20, `TXN000001` through `TXN000020`.
+
+`examples/demo/specs/iceberg.yaml` compares the matching CSV with an Iceberg table of the same rows. `examples/demo/specs/s3.yaml` reads that same pair from `s3://demo-bucket`. The tests build the Iceberg table and upload the CSV files to moto. The commands above use the local match spec.
+
+### Read The Report
+
+```bash
+cat /tmp/qa-core-recon-match/report.md
+```
+
+`report.json` is the same result as canonical JSON: sorted keys, indent 2, and one trailing newline. Headings in `report.md` are Title Case. The files have no timestamp. `spec_sha256` is the SHA-256 of the spec file you passed. Difference cases list missing, extra, and changed `txn_id` values under the key diff and the changed-column check. Each of those lists stops at 20 examples. The count next to the list is the full number.
 
 ## Install From Source
 
 Requires Python 3.11 and Java 17. Java 17 is the runtime AWS Glue 5.0 uses with Spark 3.5.
 
 ```bash
-git clone https://github.com/sprintsynergyhq/qa-core-recon.git
+git clone https://github.com/sprintsynergyio/qa-core-recon.git
 cd qa-core-recon
 python3.11 -m venv .venv
 source .venv/bin/activate
@@ -287,6 +334,8 @@ No compared column differs.
 | 1 | `MISMATCH` | `run` found a difference. At least one check did not match. |
 | 2 | `REFUSED` | The tool declined to run, or the input or the output directory could not be used, so there is no comparison result. A refusal still writes a report. A read error does not. |
 
+`qa-core-recon --help`, and the `--help` text for `init`, `validate`, and `run`, print these codes and exit 0. Running `qa-core-recon` with no command prints that help to stderr and exits 2.
+
 `init` and `validate` use codes 0 and 2 only. `--check-data` is part of `validate`, so it stays on those codes too. `run` uses 0, 1, and 2. An amount that cannot be represented at the spec scale is a refusal, exit 2, because the tool has no decimal to compare. A sum that does not fit `decimal(38, scale)` is a read error on `run`, exit 2, because a rounded total would be a wrong number. `init` and `validate` never return code 1.
 
 A malformed spec, a refusal, an unreadable spec file, an unreadable dataset, and any unexpected error all exit with code 2. An unexpected error inside the CLI is caught, printed as one `qa-core-recon: error:` line on stderr, and exits with code 2. The CLI prints no traceback.
@@ -295,12 +344,12 @@ A malformed spec, a refusal, an unreadable spec file, an unreadable dataset, and
 
 | Code | Meaning |
 | ---- | ------- |
-| `missing-key` | the spec has no business key, or the key is not unique and no rule says how to handle that. |
+| `missing-key` | `keys` is absent, null, or empty. A key that is not unique is a duplicate-key mismatch on `run`, not this refusal. |
 | `float-amount` | an amount column is float or double and the spec has no cast rule to a decimal scale. |
 | `inexact-amount` | an amount value is not an exact decimal at the spec scale, or the column type is not a number type. |
 | `tolerance-without-reason` | a tolerance above zero is set with no written reason. |
 | `unmapped-column` | a column named in the spec is missing from the source or the target. |
-| `path-not-allowed` | a path is outside the allowlist (local disk and the moto S3 bucket in the MVP). |
+| `path-not-allowed` | a path is outside the allowlist. An entry is a local path or an `s3://` URI. |
 | `sample-only` | the input was sampled, so a full reconciliation cannot be claimed. |
 
 `validate` enforces the spec-level codes. `validate --check-data` also enforces the data-level codes. The same file always prints the same line.

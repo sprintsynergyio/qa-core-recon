@@ -1,0 +1,28 @@
+# TXN000001 through TXN000005 keep their keys. The amount and txn_type change.
+version: 1
+
+source:
+  path: examples/demo/data/changed-rows/source.csv
+  format: csv
+
+target:
+  path: examples/demo/data/changed-rows/target.csv
+  format: csv
+
+keys: [txn_id]
+
+amounts:
+  - column: amount
+    scale: 2
+
+group_by: [txn_date]
+
+hash_columns: [account_id, txn_type, amount, currency, txn_date]
+
+tolerance:
+  value: "0"
+  reason: ""
+
+sampled: false
+
+allowlist: ["examples/demo/data"]

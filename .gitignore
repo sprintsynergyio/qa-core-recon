@@ -20,3 +20,7 @@ htmlcov/
 spark-warehouse/
 metastore_db/
 derby.log
+
+# Demo output and the Iceberg warehouse the demo test builds
+examples/demo/out/
+examples/demo/data/iceberg/

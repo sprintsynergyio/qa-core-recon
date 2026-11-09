@@ -1,0 +1,28 @@
+# Every target amount is 0.50 higher than the source. The row count matches.
+version: 1
+
+source:
+  path: examples/demo/data/sum-mismatch/source.csv
+  format: csv
+
+target:
+  path: examples/demo/data/sum-mismatch/target.csv
+  format: csv
+
+keys: [txn_id]
+
+amounts:
+  - column: amount
+    scale: 2
+
+group_by: [txn_date]
+
+hash_columns: [account_id, txn_type, amount, currency, txn_date]
+
+tolerance:
+  value: "0"
+  reason: ""
+
+sampled: false
+
+allowlist: ["examples/demo/data"]

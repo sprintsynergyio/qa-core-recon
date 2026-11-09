@@ -1,0 +1,28 @@
+# The target drops every row dated 2024-03-01.
+version: 1
+
+source:
+  path: examples/demo/data/missing-rows/source.csv
+  format: csv
+
+target:
+  path: examples/demo/data/missing-rows/target.csv
+  format: csv
+
+keys: [txn_id]
+
+amounts:
+  - column: amount
+    scale: 2
+
+group_by: [txn_date]
+
+hash_columns: [account_id, txn_type, amount, currency, txn_date]
+
+tolerance:
+  value: "0"
+  reason: ""
+
+sampled: false
+
+allowlist: ["examples/demo/data"]

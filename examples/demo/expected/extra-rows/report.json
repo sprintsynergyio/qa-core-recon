@@ -1,0 +1,251 @@
+{
+  "checks": [
+    {
+      "details": {
+        "group_by": [
+          "txn_date"
+        ],
+        "groups": [
+          {
+            "group": {
+              "txn_date": "2024-03-01"
+            },
+            "missing": null,
+            "source": 40,
+            "status": "match",
+            "target": 40
+          },
+          {
+            "group": {
+              "txn_date": "2024-03-02"
+            },
+            "missing": null,
+            "source": 40,
+            "status": "match",
+            "target": 40
+          },
+          {
+            "group": {
+              "txn_date": "2024-03-03"
+            },
+            "missing": null,
+            "source": 40,
+            "status": "match",
+            "target": 40
+          },
+          {
+            "group": {
+              "txn_date": "2024-03-04"
+            },
+            "missing": null,
+            "source": 40,
+            "status": "match",
+            "target": 40
+          },
+          {
+            "group": {
+              "txn_date": "2024-03-05"
+            },
+            "missing": null,
+            "source": 40,
+            "status": "match",
+            "target": 40
+          },
+          {
+            "group": {
+              "txn_date": "2024-03-06"
+            },
+            "missing": "source",
+            "source": 0,
+            "status": "mismatch",
+            "target": 3
+          }
+        ],
+        "source": 200,
+        "target": 203
+      },
+      "name": "row_count",
+      "status": "mismatch"
+    },
+    {
+      "details": {
+        "columns": [
+          {
+            "column": "amount",
+            "difference": "80.75",
+            "groups": [
+              {
+                "difference": "0.00",
+                "group": {
+                  "txn_date": "2024-03-01"
+                },
+                "missing": null,
+                "source": "24088.22",
+                "status": "match",
+                "target": "24088.22"
+              },
+              {
+                "difference": "0.00",
+                "group": {
+                  "txn_date": "2024-03-02"
+                },
+                "missing": null,
+                "source": "27138.71",
+                "status": "match",
+                "target": "27138.71"
+              },
+              {
+                "difference": "0.00",
+                "group": {
+                  "txn_date": "2024-03-03"
+                },
+                "missing": null,
+                "source": "19067.29",
+                "status": "match",
+                "target": "19067.29"
+              },
+              {
+                "difference": "0.00",
+                "group": {
+                  "txn_date": "2024-03-04"
+                },
+                "missing": null,
+                "source": "18979.63",
+                "status": "match",
+                "target": "18979.63"
+              },
+              {
+                "difference": "0.00",
+                "group": {
+                  "txn_date": "2024-03-05"
+                },
+                "missing": null,
+                "source": "21243.33",
+                "status": "match",
+                "target": "21243.33"
+              },
+              {
+                "difference": null,
+                "group": {
+                  "txn_date": "2024-03-06"
+                },
+                "missing": "source",
+                "source": null,
+                "status": "mismatch",
+                "target": "80.75"
+              }
+            ],
+            "reason": "",
+            "scale": 2,
+            "source": "110517.18",
+            "status": "mismatch",
+            "target": "110597.93",
+            "tolerance": "0"
+          }
+        ]
+      },
+      "name": "amount_sum",
+      "status": "mismatch"
+    },
+    {
+      "details": {
+        "keys": [
+          "txn_id"
+        ],
+        "source": 0,
+        "target": 0
+      },
+      "name": "null_keys",
+      "status": "match"
+    },
+    {
+      "details": {
+        "example_limit": 20,
+        "keys": [
+          "txn_id"
+        ],
+        "source": {
+          "count": 0,
+          "examples": []
+        },
+        "target": {
+          "count": 0,
+          "examples": []
+        }
+      },
+      "name": "duplicate_keys",
+      "status": "match"
+    },
+    {
+      "details": {
+        "changed": {
+          "count": 0,
+          "examples": []
+        },
+        "changed_detection": null,
+        "columns": [
+          "account_id",
+          "amount",
+          "currency",
+          "txn_date",
+          "txn_type"
+        ],
+        "counting": "distinct_key",
+        "duplicates_present": false,
+        "example_limit": 20,
+        "extra": {
+          "count": 3,
+          "examples": [
+            [
+              "TXN900001"
+            ],
+            [
+              "TXN900002"
+            ],
+            [
+              "TXN900003"
+            ]
+          ]
+        },
+        "keys": [
+          "txn_id"
+        ],
+        "missing": {
+          "count": 0,
+          "examples": []
+        },
+        "null_keys": "excluded",
+        "rules": [
+          "Rows with a null in any key column are excluded.",
+          "Counts are by distinct key value.",
+          "When a key is duplicated, the row with the smallest row hash is used."
+        ],
+        "type_mismatches": []
+      },
+      "name": "key_diff",
+      "status": "mismatch"
+    },
+    {
+      "details": {
+        "columns": [],
+        "counting": "distinct_key",
+        "example_limit": 20,
+        "keys": [
+          "txn_id"
+        ],
+        "rule": "Each count is the number of distinct keys whose value differs. Examples are listed in sorted order. When a key is duplicated, the compared row is the one with the smallest row hash."
+      },
+      "name": "changed_columns",
+      "status": "match"
+    }
+  ],
+  "refusals": [],
+  "row_counts": {
+    "source": 200,
+    "target": 203
+  },
+  "spec_sha256": "a9b3ae8ad899741f58d92fab9692db89d16261d5c71962bbdc63020a287ec50c",
+  "status": "mismatch",
+  "tool": "qa-core-recon",
+  "version": "0.1.0"
+}
