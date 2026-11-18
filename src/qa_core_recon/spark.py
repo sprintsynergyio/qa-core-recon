@@ -80,6 +80,10 @@ JAR_DOWNLOAD_CONNECT_TIMEOUT_SECONDS = 10
 JAR_DOWNLOAD_STALL_TIMEOUT_SECONDS = 30
 # Small enough that a drip is noticed between reads, not after a full megabyte.
 JAR_DOWNLOAD_CHUNK_BYTES = 64 * 1024
+# Fail when a 60 second stretch of the body delivers less than 64 KiB.
+# That is about 1.1 KB/s. A 0.5 MB/s link stays above it.
+JAR_DOWNLOAD_MIN_SPEED_BYTES = 64 * 1024
+JAR_DOWNLOAD_MIN_SPEED_WINDOW_SECONDS = 60
 
 # SHA-256 of the jar bytes on Maven Central. Each value was checked against
 # Central's published .sha1 file. The Iceberg runtime also has a published
@@ -342,6 +346,13 @@ def _stall_timeout() -> TimeoutError:
     return TimeoutError(f"no bytes received for {JAR_DOWNLOAD_STALL_TIMEOUT_SECONDS} seconds")
 
 
+def _too_slow() -> TimeoutError:
+    return TimeoutError(
+        f"fewer than {JAR_DOWNLOAD_MIN_SPEED_BYTES} bytes arrived "
+        f"in {JAR_DOWNLOAD_MIN_SPEED_WINDOW_SECONDS} seconds"
+    )
+
+
 def _touch_download(path: Path) -> None:
     """Refresh ``path`` so a sweep does not treat a live download as stale."""
     try:
@@ -388,8 +399,11 @@ def _copy_download(url: str, handle, temp_path: Path) -> None:
     ``JAR_DOWNLOAD_CONNECT_TIMEOUT_SECONDS``. After that, each read is at
     most ``JAR_DOWNLOAD_CHUNK_BYTES`` and returns as soon as some bytes are
     available. The download fails when no bytes arrive for
-    ``JAR_DOWNLOAD_STALL_TIMEOUT_SECONDS``. There is no short cap on the
-    total time.
+    ``JAR_DOWNLOAD_STALL_TIMEOUT_SECONDS``, or when a stretch of
+    ``JAR_DOWNLOAD_MIN_SPEED_WINDOW_SECONDS`` delivers fewer than
+    ``JAR_DOWNLOAD_MIN_SPEED_BYTES``. A transfer that finishes before that
+    window ends is not failed for speed. There is no short cap on the total
+    time.
     """
     request = urllib.request.Request(url, headers={"User-Agent": "qa-core-recon"})
     try:
@@ -400,6 +414,8 @@ def _copy_download(url: str, handle, temp_path: Path) -> None:
     try:
         _set_read_timeout(response, JAR_DOWNLOAD_STALL_TIMEOUT_SECONDS)
         last_byte = time.monotonic()
+        window_started = last_byte
+        window_bytes = 0
         while True:
             if time.monotonic() - last_byte > JAR_DOWNLOAD_STALL_TIMEOUT_SECONDS:
                 raise _stall_timeout()
@@ -411,7 +427,14 @@ def _copy_download(url: str, handle, temp_path: Path) -> None:
             if not chunk:
                 return
             handle.write(chunk)
-            last_byte = time.monotonic()
+            now = time.monotonic()
+            last_byte = now
+            window_bytes += len(chunk)
+            if now - window_started >= JAR_DOWNLOAD_MIN_SPEED_WINDOW_SECONDS:
+                if window_bytes < JAR_DOWNLOAD_MIN_SPEED_BYTES:
+                    raise _too_slow()
+                window_started = now
+                window_bytes = 0
     finally:
         response.close()
 
@@ -494,8 +517,11 @@ def _resolve_one(cache: Path, pin: PinnedJar) -> Path:
     stops the run. The bad file is left in place, and it is not replaced by a
     new download. A missing file is downloaded to a private temp file, hashed,
     and moved into place only when the hash matches. If another run publishes
-    a valid file while this download is in progress, that file is used.
+    a     valid file while this download is in progress, that file is used.
+    A warm cache still drops this jar's stale temp files. A temp file for
+    another jar is left alone.
     """
+    _sweep_stale_downloads(cache / "jars", pin.filename)
     ready = _ready_jar(cache, pin)
     if ready is not None:
         return ready

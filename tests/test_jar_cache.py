@@ -17,6 +17,8 @@ from qa_core_recon.exit_codes import ExitCode
 from qa_core_recon.spark import (
     ICEBERG_RUNTIME_JAR,
     JAR_DOWNLOAD_CONNECT_TIMEOUT_SECONDS,
+    JAR_DOWNLOAD_MIN_SPEED_BYTES,
+    JAR_DOWNLOAD_MIN_SPEED_WINDOW_SECONDS,
     JAR_DOWNLOAD_STALL_TIMEOUT_SECONDS,
     PinnedJar,
     SessionStartError,
@@ -144,6 +146,8 @@ def test_download_timeouts_are_a_connect_limit_and_a_stall_limit():
     assert JAR_DOWNLOAD_CONNECT_TIMEOUT_SECONDS == 10
     assert JAR_DOWNLOAD_STALL_TIMEOUT_SECONDS == 30
     assert JAR_DOWNLOAD_STALL_TIMEOUT_SECONDS > JAR_DOWNLOAD_CONNECT_TIMEOUT_SECONDS
+    assert JAR_DOWNLOAD_MIN_SPEED_BYTES == 64 * 1024
+    assert JAR_DOWNLOAD_MIN_SPEED_WINDOW_SECONDS == 60
 
 
 def test_concurrent_processes_share_a_cold_cache(tmp_path):
@@ -594,5 +598,128 @@ def test_live_download_touches_its_temp_file(tmp_path, monkeypatch):
         assert not thread.is_alive()
         assert "error" not in outcome
         assert outcome["path"].read_bytes() == body
+    finally:
+        _stop_mirror(server)
+
+
+def _warm_jar(cache: Path, pin: PinnedJar, body: bytes) -> Path:
+    jar = cache / "jars" / pin.filename
+    jar.parent.mkdir(parents=True, exist_ok=True)
+    jar.write_bytes(body)
+    return jar
+
+
+def _temp_file(cache: Path, pin: PinnedJar, middle: str, payload: bytes) -> Path:
+    path = cache / "jars" / f".{pin.filename}.{middle}.download"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(payload)
+    return path
+
+
+def _age_file(path: Path, seconds_ago: float) -> None:
+    when = time.time() - seconds_ago
+    os.utime(path, (when, when))
+
+
+def test_warm_cache_removes_a_stale_temp_file(tmp_path):
+    import qa_core_recon.spark as spark_mod
+
+    pin, body = _pin("org.example", "alpha", b"warm-jar-bytes")
+    cache = tmp_path / "ivy"
+    jar = _warm_jar(cache, pin, body)
+    stale = _temp_file(cache, pin, "killed", b"leftover" * 1000)
+    _age_file(stale, JAR_DOWNLOAD_STALL_TIMEOUT_SECONDS + 5)
+    path = spark_mod._resolve_one(cache, pin)
+    assert path == jar
+    assert jar.read_bytes() == body
+    assert not stale.exists()
+
+
+def test_warm_cache_keeps_a_fresh_temp_file(tmp_path):
+    import qa_core_recon.spark as spark_mod
+
+    pin, body = _pin("org.example", "alpha", b"warm-jar-bytes")
+    cache = tmp_path / "ivy"
+    _warm_jar(cache, pin, body)
+    fresh = _temp_file(cache, pin, "stilllive", b"in-progress")
+    spark_mod._resolve_one(cache, pin)
+    assert fresh.is_file()
+    assert fresh.read_bytes() == b"in-progress"
+
+
+def test_sweep_leaves_a_different_jars_stale_temp_file(tmp_path):
+    import qa_core_recon.spark as spark_mod
+
+    alpha, alpha_body = _pin("org.example", "alpha", b"alpha-warm")
+    beta, beta_body = _pin("org.example", "beta", b"beta-warm")
+    cache = tmp_path / "ivy"
+    _warm_jar(cache, alpha, alpha_body)
+    _warm_jar(cache, beta, beta_body)
+    foreign = _temp_file(cache, beta, "killed", b"beta-leftover")
+    _age_file(foreign, JAR_DOWNLOAD_STALL_TIMEOUT_SECONDS + 5)
+    spark_mod._resolve_one(cache, alpha)
+    assert foreign.is_file()
+    assert foreign.read_bytes() == b"beta-leftover"
+    spark_mod._resolve_one(cache, beta)
+    assert not foreign.exists()
+
+
+def test_slow_drip_fails_when_the_window_is_short_on_bytes(tmp_path, monkeypatch):
+    import qa_core_recon.spark as spark_mod
+
+    body = b"d" * 400
+    pin, _body = _pin("org.example", "alpha", body)
+    server, base = _mirror()
+    server.mode = "drip"
+    server.piece = 1
+    server.gap = 0.05
+    cache = tmp_path / "ivy"
+    monkeypatch.setattr(spark_mod, "MAVEN_CENTRAL", base)
+    monkeypatch.setattr(spark_mod, "JAR_DOWNLOAD_MIN_SPEED_WINDOW_SECONDS", 0.4)
+    monkeypatch.setattr(spark_mod, "JAR_DOWNLOAD_MIN_SPEED_BYTES", 64)
+    outcome: dict[str, object] = {}
+
+    def run() -> None:
+        try:
+            spark_mod._resolve_one(cache, pin)
+        except Exception as exc:
+            outcome["error"] = exc
+
+    try:
+        _publish(server, base, [(pin, body)])
+        started = time.monotonic()
+        thread = threading.Thread(target=run)
+        thread.start()
+        thread.join(timeout=2)
+        elapsed = time.monotonic() - started
+        assert not thread.is_alive()
+        error = outcome.get("error")
+        assert isinstance(error, SessionStartError)
+        assert "fewer than 64 bytes arrived in 0.4 seconds" in str(error)
+        assert elapsed < 2
+        assert not (cache / "jars" / pin.filename).exists()
+    finally:
+        _stop_mirror(server)
+
+
+def test_half_megabyte_per_second_stays_above_the_minimum_speed(tmp_path, monkeypatch):
+    import qa_core_recon.spark as spark_mod
+
+    piece = 64 * 1024
+    rate = 0.5 * 1024 * 1024
+    body = b"s" * (piece * 7)
+    pin, _body = _pin("org.example", "alpha", body)
+    server, base = _mirror()
+    server.mode = "throttle"
+    server.piece = piece
+    server.gap = piece / rate
+    cache = tmp_path / "ivy"
+    monkeypatch.setattr(spark_mod, "MAVEN_CENTRAL", base)
+    monkeypatch.setattr(spark_mod, "JAR_DOWNLOAD_MIN_SPEED_WINDOW_SECONDS", 0.5)
+    monkeypatch.setattr(spark_mod, "JAR_DOWNLOAD_MIN_SPEED_BYTES", 64 * 1024)
+    try:
+        _publish(server, base, [(pin, body)])
+        path = spark_mod._resolve_one(cache, pin)
+        assert path.read_bytes() == body
     finally:
         _stop_mirror(server)
