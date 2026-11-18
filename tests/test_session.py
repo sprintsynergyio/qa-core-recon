@@ -1,14 +1,21 @@
+import hashlib
 import os
+import shutil
 from pathlib import Path
 
 import pytest
 from py4j.protocol import Py4JJavaError
 
 from qa_core_recon.spark import (
+    AWS_SDK_BUNDLE_JAR,
     AWS_SDK_BUNDLE_PACKAGE,
+    AWS_SDK_BUNDLE_VERSION,
+    HADOOP_AWS_JAR,
     HADOOP_AWS_PACKAGE,
+    HADOOP_VERSION,
+    ICEBERG_RUNTIME_JAR,
     ICEBERG_SPARK_PACKAGE,
-    MAVEN_CENTRAL,
+    ICEBERG_VERSION,
     IcebergRuntimeError,
     S3RuntimeError,
     SessionStartError,
@@ -18,6 +25,8 @@ from qa_core_recon.spark import (
     local_session,
     missing_runtime_message,
     missing_s3_runtime_message,
+    required_jars,
+    resolve_verified_jars,
     runtime_jar_cached,
     s3_jars_cached,
     session_start_failure,
@@ -31,9 +40,12 @@ def test_session_is_local_and_fixed(spark):
     assert spark.conf.get("spark.sql.session.timeZone") == "UTC"
     assert spark.conf.get("spark.ui.enabled") == "false"
     assert spark.conf.get("spark.sql.catalogImplementation") == "in-memory"
-    assert spark.conf.get("spark.jars.packages") == jars_packages(iceberg=True, s3=True)
+    jars = spark.conf.get("spark.jars")
+    for pin in required_jars(iceberg=True, s3=True):
+        assert pin.filename in jars
+        assert pin.sha256
+    assert spark.conf.get("spark.jars.packages", "") == ""
     assert spark.conf.get("spark.jars.ivy") == str(ivy_cache_dir())
-    assert spark.conf.get("spark.jars.repositories") == MAVEN_CENTRAL
     pending = catalog_name_for("/not/a/registered/warehouse")
     with pytest.raises(Py4JJavaError):
         spark.conf.get(f"spark.sql.catalog.{pending}")
@@ -118,9 +130,21 @@ def test_other_session_start_failures_stay_generic(tmp_path):
     assert ICEBERG_SPARK_PACKAGE not in str(failure)
 
 
+def _skip_jar_resolution(monkeypatch) -> None:
+    """Keep start-failure tests on the Spark error path.
+
+    An empty cache would otherwise download the pinned jars before Spark
+    starts. These tests are about how a failed start is classified.
+    """
+    import qa_core_recon.spark as spark_mod
+
+    monkeypatch.setattr(spark_mod, "resolve_verified_jars", lambda *_args, **_kwargs: ())
+
+
 def _call_local_session_with_failed_start(monkeypatch, cache: Path, message: str):
     import qa_core_recon.spark as spark_mod
 
+    _skip_jar_resolution(monkeypatch)
     monkeypatch.setattr(spark_mod, "ivy_cache_dir", lambda: cache)
     monkeypatch.setattr(spark_mod, "_session", None)
     monkeypatch.setattr(spark_mod, "_warehouse", None)
@@ -165,6 +189,7 @@ def _local_session_with_fake_start(monkeypatch, cache: Path, stderr: bytes):
 
     import qa_core_recon.spark as spark_mod
 
+    _skip_jar_resolution(monkeypatch)
     monkeypatch.setattr(spark_mod, "ivy_cache_dir", lambda: cache)
     monkeypatch.setattr(spark_mod, "_session", None)
     monkeypatch.setattr(spark_mod, "_warehouse", None)
@@ -270,6 +295,7 @@ def test_local_only_session_does_not_request_s3_packages(spark, monkeypatch):
 
     def capture(builder):
         seen["packages"] = builder._options.get("spark.jars.packages")
+        seen["jars"] = builder._options.get("spark.jars")
         seen["ivy"] = builder._options.get("spark.jars.ivy")
         raise RuntimeError("stopped before the jvm")
 
@@ -281,19 +307,23 @@ def test_local_only_session_does_not_request_s3_packages(spark, monkeypatch):
     with pytest.raises(SessionStartError, match="stopped before the jvm"):
         local_session(iceberg=False, s3=False)
     assert seen["packages"] is None
+    assert seen["jars"] is None
     assert seen["ivy"] is None
 
     def capture_s3(builder):
         seen["packages"] = builder._options.get("spark.jars.packages")
+        seen["jars"] = builder._options.get("spark.jars")
         raise RuntimeError("stopped before the jvm")
 
     monkeypatch.setattr(spark_mod, "_start_quietly", capture_s3)
     with pytest.raises(SessionStartError, match="stopped before the jvm"):
         local_session(iceberg=False, s3=True)
-    assert seen["packages"] == jars_packages(s3=True)
-    assert HADOOP_AWS_PACKAGE in seen["packages"]
-    assert AWS_SDK_BUNDLE_PACKAGE in seen["packages"]
-    assert ICEBERG_SPARK_PACKAGE not in seen["packages"]
+    assert seen["packages"] is None
+    assert seen["jars"] is not None
+    assert HADOOP_AWS_JAR.filename in seen["jars"]
+    assert AWS_SDK_BUNDLE_JAR.filename in seen["jars"]
+    assert ICEBERG_RUNTIME_JAR.filename not in seen["jars"]
+    assert jars_packages(s3=True) == f"{HADOOP_AWS_PACKAGE},{AWS_SDK_BUNDLE_PACKAGE}"
 
 
 def test_s3_session_sets_s3_builder_settings(spark, monkeypatch):
@@ -313,7 +343,12 @@ def test_s3_session_sets_s3_builder_settings(spark, monkeypatch):
     monkeypatch.setattr(spark_mod, "_start_quietly", capture)
     with pytest.raises(SessionStartError, match="stopped before the jvm"):
         local_session(iceberg=False, s3=True)
-    assert seen["spark.jars.packages"] == jars_packages(s3=True)
+    assert "spark.jars.packages" not in seen
+    jars = seen["spark.jars"]
+    assert jars is not None
+    assert HADOOP_AWS_JAR.filename in jars
+    assert AWS_SDK_BUNDLE_JAR.filename in jars
+    assert ICEBERG_RUNTIME_JAR.filename not in jars
     assert seen["spark.hadoop.fs.s3.impl"] == "org.apache.hadoop.fs.s3a.S3AFileSystem"
     assert seen["spark.hadoop.fs.s3a.impl"] == "org.apache.hadoop.fs.s3a.S3AFileSystem"
     assert seen["spark.hadoop.fs.s3a.path.style.access"] == "true"
@@ -338,3 +373,120 @@ def test_session_leaves_no_hive_files_in_the_repo(spark):
     ivy = Path(spark.conf.get("spark.jars.ivy"))
     assert root not in ivy.parents
     assert Path.cwd() not in ivy.parents
+
+
+def test_pinned_jars_match_version_constants():
+    assert ICEBERG_RUNTIME_JAR.version == ICEBERG_VERSION
+    assert ICEBERG_RUNTIME_JAR.coordinate == ICEBERG_SPARK_PACKAGE
+    assert ICEBERG_RUNTIME_JAR.filename == f"iceberg-spark-runtime-3.5_2.12-{ICEBERG_VERSION}.jar"
+    assert HADOOP_AWS_JAR.version == HADOOP_VERSION
+    assert HADOOP_AWS_JAR.coordinate == HADOOP_AWS_PACKAGE
+    assert HADOOP_AWS_JAR.filename == f"hadoop-aws-{HADOOP_VERSION}.jar"
+    assert AWS_SDK_BUNDLE_JAR.version == AWS_SDK_BUNDLE_VERSION
+    assert AWS_SDK_BUNDLE_JAR.coordinate == AWS_SDK_BUNDLE_PACKAGE
+    assert AWS_SDK_BUNDLE_JAR.filename == f"aws-java-sdk-bundle-{AWS_SDK_BUNDLE_VERSION}.jar"
+    pins = required_jars(iceberg=True, s3=True)
+    assert pins == (ICEBERG_RUNTIME_JAR, HADOOP_AWS_JAR, AWS_SDK_BUNDLE_JAR)
+    for pin in pins:
+        assert pin.sha256 == pin.sha256.lower()
+        assert len(pin.sha256) == 64
+        int(pin.sha256, 16)
+
+
+def _refuse_network(*_args, **_kwargs):
+    raise AssertionError("this test must not download a jar")
+
+
+def _copy_verified_jars(cache: Path) -> None:
+    jar_dir = cache / "jars"
+    jar_dir.mkdir(parents=True)
+    source = ivy_cache_dir() / "jars"
+    for pin in required_jars(iceberg=True, s3=True):
+        shutil.copyfile(source / pin.filename, jar_dir / pin.filename)
+
+
+def test_correct_cache_passes_offline(spark, tmp_path, monkeypatch):
+    import qa_core_recon.spark as spark_mod
+
+    cache = tmp_path / "warm"
+    _copy_verified_jars(cache)
+    monkeypatch.setattr(spark_mod.urllib.request, "urlopen", _refuse_network)
+    paths = resolve_verified_jars(cache, iceberg=True, s3=True)
+    assert [path.name for path in paths] == [
+        pin.filename for pin in required_jars(iceberg=True, s3=True)
+    ]
+    for path, pin in zip(paths, required_jars(iceberg=True, s3=True), strict=True):
+        assert path.is_file()
+        assert pin.filename in str(path)
+
+
+def test_prefixed_ivy_cache_name_passes_offline(spark, tmp_path, monkeypatch):
+    import qa_core_recon.spark as spark_mod
+
+    pin = ICEBERG_RUNTIME_JAR
+    cache = tmp_path / "ivy-layout"
+    cache.mkdir()
+    source = ivy_cache_dir() / "jars" / pin.filename
+    target = cache / f"org.apache.iceberg_{pin.filename}"
+    shutil.copyfile(source, target)
+    monkeypatch.setattr(spark_mod.urllib.request, "urlopen", _refuse_network)
+    assert resolve_verified_jars(cache, iceberg=True, s3=False) == (target,)
+
+
+def test_corrupted_cached_jar_is_rejected_before_spark_starts(spark, monkeypatch, tmp_path):
+    import qa_core_recon.spark as spark_mod
+
+    pin = ICEBERG_RUNTIME_JAR
+    cache = tmp_path / "ivy"
+    (cache / "jars").mkdir(parents=True)
+    payload = b"corrupted jar"
+    (cache / "jars" / pin.filename).write_bytes(payload)
+    actual = hashlib.sha256(payload).hexdigest()
+
+    def refuse_start(_builder):
+        raise AssertionError("Spark started on an unverified jar")
+
+    monkeypatch.setattr(spark_mod.urllib.request, "urlopen", _refuse_network)
+    monkeypatch.setattr(spark_mod, "ivy_cache_dir", lambda: cache)
+    monkeypatch.setattr(spark_mod, "_session", None)
+    monkeypatch.setattr(spark_mod, "_warehouse", None)
+    monkeypatch.setattr(spark_mod, "_iceberg_ready", False)
+    monkeypatch.setattr(spark_mod, "_s3_ready", False)
+    monkeypatch.setattr(spark_mod, "_start_quietly", refuse_start)
+    with pytest.raises(SessionStartError) as caught:
+        local_session(iceberg=True, s3=False)
+    message = str(caught.value)
+    assert isinstance(caught.value, SessionStartError)
+    assert not isinstance(caught.value, IcebergRuntimeError)
+    assert pin.filename in message
+    assert pin.sha256 in message
+    assert actual in message
+    assert "failed verification" in message
+
+
+def test_missing_jar_is_rejected_before_spark_starts(spark, monkeypatch, tmp_path):
+    import qa_core_recon.spark as spark_mod
+
+    pin = HADOOP_AWS_JAR
+    cache = tmp_path / "empty-ivy"
+
+    def refuse_download(*_args, **_kwargs):
+        raise OSError("maven central is unreachable")
+
+    def refuse_start(_builder):
+        raise AssertionError("Spark started without a jar")
+
+    monkeypatch.setattr(spark_mod.urllib.request, "urlopen", refuse_download)
+    monkeypatch.setattr(spark_mod, "ivy_cache_dir", lambda: cache)
+    monkeypatch.setattr(spark_mod, "_session", None)
+    monkeypatch.setattr(spark_mod, "_warehouse", None)
+    monkeypatch.setattr(spark_mod, "_iceberg_ready", False)
+    monkeypatch.setattr(spark_mod, "_s3_ready", False)
+    monkeypatch.setattr(spark_mod, "_start_quietly", refuse_start)
+    with pytest.raises(SessionStartError) as caught:
+        local_session(iceberg=False, s3=True)
+    message = str(caught.value)
+    assert pin.filename in message
+    assert pin.sha256 in message
+    assert "actual sha256 missing" in message
+    assert "maven central" not in message.lower()

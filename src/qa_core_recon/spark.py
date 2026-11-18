@@ -14,27 +14,30 @@ directory or the repo root.
 The Iceberg Spark runtime is loaded only when the caller asks for it, because
 Spark cannot add jars after the session exists. The jar is
 ``org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.7.1``, the Iceberg
-version AWS Glue 5.0 ships for Spark 3.5 and Scala 2.12. Spark resolves that
-coordinate from Maven Central into an Ivy cache at
+version AWS Glue 5.0 ships for Spark 3.5 and Scala 2.12. This module downloads
+that jar from Maven Central into an Ivy cache at
 ``~/.cache/qa-core-recon/ivy``, or ``QA_CORE_RECON_IVY`` when that variable
-is set. The cache is not inside the session temp directory, so stopping the
-session does not delete it. A Hadoop catalog for one warehouse is registered
-later, and only when a spec reads Iceberg.
+is set, when the file is not already there. It hashes the jar and compares
+the SHA-256 to the pinned value before the session starts. A mismatch or a
+missing jar raises :class:`SessionStartError`, and Spark is not started. The
+verified path is passed through ``spark.jars``. The cache is not inside the
+session temp directory, so stopping the session does not delete it. A Hadoop
+catalog for one warehouse is registered later, and only when a spec reads
+Iceberg.
 
 S3 reads use that same cache and Maven Central. The jars are
 ``org.apache.hadoop:hadoop-aws:3.3.4`` and
 ``com.amazonaws:aws-java-sdk-bundle:1.12.262``. PySpark 3.5 ships Hadoop
-3.3.4, and hadoop-aws 3.3.4 is built against that SDK bundle. They are added
-only when the caller asks for S3, so a local spec does not download them.
-Credentials stay on the AWS default chain. They are not copied into the Spark
-configuration. ``QA_CORE_RECON_S3_ENDPOINT``, when set, points s3a at that
-endpoint and turns on path-style access.
+3.3.4, and hadoop-aws 3.3.4 is built against that SDK bundle. They are checked
+the same way and added only when the caller asks for S3, so a local spec does
+not download them. Credentials stay on the AWS default chain. They are not
+copied into the Spark configuration. ``QA_CORE_RECON_S3_ENDPOINT``, when set,
+points s3a at that endpoint and turns on path-style access.
 
 Spark prints a startup banner on the process stderr before Python can change
-its log level, and that banner contains a timestamp. Ivy prints a settings
-line on stdout when the Iceberg runtime is resolved. Both are captured and
-dropped so the CLI's output stays limited to refusals, errors, and the
-result line.
+its log level, and that banner contains a timestamp. Startup lines are
+captured and dropped so the CLI's output stays limited to refusals, errors,
+and the result line.
 
 The first call creates the session. Later calls in the same process return
 that session. Spark allows one context per JVM, so a stopped session is not
@@ -46,6 +49,9 @@ import os
 import shutil
 import sys
 import tempfile
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
 from pathlib import Path
 
 from pyspark.sql import SparkSession
@@ -65,6 +71,53 @@ AWS_SDK_BUNDLE_PACKAGE = f"com.amazonaws:aws-java-sdk-bundle:{AWS_SDK_BUNDLE_VER
 S3_ENDPOINT_ENV = "QA_CORE_RECON_S3_ENDPOINT"
 _DEFAULT_S3_REGION = "us-east-1"
 MAVEN_CENTRAL = "https://repo1.maven.org/maven2"
+
+# SHA-256 of the jar bytes on Maven Central. Each value was checked against
+# Central's published .sha1 file. The Iceberg runtime also has a published
+# .sha256 file, and that file matches this pin. See "Update A Jar Pin" in the
+# README before changing a version or a hash.
+
+
+@dataclass(frozen=True)
+class PinnedJar:
+    """One Maven jar, named by coordinate and pinned by SHA-256."""
+
+    group: str
+    artifact: str
+    version: str
+    sha256: str
+
+    @property
+    def filename(self) -> str:
+        return f"{self.artifact}-{self.version}.jar"
+
+    @property
+    def coordinate(self) -> str:
+        return f"{self.group}:{self.artifact}:{self.version}"
+
+    def maven_url(self) -> str:
+        group_path = self.group.replace(".", "/")
+        return f"{MAVEN_CENTRAL}/{group_path}/{self.artifact}/{self.version}/{self.filename}"
+
+
+ICEBERG_RUNTIME_JAR = PinnedJar(
+    group="org.apache.iceberg",
+    artifact="iceberg-spark-runtime-3.5_2.12",
+    version=ICEBERG_VERSION,
+    sha256="cdf7357865d8d91764e0f147a2d76bc3e1e2b8792ddc0d3be329b3d34aaf218c",
+)
+HADOOP_AWS_JAR = PinnedJar(
+    group="org.apache.hadoop",
+    artifact="hadoop-aws",
+    version=HADOOP_VERSION,
+    sha256="53f9ae03c681a30a50aa17524bd9790ab596b28481858e54efd989a826ed3a4a",
+)
+AWS_SDK_BUNDLE_JAR = PinnedJar(
+    group="com.amazonaws",
+    artifact="aws-java-sdk-bundle",
+    version=AWS_SDK_BUNDLE_VERSION,
+    sha256="873fe7cf495126619997bec21c44de5d992544aea7e632fdc77adb1a0915bae5",
+)
 
 _session: SparkSession | None = None
 _warehouse: Path | None = None
@@ -151,14 +204,121 @@ def s3_jars_cached(cache: Path) -> bool:
 
 
 def jars_packages(*, iceberg: bool = False, s3: bool = False) -> str:
-    """Return the Maven coordinates Spark should resolve, or an empty string."""
-    parts: list[str] = []
+    """Return the Maven coordinates for the jars a session would load."""
+    return ",".join(pin.coordinate for pin in required_jars(iceberg=iceberg, s3=s3))
+
+
+def required_jars(*, iceberg: bool = False, s3: bool = False) -> tuple[PinnedJar, ...]:
+    """Return the pinned jars for this session, in classpath order."""
+    pins: list[PinnedJar] = []
     if iceberg:
-        parts.append(ICEBERG_SPARK_PACKAGE)
+        pins.append(ICEBERG_RUNTIME_JAR)
     if s3:
-        parts.append(HADOOP_AWS_PACKAGE)
-        parts.append(AWS_SDK_BUNDLE_PACKAGE)
-    return ",".join(parts)
+        pins.append(HADOOP_AWS_JAR)
+        pins.append(AWS_SDK_BUNDLE_JAR)
+    return tuple(pins)
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _verification_error(jar_name: str, expected: str, actual: str) -> SessionStartError:
+    return SessionStartError(
+        f"jar {jar_name} failed verification: expected sha256 {expected}, actual sha256 {actual}"
+    )
+
+
+def _cached_jar(cache: Path, filename: str) -> Path | None:
+    """Return the cached jar to verify, or None when the cache has no copy.
+
+    The path this module downloads is ``<cache>/jars/<filename>``. A cache
+    filled by an older Spark Ivy run uses that same filename, or
+    ``<group>_<filename>`` under the Ivy home. A warm cache of either shape
+    is reused. The first match is the file that will be hashed.
+    """
+    preferred = cache / "jars" / filename
+    if preferred.is_file():
+        return preferred
+    if not cache.is_dir():
+        return None
+    exact: list[Path] = []
+    prefixed: list[Path] = []
+    marker = "_" + filename
+    for path in cache.rglob("*.jar"):
+        if not path.is_file() or path == preferred:
+            continue
+        if path.name == filename:
+            exact.append(path)
+        elif path.name.endswith(marker):
+            prefixed.append(path)
+    exact.sort()
+    prefixed.sort()
+    if exact:
+        return exact[0]
+    if prefixed:
+        return prefixed[0]
+    return None
+
+
+def _download_jar(url: str, dest: Path) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    partial = dest.with_name(dest.name + ".partial")
+    request = urllib.request.Request(url, headers={"User-Agent": "qa-core-recon"})
+    try:
+        with (
+            urllib.request.urlopen(request, timeout=120) as response,
+            partial.open("wb") as handle,
+        ):
+            for chunk in iter(lambda: response.read(1024 * 1024), b""):
+                handle.write(chunk)
+    except Exception:
+        partial.unlink(missing_ok=True)
+        raise
+    os.replace(partial, dest)
+
+
+def _resolve_one(cache: Path, pin: PinnedJar) -> Path:
+    """Return a cached jar whose SHA-256 matches ``pin``.
+
+    A file already in the cache is hashed and kept when it matches. A mismatch
+    stops the run. The bad file is left in place, and it is not replaced by a
+    new download. A missing file is downloaded from Maven Central, hashed, and
+    stored only when the hash matches.
+    """
+    cached = _cached_jar(cache, pin.filename)
+    if cached is not None:
+        actual = _file_sha256(cached)
+        if actual != pin.sha256:
+            raise _verification_error(cached.name, pin.sha256, actual)
+        return cached
+    destination = cache / "jars" / pin.filename
+    try:
+        _download_jar(pin.maven_url(), destination)
+    except (urllib.error.URLError, TimeoutError, OSError):
+        destination.unlink(missing_ok=True)
+        raise _verification_error(pin.filename, pin.sha256, "missing") from None
+    actual = _file_sha256(destination)
+    if actual != pin.sha256:
+        destination.unlink(missing_ok=True)
+        raise _verification_error(pin.filename, pin.sha256, actual)
+    return destination
+
+
+def resolve_verified_jars(
+    cache: Path, *, iceberg: bool = False, s3: bool = False
+) -> tuple[Path, ...]:
+    """Download any missing pinned jar, hash every jar, and return local paths.
+
+    Nothing is returned for a jar that fails the pin. The caller must not
+    start Spark with a path this function did not return.
+    """
+    cache.mkdir(parents=True, exist_ok=True)
+    return tuple(_resolve_one(cache, pin) for pin in required_jars(iceberg=iceberg, s3=s3))
 
 
 def resolve_s3_region() -> str | None:
@@ -341,7 +501,8 @@ def local_session(
     """Return the process-wide local session, creating it on the first call.
 
     ``iceberg`` loads the Iceberg runtime. ``s3`` loads the Hadoop AWS client
-    and the AWS SDK bundle. Spark accepts jars only while the session is
+    and the AWS SDK bundle. Each required jar is hashed against its pin
+    before the session starts. Spark accepts jars only while the session is
     created, so a session that was started without one of them cannot gain
     it later.
     """
@@ -393,10 +554,13 @@ def local_session(
     if iceberg or s3:
         ivy = ivy_cache_dir()
         ivy.mkdir(parents=True, exist_ok=True)
-        builder = (
-            builder.config("spark.jars.packages", jars_packages(iceberg=iceberg, s3=s3))
-            .config("spark.jars.ivy", str(ivy))
-            .config("spark.jars.repositories", MAVEN_CENTRAL)
+        try:
+            jar_paths = resolve_verified_jars(ivy, iceberg=iceberg, s3=s3)
+        except SessionStartError:
+            shutil.rmtree(root, ignore_errors=True)
+            raise
+        builder = builder.config("spark.jars", ",".join(str(path) for path in jar_paths)).config(
+            "spark.jars.ivy", str(ivy)
         )
     if s3:
         for key, value in s3_hadoop_settings().items():
@@ -432,13 +596,13 @@ def _quiet_s3_logs(session: SparkSession) -> None:
 
 
 def _start_quietly(builder: SparkSession.Builder) -> SparkSession:
-    """Create the session and drop Spark and Ivy startup lines.
+    """Create the session and drop Spark startup lines.
 
-    The JVM writes its banner to file descriptor 2, and Ivy writes a settings
-    line to file descriptor 1. Redirecting Python's ``sys`` streams does not
-    catch either, so both descriptors are pointed at a temporary file for the
-    duration of startup and then restored. On failure the captured text is
-    kept on the raised error for classification. It is not part of the message.
+    The JVM writes its banner to file descriptor 2. Redirecting Python's
+    ``sys`` streams does not catch that, so both descriptors are pointed at a
+    temporary file for the duration of startup and then restored. On failure
+    the captured text is kept on the raised error for classification. It is
+    not part of the message.
     """
     captured = tempfile.NamedTemporaryFile(prefix="qa-core-recon-spark-log-", delete=False)
     saved_out = os.dup(1)

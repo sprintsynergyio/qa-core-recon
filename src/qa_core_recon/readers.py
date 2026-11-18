@@ -53,6 +53,7 @@ from pyspark.sql.types import (
 
 from qa_core_recon.decimals import DECIMAL_PRECISION, InexactAmount, to_decimal
 from qa_core_recon.refusals import Refusal, RefusalCode, RefusalError
+from qa_core_recon.report import _resolve_checked
 from qa_core_recon.spark import (
     apply_s3_config,
     hadoop_catalog,
@@ -455,10 +456,11 @@ def _exception_text(exc: BaseException) -> str:
 def _require_local(path: str, side: str) -> Path:
     location = Path(path)
     try:
-        # resolve() raises RuntimeError ("Symlink loop from ...") when the
-        # path is a symlink cycle. exists() returns False for that path and
-        # would otherwise report it as missing.
-        location.resolve(strict=False)
+        # A symlink cycle raises RuntimeError ("Symlink loop from ...").
+        # exists() returns False for that path and would otherwise report it
+        # as missing. Python 3.13's resolve() does not raise, so the helper
+        # checks the resolved path and keeps that same message.
+        _resolve_checked(location)
         exists = location.exists()
         kind = "file" if location.is_file() else "dir" if location.is_dir() else "other"
     except (OSError, RuntimeError) as exc:

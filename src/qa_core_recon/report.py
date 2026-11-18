@@ -20,6 +20,7 @@ report files are removed. When this command created the directory and the
 write fails, the empty directory is removed.
 """
 
+import errno
 import hashlib
 import json
 import os
@@ -248,9 +249,29 @@ class _PathResolveError(Exception):
         self.detail = detail
 
 
+def _resolve_checked(path: Path) -> Path:
+    """Resolve ``path`` and still fail a symlink cycle on Python 3.13.
+
+    Python 3.11 and 3.12 raise ``RuntimeError`` (``Symlink loop from ...``)
+    from ``Path.resolve(strict=False)``. Python 3.13 returns the path. ``stat``
+    still raises ``ELOOP`` for that cycle. The message stays the one those
+    older versions used, so a loop is not reported as a missing path.
+    """
+    resolved = path.resolve(strict=False)
+    try:
+        resolved.stat()
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            filename = (
+                exc.filename if isinstance(exc.filename, str) and exc.filename else str(resolved)
+            )
+            raise RuntimeError(f"Symlink loop from {filename!r}") from None
+    return resolved
+
+
 def _resolve_parts(path: Path) -> tuple[str, ...]:
     try:
-        return path.resolve(strict=False).parts
+        return _resolve_checked(path).parts
     except (OSError, RuntimeError) as exc:
         detail = getattr(exc, "strerror", None) or str(exc) or exc.__class__.__name__
         raise _PathResolveError(detail) from None
