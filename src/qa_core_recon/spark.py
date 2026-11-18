@@ -17,10 +17,11 @@ Spark cannot add jars after the session exists. The jar is
 version AWS Glue 5.0 ships for Spark 3.5 and Scala 2.12. This module downloads
 that jar from Maven Central into an Ivy cache at
 ``~/.cache/qa-core-recon/ivy``, or ``QA_CORE_RECON_IVY`` when that variable
-is set, when the file is not already there. It hashes the jar and compares
-the SHA-256 to the pinned value before the session starts. A mismatch or a
-missing jar raises :class:`SessionStartError`, and Spark is not started. The
-verified path is passed through ``spark.jars``. The cache is not inside the
+is set, when the file is not already there. The download is a private temp
+file. It is moved into place only when its SHA-256 matches the pin. A mismatch
+or a failed download raises :class:`SessionStartError`, and Spark is not
+started. The verified path is passed through ``spark.jars``. The cache is not
+inside the
 session temp directory, so stopping the session does not delete it. A Hadoop
 catalog for one warehouse is registered later, and only when a spec reads
 Iceberg.
@@ -49,6 +50,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -71,6 +73,11 @@ AWS_SDK_BUNDLE_PACKAGE = f"com.amazonaws:aws-java-sdk-bundle:{AWS_SDK_BUNDLE_VER
 S3_ENDPOINT_ENV = "QA_CORE_RECON_S3_ENDPOINT"
 _DEFAULT_S3_REGION = "us-east-1"
 MAVEN_CENTRAL = "https://repo1.maven.org/maven2"
+# A hung TCP handshake or a silent response header fails after this many
+# seconds. The body then has until JAR_DOWNLOAD_TOTAL_TIMEOUT_SECONDS from
+# the start of the attempt. A blackholed server fails in well under a minute.
+JAR_DOWNLOAD_CONNECT_TIMEOUT_SECONDS = 10
+JAR_DOWNLOAD_TOTAL_TIMEOUT_SECONDS = 45
 
 # SHA-256 of the jar bytes on Maven Central. Each value was checked against
 # Central's published .sha1 file. The Iceberg runtime also has a published
@@ -227,9 +234,53 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _verification_error(jar_name: str, expected: str, actual: str) -> SessionStartError:
+def _one_line(exc: BaseException) -> str:
+    text = " ".join(str(exc).split())
+    return text or exc.__class__.__name__
+
+
+def _cached_mismatch(cache: Path, path: Path, expected: str, actual: str) -> SessionStartError:
     return SessionStartError(
-        f"jar {jar_name} failed verification: expected sha256 {expected}, actual sha256 {actual}"
+        f"jar {path.name} in the cache at {cache} failed verification: "
+        f"expected sha256 {expected}, actual sha256 {actual}. "
+        f"Remove {path}, then run again."
+    )
+
+
+def _download_mismatch(cache: Path, pin: PinnedJar, actual: str) -> SessionStartError:
+    return SessionStartError(
+        f"jar {pin.filename} downloaded for the cache at {cache} failed verification: "
+        f"expected sha256 {pin.sha256}, actual sha256 {actual}. "
+        f"The file was not saved."
+    )
+
+
+def _could_not_download(cache: Path, pin: PinnedJar, exc: BaseException) -> SessionStartError:
+    return SessionStartError(
+        f"could not download {pin.filename} from {pin.maven_url()} "
+        f"into the cache at {cache}: {_one_line(exc)}. "
+        f"Check the network and the cache directory, then run again."
+    )
+
+
+def _cache_not_writable(cache: Path, exc: BaseException) -> SessionStartError:
+    return SessionStartError(
+        f"the jar cache at {cache} is not writable: {_one_line(exc)}. "
+        f"Choose a writable directory or set QA_CORE_RECON_IVY, then run again."
+    )
+
+
+def _unreadable_jar(path: Path, cache: Path, exc: BaseException) -> SessionStartError:
+    return SessionStartError(
+        f"cannot read jar {path} in the cache at {cache}: {_one_line(exc)}. "
+        f"Check the file permissions, then run again."
+    )
+
+
+def _jar_path_is_directory(path: Path, cache: Path) -> SessionStartError:
+    return SessionStartError(
+        f"jar path {path} in the cache at {cache} is a directory, not a file. "
+        f"Remove that directory, then run again."
     )
 
 
@@ -265,21 +316,122 @@ def _cached_jar(cache: Path, filename: str) -> Path | None:
     return None
 
 
-def _download_jar(url: str, dest: Path) -> None:
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    partial = dest.with_name(dest.name + ".partial")
-    request = urllib.request.Request(url, headers={"User-Agent": "qa-core-recon"})
+def _path_is_dir(path: Path, cache: Path) -> bool:
     try:
-        with (
-            urllib.request.urlopen(request, timeout=120) as response,
-            partial.open("wb") as handle,
-        ):
-            for chunk in iter(lambda: response.read(1024 * 1024), b""):
-                handle.write(chunk)
-    except Exception:
-        partial.unlink(missing_ok=True)
+        return path.is_dir()
+    except OSError as exc:
+        raise _unreadable_jar(path, cache, exc) from None
+
+
+def _set_read_timeout(response: object, seconds: float) -> None:
+    """Raise the socket timeout after connect so the body can use the total budget."""
+    fp = getattr(response, "fp", None)
+    raw = getattr(fp, "raw", None)
+    sock = getattr(raw, "_sock", None)
+    if sock is None:
+        return
+    try:
+        sock.settimeout(seconds)
+    except OSError:
+        return
+
+
+def _copy_download(url: str, handle) -> None:
+    """Write ``url`` to ``handle``.
+
+    The TCP handshake and response headers use
+    ``JAR_DOWNLOAD_CONNECT_TIMEOUT_SECONDS``. The whole attempt, including
+    the body, stops at ``JAR_DOWNLOAD_TOTAL_TIMEOUT_SECONDS``.
+    """
+    request = urllib.request.Request(url, headers={"User-Agent": "qa-core-recon"})
+    deadline = time.monotonic() + JAR_DOWNLOAD_TOTAL_TIMEOUT_SECONDS
+    try:
+        response = urllib.request.urlopen(request, timeout=JAR_DOWNLOAD_CONNECT_TIMEOUT_SECONDS)
+    except urllib.error.HTTPError as exc:
+        exc.close()
         raise
-    os.replace(partial, dest)
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"timed out after {JAR_DOWNLOAD_TOTAL_TIMEOUT_SECONDS} seconds")
+            _set_read_timeout(response, remaining)
+            chunk = response.read(1024 * 1024)
+            if not chunk:
+                return
+            handle.write(chunk)
+    finally:
+        response.close()
+
+
+def _download_and_publish(cache: Path, pin: PinnedJar, destination: Path) -> None:
+    """Download ``pin`` to a private temp file and publish it only if it matches.
+
+    The temp file is created with ``tempfile.mkstemp`` in the jars directory,
+    fsynced, and hashed before ``os.replace``. A mismatch or a network error
+    deletes that temp file and does not delete ``destination``. Another run
+    can publish the same final name at the same time. This run leaves that
+    file alone.
+    """
+    jar_dir = destination.parent
+    try:
+        jar_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise _cache_not_writable(cache, exc) from None
+    try:
+        fd, name = tempfile.mkstemp(
+            prefix=f".{destination.name}.",
+            suffix=".download",
+            dir=jar_dir,
+        )
+    except OSError as exc:
+        raise _cache_not_writable(cache, exc) from None
+    temp_path = Path(name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            try:
+                _copy_download(pin.maven_url(), handle)
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                raise _could_not_download(cache, pin, exc) from None
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            actual = _file_sha256(temp_path)
+        except OSError as exc:
+            raise _unreadable_jar(temp_path, cache, exc) from None
+        if actual != pin.sha256:
+            raise _download_mismatch(cache, pin, actual)
+        try:
+            os.replace(temp_path, destination)
+        except OSError as exc:
+            if _path_is_dir(destination, cache):
+                raise _jar_path_is_directory(destination, cache) from None
+            raise _cache_not_writable(cache, exc) from None
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+def _ready_jar(cache: Path, pin: PinnedJar) -> Path | None:
+    """Return the cached jar when it matches ``pin``.
+
+    A missing jar returns None. A directory, an unreadable file, or a hash
+    mismatch raises :class:`SessionStartError` and does not delete the path.
+    """
+    preferred = cache / "jars" / pin.filename
+    if preferred.exists() and _path_is_dir(preferred, cache):
+        raise _jar_path_is_directory(preferred, cache)
+    cached = _cached_jar(cache, pin.filename)
+    if cached is None:
+        return None
+    if _path_is_dir(cached, cache):
+        raise _jar_path_is_directory(cached, cache)
+    try:
+        actual = _file_sha256(cached)
+    except OSError as exc:
+        raise _unreadable_jar(cached, cache, exc) from None
+    if actual != pin.sha256:
+        raise _cached_mismatch(cache, cached, pin.sha256, actual)
+    return cached
 
 
 def _resolve_one(cache: Path, pin: PinnedJar) -> Path:
@@ -287,26 +439,27 @@ def _resolve_one(cache: Path, pin: PinnedJar) -> Path:
 
     A file already in the cache is hashed and kept when it matches. A mismatch
     stops the run. The bad file is left in place, and it is not replaced by a
-    new download. A missing file is downloaded from Maven Central, hashed, and
-    stored only when the hash matches.
+    new download. A missing file is downloaded to a private temp file, hashed,
+    and moved into place only when the hash matches. If another run publishes
+    a valid file while this download is in progress, that file is used.
     """
-    cached = _cached_jar(cache, pin.filename)
-    if cached is not None:
-        actual = _file_sha256(cached)
-        if actual != pin.sha256:
-            raise _verification_error(cached.name, pin.sha256, actual)
-        return cached
+    ready = _ready_jar(cache, pin)
+    if ready is not None:
+        return ready
     destination = cache / "jars" / pin.filename
     try:
-        _download_jar(pin.maven_url(), destination)
-    except (urllib.error.URLError, TimeoutError, OSError):
-        destination.unlink(missing_ok=True)
-        raise _verification_error(pin.filename, pin.sha256, "missing") from None
-    actual = _file_sha256(destination)
-    if actual != pin.sha256:
-        destination.unlink(missing_ok=True)
-        raise _verification_error(pin.filename, pin.sha256, actual)
-    return destination
+        _download_and_publish(cache, pin, destination)
+    except SessionStartError:
+        raced = _ready_jar(cache, pin)
+        if raced is not None:
+            return raced
+        raise
+    ready = _ready_jar(cache, pin)
+    if ready is None:
+        raise SessionStartError(
+            f"jar {pin.filename} is missing from the cache at {cache} after download. Run again."
+        )
+    return ready
 
 
 def resolve_verified_jars(
@@ -553,9 +706,12 @@ def local_session(
     ivy: Path | None = None
     if iceberg or s3:
         ivy = ivy_cache_dir()
-        ivy.mkdir(parents=True, exist_ok=True)
         try:
+            ivy.mkdir(parents=True, exist_ok=True)
             jar_paths = resolve_verified_jars(ivy, iceberg=iceberg, s3=s3)
+        except OSError as exc:
+            shutil.rmtree(root, ignore_errors=True)
+            raise _cache_not_writable(ivy, exc) from None
         except SessionStartError:
             shutil.rmtree(root, ignore_errors=True)
             raise

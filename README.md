@@ -69,11 +69,13 @@ A spec that uses Iceberg also needs the Iceberg Spark runtime `org.apache.iceber
 
 ## Jar Verification
 
-Iceberg and S3 need jars from Maven Central. The tool downloads a jar only when the spec needs it and the jar is not already in the Ivy cache (`~/.cache/qa-core-recon/ivy`, or `QA_CORE_RECON_IVY`). It hashes that file and compares the SHA-256 to a pin in `src/qa_core_recon/spark.py`. The check runs before the Spark session starts. A cache that already holds the right bytes is hashed again and does not use the network.
+Iceberg and S3 need jars from Maven Central. The tool downloads a jar only when the spec needs it and the jar is not already in the Ivy cache (`~/.cache/qa-core-recon/ivy`, or `QA_CORE_RECON_IVY`). Each download goes to its own temp file in that cache, is synced to disk, and is hashed. The temp file is moved into place only when the SHA-256 matches the pin in `src/qa_core_recon/spark.py`. A failed download deletes that temp file and does not delete a jar that is already in the cache. A warm cache is hashed again and does not use the network.
+
+The connect timeout is 10 seconds (`JAR_DOWNLOAD_CONNECT_TIMEOUT_SECONDS`). The whole download must finish within 45 seconds (`JAR_DOWNLOAD_TOTAL_TIMEOUT_SECONDS`). A server that accepts the connection and then sends nothing fails in under a minute.
 
 The pins are `org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.7.1`, `org.apache.hadoop:hadoop-aws:3.3.4`, and `com.amazonaws:aws-java-sdk-bundle:1.12.262`. A verified jar is passed to Spark as a local path (`spark.jars`).
 
-A mismatch stops the command. A missing jar stops the command. The error names the jar, the expected SHA-256, and the actual SHA-256. When the file is not there, the actual value is `missing`. This is a read error, exit 2. Spark does not start, so nothing runs on an unverified jar.
+A hash mismatch names the jar, the cache path, the expected SHA-256, and the actual SHA-256. A download that fails names the jar, the URL, the cache path, and the cause. A cache that cannot be written names the cache path and says to choose a writable directory or set `QA_CORE_RECON_IVY`. These are read errors, exit 2. Spark does not start, so nothing runs on an unverified jar.
 
 ### Update A Jar Pin
 
@@ -432,7 +434,7 @@ target:
 
 The catalog is `org.apache.iceberg.spark.SparkCatalog` with `type` set to `hadoop`. It is registered for that warehouse only, and only when the spec uses Iceberg. The Spark session catalog stays in memory, Hive is not started, and the Iceberg catalog cache is off so a read sees the current snapshot. This is not the Glue catalog.
 
-The runtime jar is `org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.7.1` (Spark 3.5, Scala 2.12). AWS Glue 5.0 ships Iceberg 1.7.1 with Spark 3.5.4, as listed in the AWS Glue versions documentation. The tool fetches that jar from Maven Central the first time a session is started for an Iceberg spec, stores it in the Ivy cache (`~/.cache/qa-core-recon/ivy`, or `QA_CORE_RECON_IVY`), and checks the SHA-256 before Spark starts. Later runs reuse the cache and check it again. CSV and Parquet do not download it. A hash mismatch, or a jar that cannot be fetched, is a read error that names the jar and both hashes, and exits 2. See Jar Verification. If Spark itself reports an unresolved dependency and the jar is not in the cache, the error names the runtime and the cache directory instead. Any other failure to start the session prints `cannot start the local Spark session` and exits 2.
+The runtime jar is `org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.7.1` (Spark 3.5, Scala 2.12). AWS Glue 5.0 ships Iceberg 1.7.1 with Spark 3.5.4, as listed in the AWS Glue versions documentation. The tool fetches that jar from Maven Central the first time a session is started for an Iceberg spec, stores it in the Ivy cache (`~/.cache/qa-core-recon/ivy`, or `QA_CORE_RECON_IVY`), and checks the SHA-256 before Spark starts. Later runs reuse the cache and check it again. CSV and Parquet do not download it. A hash mismatch or a download failure is a read error, exit 2. The message names the jar and the cache. See Jar Verification. Any other failure to start the session prints `cannot start the local Spark session` and exits 2.
 
 Iceberg on a local warehouse is supported. An `s3://` warehouse is read through the same Hadoop catalog, with the path mapped to `s3a://`. Tables written by Glue, EMR, or Athena still store each metadata and data file as `s3://`. Those paths use the same S3A client. See S3 for credentials and the endpoint. This is not the Glue catalog. The tool does not write to S3.
 
@@ -454,7 +456,7 @@ For moto, or another S3-compatible store, set `QA_CORE_RECON_S3_ENDPOINT` to the
 
 A missing bucket, a missing key, access denied, and an endpoint that cannot be reached are read errors. The message names the side and the path. The command exits 2 and does not print a stack trace.
 
-`org.apache.hadoop:hadoop-aws:3.3.4` and `com.amazonaws:aws-java-sdk-bundle:1.12.262` are fetched only when a spec uses `s3://`. They use the same Ivy cache as the Iceberg runtime (`~/.cache/qa-core-recon/ivy`, or `QA_CORE_RECON_IVY`) and the same SHA-256 check. A local CSV, Parquet, or Iceberg spec does not download them. If a jar is missing or the hash does not match, `--check-data` and `run` print a read error that names the jar and both hashes, and exit 2. See Jar Verification.
+`org.apache.hadoop:hadoop-aws:3.3.4` and `com.amazonaws:aws-java-sdk-bundle:1.12.262` are fetched only when a spec uses `s3://`. They use the same Ivy cache as the Iceberg runtime (`~/.cache/qa-core-recon/ivy`, or `QA_CORE_RECON_IVY`) and the same SHA-256 check. A local CSV, Parquet, or Iceberg spec does not download them. If a jar cannot be downloaded or the hash does not match, `--check-data` and `run` print a read error and exit 2. See Jar Verification.
 
 These reads were tested with moto on `127.0.0.1`. The tests use fake credentials and do not call AWS. A run against real AWS comes later. This tool does not use the Glue Data Catalog, and it does not write to S3.
 

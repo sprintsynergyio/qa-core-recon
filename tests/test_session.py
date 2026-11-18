@@ -486,7 +486,11 @@ def test_missing_jar_is_rejected_before_spark_starts(spark, monkeypatch, tmp_pat
     with pytest.raises(SessionStartError) as caught:
         local_session(iceberg=False, s3=True)
     message = str(caught.value)
+    assert "could not download" in message
     assert pin.filename in message
-    assert pin.sha256 in message
-    assert "actual sha256 missing" in message
-    assert "maven central" not in message.lower()
+    assert pin.maven_url() in message
+    assert str(cache) in message
+    assert "maven central is unreachable" in message
+    assert "actual sha256 missing" not in message
+    assert "unexpected error" not in message
+    assert "Check the network" in message

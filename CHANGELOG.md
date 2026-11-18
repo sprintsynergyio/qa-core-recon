@@ -13,7 +13,8 @@
 
 ### Supply Chain
 
-- The Iceberg runtime, `hadoop-aws`, and `aws-java-sdk-bundle` jars are hashed before the Spark session starts. The SHA-256 must match the pin in `src/qa_core_recon/spark.py`. A mismatch or a missing jar is a read error and exits 2. A warm cache is checked again and does not need Maven Central.
+- The Iceberg runtime, `hadoop-aws`, and `aws-java-sdk-bundle` jars are hashed before the Spark session starts. The SHA-256 must match the pin in `src/qa_core_recon/spark.py`. A mismatch or a failed download is a read error and exits 2. A warm cache is checked again and does not need Maven Central.
+- Each download uses its own temp file. The file is moved into the cache only after the hash matches, and a failed download does not delete a jar that is already there. A network error names the URL, the cache, and the cause. The connect timeout is 10 seconds. The download timeout is 45 seconds.
 
 ## 0.1.0
 
