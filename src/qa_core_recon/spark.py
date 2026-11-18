@@ -73,11 +73,13 @@ AWS_SDK_BUNDLE_PACKAGE = f"com.amazonaws:aws-java-sdk-bundle:{AWS_SDK_BUNDLE_VER
 S3_ENDPOINT_ENV = "QA_CORE_RECON_S3_ENDPOINT"
 _DEFAULT_S3_REGION = "us-east-1"
 MAVEN_CENTRAL = "https://repo1.maven.org/maven2"
-# A hung TCP handshake or a silent response header fails after this many
-# seconds. The body then has until JAR_DOWNLOAD_TOTAL_TIMEOUT_SECONDS from
-# the start of the attempt. A blackholed server fails in well under a minute.
+# A hung TCP handshake or silent response headers fail after this many seconds.
 JAR_DOWNLOAD_CONNECT_TIMEOUT_SECONDS = 10
-JAR_DOWNLOAD_TOTAL_TIMEOUT_SECONDS = 45
+# Fail when the body sends no bytes for this long. A slow but steady link
+# can still finish a large jar. There is no short cap on the total time.
+JAR_DOWNLOAD_STALL_TIMEOUT_SECONDS = 30
+# Small enough that a drip is noticed between reads, not after a full megabyte.
+JAR_DOWNLOAD_CHUNK_BYTES = 64 * 1024
 
 # SHA-256 of the jar bytes on Maven Central. Each value was checked against
 # Central's published .sha1 file. The Iceberg runtime also has a published
@@ -324,7 +326,7 @@ def _path_is_dir(path: Path, cache: Path) -> bool:
 
 
 def _set_read_timeout(response: object, seconds: float) -> None:
-    """Raise the socket timeout after connect so the body can use the total budget."""
+    """Set the body socket timeout to the stall limit."""
     fp = getattr(response, "fp", None)
     raw = getattr(fp, "raw", None)
     sock = getattr(raw, "_sock", None)
@@ -336,30 +338,80 @@ def _set_read_timeout(response: object, seconds: float) -> None:
         return
 
 
-def _copy_download(url: str, handle) -> None:
-    """Write ``url`` to ``handle``.
+def _stall_timeout() -> TimeoutError:
+    return TimeoutError(f"no bytes received for {JAR_DOWNLOAD_STALL_TIMEOUT_SECONDS} seconds")
+
+
+def _touch_download(path: Path) -> None:
+    """Refresh ``path`` so a sweep does not treat a live download as stale."""
+    try:
+        os.utime(path, None)
+    except OSError:
+        return
+
+
+def _is_download_temp(filename: str, name: str) -> bool:
+    """True for this jar's private temp file, not for another jar's temp file."""
+    prefix = f".{filename}."
+    suffix = ".download"
+    if not name.startswith(prefix) or not name.endswith(suffix):
+        return False
+    middle = name[len(prefix) : -len(suffix)]
+    return bool(middle) and "." not in middle
+
+
+def _sweep_stale_downloads(jar_dir: Path, filename: str) -> None:
+    """Delete this jar's temp files that have not been touched within the stall timeout.
+
+    A live download touches its temp file as bytes arrive, so its mtime stays
+    newer than the stall timeout. A file left by a killed run is older than
+    that and is removed. A temp file for a different jar is left alone.
+    """
+    if not jar_dir.is_dir():
+        return
+    cutoff = time.time() - JAR_DOWNLOAD_STALL_TIMEOUT_SECONDS
+    for path in jar_dir.iterdir():
+        if not path.is_file() or not _is_download_temp(filename, path.name):
+            continue
+        try:
+            if path.stat().st_mtime > cutoff:
+                continue
+            path.unlink()
+        except OSError:
+            continue
+
+
+def _copy_download(url: str, handle, temp_path: Path) -> None:
+    """Write ``url`` to ``handle`` and keep ``temp_path`` marked as live.
 
     The TCP handshake and response headers use
-    ``JAR_DOWNLOAD_CONNECT_TIMEOUT_SECONDS``. The whole attempt, including
-    the body, stops at ``JAR_DOWNLOAD_TOTAL_TIMEOUT_SECONDS``.
+    ``JAR_DOWNLOAD_CONNECT_TIMEOUT_SECONDS``. After that, each read is at
+    most ``JAR_DOWNLOAD_CHUNK_BYTES`` and returns as soon as some bytes are
+    available. The download fails when no bytes arrive for
+    ``JAR_DOWNLOAD_STALL_TIMEOUT_SECONDS``. There is no short cap on the
+    total time.
     """
     request = urllib.request.Request(url, headers={"User-Agent": "qa-core-recon"})
-    deadline = time.monotonic() + JAR_DOWNLOAD_TOTAL_TIMEOUT_SECONDS
     try:
         response = urllib.request.urlopen(request, timeout=JAR_DOWNLOAD_CONNECT_TIMEOUT_SECONDS)
     except urllib.error.HTTPError as exc:
         exc.close()
         raise
     try:
+        _set_read_timeout(response, JAR_DOWNLOAD_STALL_TIMEOUT_SECONDS)
+        last_byte = time.monotonic()
         while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError(f"timed out after {JAR_DOWNLOAD_TOTAL_TIMEOUT_SECONDS} seconds")
-            _set_read_timeout(response, remaining)
-            chunk = response.read(1024 * 1024)
+            if time.monotonic() - last_byte > JAR_DOWNLOAD_STALL_TIMEOUT_SECONDS:
+                raise _stall_timeout()
+            _touch_download(temp_path)
+            try:
+                chunk = response.read1(JAR_DOWNLOAD_CHUNK_BYTES)
+            except TimeoutError as exc:
+                raise _stall_timeout() from exc
             if not chunk:
                 return
             handle.write(chunk)
+            last_byte = time.monotonic()
     finally:
         response.close()
 
@@ -378,6 +430,7 @@ def _download_and_publish(cache: Path, pin: PinnedJar, destination: Path) -> Non
         jar_dir.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         raise _cache_not_writable(cache, exc) from None
+    _sweep_stale_downloads(jar_dir, destination.name)
     try:
         fd, name = tempfile.mkstemp(
             prefix=f".{destination.name}.",
@@ -390,7 +443,7 @@ def _download_and_publish(cache: Path, pin: PinnedJar, destination: Path) -> Non
     try:
         with os.fdopen(fd, "wb") as handle:
             try:
-                _copy_download(pin.maven_url(), handle)
+                _copy_download(pin.maven_url(), handle, temp_path)
             except (urllib.error.URLError, TimeoutError, OSError) as exc:
                 raise _could_not_download(cache, pin, exc) from None
             handle.flush()

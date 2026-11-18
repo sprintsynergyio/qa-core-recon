@@ -71,7 +71,7 @@ A spec that uses Iceberg also needs the Iceberg Spark runtime `org.apache.iceber
 
 Iceberg and S3 need jars from Maven Central. The tool downloads a jar only when the spec needs it and the jar is not already in the Ivy cache (`~/.cache/qa-core-recon/ivy`, or `QA_CORE_RECON_IVY`). Each download goes to its own temp file in that cache, is synced to disk, and is hashed. The temp file is moved into place only when the SHA-256 matches the pin in `src/qa_core_recon/spark.py`. A failed download deletes that temp file and does not delete a jar that is already in the cache. A warm cache is hashed again and does not use the network.
 
-The connect timeout is 10 seconds (`JAR_DOWNLOAD_CONNECT_TIMEOUT_SECONDS`). The whole download must finish within 45 seconds (`JAR_DOWNLOAD_TOTAL_TIMEOUT_SECONDS`). A server that accepts the connection and then sends nothing fails in under a minute.
+The connect timeout is 10 seconds (`JAR_DOWNLOAD_CONNECT_TIMEOUT_SECONDS`). If the body sends no bytes for 30 seconds (`JAR_DOWNLOAD_STALL_TIMEOUT_SECONDS`), the download fails. There is no short cap on the total time, so a slow link can finish the AWS SDK jar. The body is read in 64 KiB pieces (`JAR_DOWNLOAD_CHUNK_BYTES`), and the stall is checked after each piece. A download that is still receiving data updates its temp file's timestamp. A later run deletes a leftover temp file for that jar only when the timestamp is older than the stall timeout, so a live download is left alone.
 
 The pins are `org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.7.1`, `org.apache.hadoop:hadoop-aws:3.3.4`, and `com.amazonaws:aws-java-sdk-bundle:1.12.262`. A verified jar is passed to Spark as a local path (`spark.jars`).
 
