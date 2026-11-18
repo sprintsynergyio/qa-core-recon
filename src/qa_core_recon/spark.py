@@ -14,27 +14,31 @@ directory or the repo root.
 The Iceberg Spark runtime is loaded only when the caller asks for it, because
 Spark cannot add jars after the session exists. The jar is
 ``org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.7.1``, the Iceberg
-version AWS Glue 5.0 ships for Spark 3.5 and Scala 2.12. Spark resolves that
-coordinate from Maven Central into an Ivy cache at
+version AWS Glue 5.0 ships for Spark 3.5 and Scala 2.12. This module downloads
+that jar from Maven Central into an Ivy cache at
 ``~/.cache/qa-core-recon/ivy``, or ``QA_CORE_RECON_IVY`` when that variable
-is set. The cache is not inside the session temp directory, so stopping the
-session does not delete it. A Hadoop catalog for one warehouse is registered
-later, and only when a spec reads Iceberg.
+is set, when the file is not already there. The download is a private temp
+file. It is moved into place only when its SHA-256 matches the pin. A mismatch
+or a failed download raises :class:`SessionStartError`, and Spark is not
+started. The verified path is passed through ``spark.jars``. The cache is not
+inside the
+session temp directory, so stopping the session does not delete it. A Hadoop
+catalog for one warehouse is registered later, and only when a spec reads
+Iceberg.
 
 S3 reads use that same cache and Maven Central. The jars are
 ``org.apache.hadoop:hadoop-aws:3.3.4`` and
 ``com.amazonaws:aws-java-sdk-bundle:1.12.262``. PySpark 3.5 ships Hadoop
-3.3.4, and hadoop-aws 3.3.4 is built against that SDK bundle. They are added
-only when the caller asks for S3, so a local spec does not download them.
-Credentials stay on the AWS default chain. They are not copied into the Spark
-configuration. ``QA_CORE_RECON_S3_ENDPOINT``, when set, points s3a at that
-endpoint and turns on path-style access.
+3.3.4, and hadoop-aws 3.3.4 is built against that SDK bundle. They are checked
+the same way and added only when the caller asks for S3, so a local spec does
+not download them. Credentials stay on the AWS default chain. They are not
+copied into the Spark configuration. ``QA_CORE_RECON_S3_ENDPOINT``, when set,
+points s3a at that endpoint and turns on path-style access.
 
 Spark prints a startup banner on the process stderr before Python can change
-its log level, and that banner contains a timestamp. Ivy prints a settings
-line on stdout when the Iceberg runtime is resolved. Both are captured and
-dropped so the CLI's output stays limited to refusals, errors, and the
-result line.
+its log level, and that banner contains a timestamp. Startup lines are
+captured and dropped so the CLI's output stays limited to refusals, errors,
+and the result line.
 
 The first call creates the session. Later calls in the same process return
 that session. Spark allows one context per JVM, so a stopped session is not
@@ -46,6 +50,10 @@ import os
 import shutil
 import sys
 import tempfile
+import time
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
 from pathlib import Path
 
 from pyspark.sql import SparkSession
@@ -65,6 +73,64 @@ AWS_SDK_BUNDLE_PACKAGE = f"com.amazonaws:aws-java-sdk-bundle:{AWS_SDK_BUNDLE_VER
 S3_ENDPOINT_ENV = "QA_CORE_RECON_S3_ENDPOINT"
 _DEFAULT_S3_REGION = "us-east-1"
 MAVEN_CENTRAL = "https://repo1.maven.org/maven2"
+# A hung TCP handshake or silent response headers fail after this many seconds.
+JAR_DOWNLOAD_CONNECT_TIMEOUT_SECONDS = 10
+# Fail when the body sends no bytes for this long. A slow but steady link
+# can still finish a large jar. There is no short cap on the total time.
+JAR_DOWNLOAD_STALL_TIMEOUT_SECONDS = 30
+# Small enough that a drip is noticed between reads, not after a full megabyte.
+JAR_DOWNLOAD_CHUNK_BYTES = 64 * 1024
+# Fail when a 60 second stretch of the body delivers less than 64 KiB.
+# That is about 1.1 KB/s. A 0.5 MB/s link stays above it.
+JAR_DOWNLOAD_MIN_SPEED_BYTES = 64 * 1024
+JAR_DOWNLOAD_MIN_SPEED_WINDOW_SECONDS = 60
+
+# SHA-256 of the jar bytes on Maven Central. Each value was checked against
+# Central's published .sha1 file. The Iceberg runtime also has a published
+# .sha256 file, and that file matches this pin. See "Update A Jar Pin" in the
+# README before changing a version or a hash.
+
+
+@dataclass(frozen=True)
+class PinnedJar:
+    """One Maven jar, named by coordinate and pinned by SHA-256."""
+
+    group: str
+    artifact: str
+    version: str
+    sha256: str
+
+    @property
+    def filename(self) -> str:
+        return f"{self.artifact}-{self.version}.jar"
+
+    @property
+    def coordinate(self) -> str:
+        return f"{self.group}:{self.artifact}:{self.version}"
+
+    def maven_url(self) -> str:
+        group_path = self.group.replace(".", "/")
+        return f"{MAVEN_CENTRAL}/{group_path}/{self.artifact}/{self.version}/{self.filename}"
+
+
+ICEBERG_RUNTIME_JAR = PinnedJar(
+    group="org.apache.iceberg",
+    artifact="iceberg-spark-runtime-3.5_2.12",
+    version=ICEBERG_VERSION,
+    sha256="cdf7357865d8d91764e0f147a2d76bc3e1e2b8792ddc0d3be329b3d34aaf218c",
+)
+HADOOP_AWS_JAR = PinnedJar(
+    group="org.apache.hadoop",
+    artifact="hadoop-aws",
+    version=HADOOP_VERSION,
+    sha256="53f9ae03c681a30a50aa17524bd9790ab596b28481858e54efd989a826ed3a4a",
+)
+AWS_SDK_BUNDLE_JAR = PinnedJar(
+    group="com.amazonaws",
+    artifact="aws-java-sdk-bundle",
+    version=AWS_SDK_BUNDLE_VERSION,
+    sha256="873fe7cf495126619997bec21c44de5d992544aea7e632fdc77adb1a0915bae5",
+)
 
 _session: SparkSession | None = None
 _warehouse: Path | None = None
@@ -151,14 +217,340 @@ def s3_jars_cached(cache: Path) -> bool:
 
 
 def jars_packages(*, iceberg: bool = False, s3: bool = False) -> str:
-    """Return the Maven coordinates Spark should resolve, or an empty string."""
-    parts: list[str] = []
+    """Return the Maven coordinates for the jars a session would load."""
+    return ",".join(pin.coordinate for pin in required_jars(iceberg=iceberg, s3=s3))
+
+
+def required_jars(*, iceberg: bool = False, s3: bool = False) -> tuple[PinnedJar, ...]:
+    """Return the pinned jars for this session, in classpath order."""
+    pins: list[PinnedJar] = []
     if iceberg:
-        parts.append(ICEBERG_SPARK_PACKAGE)
+        pins.append(ICEBERG_RUNTIME_JAR)
     if s3:
-        parts.append(HADOOP_AWS_PACKAGE)
-        parts.append(AWS_SDK_BUNDLE_PACKAGE)
-    return ",".join(parts)
+        pins.append(HADOOP_AWS_JAR)
+        pins.append(AWS_SDK_BUNDLE_JAR)
+    return tuple(pins)
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _one_line(exc: BaseException) -> str:
+    text = " ".join(str(exc).split())
+    return text or exc.__class__.__name__
+
+
+def _cached_mismatch(cache: Path, path: Path, expected: str, actual: str) -> SessionStartError:
+    return SessionStartError(
+        f"jar {path.name} in the cache at {cache} failed verification: "
+        f"expected sha256 {expected}, actual sha256 {actual}. "
+        f"Remove {path}, then run again."
+    )
+
+
+def _download_mismatch(cache: Path, pin: PinnedJar, actual: str) -> SessionStartError:
+    return SessionStartError(
+        f"jar {pin.filename} downloaded for the cache at {cache} failed verification: "
+        f"expected sha256 {pin.sha256}, actual sha256 {actual}. "
+        f"The file was not saved."
+    )
+
+
+def _could_not_download(cache: Path, pin: PinnedJar, exc: BaseException) -> SessionStartError:
+    return SessionStartError(
+        f"could not download {pin.filename} from {pin.maven_url()} "
+        f"into the cache at {cache}: {_one_line(exc)}. "
+        f"Check the network and the cache directory, then run again."
+    )
+
+
+def _cache_not_writable(cache: Path, exc: BaseException) -> SessionStartError:
+    return SessionStartError(
+        f"the jar cache at {cache} is not writable: {_one_line(exc)}. "
+        f"Choose a writable directory or set QA_CORE_RECON_IVY, then run again."
+    )
+
+
+def _unreadable_jar(path: Path, cache: Path, exc: BaseException) -> SessionStartError:
+    return SessionStartError(
+        f"cannot read jar {path} in the cache at {cache}: {_one_line(exc)}. "
+        f"Check the file permissions, then run again."
+    )
+
+
+def _jar_path_is_directory(path: Path, cache: Path) -> SessionStartError:
+    return SessionStartError(
+        f"jar path {path} in the cache at {cache} is a directory, not a file. "
+        f"Remove that directory, then run again."
+    )
+
+
+def _cached_jar(cache: Path, filename: str) -> Path | None:
+    """Return the cached jar to verify, or None when the cache has no copy.
+
+    The path this module downloads is ``<cache>/jars/<filename>``. A cache
+    filled by an older Spark Ivy run uses that same filename, or
+    ``<group>_<filename>`` under the Ivy home. A warm cache of either shape
+    is reused. The first match is the file that will be hashed.
+    """
+    preferred = cache / "jars" / filename
+    if preferred.is_file():
+        return preferred
+    if not cache.is_dir():
+        return None
+    exact: list[Path] = []
+    prefixed: list[Path] = []
+    marker = "_" + filename
+    for path in cache.rglob("*.jar"):
+        if not path.is_file() or path == preferred:
+            continue
+        if path.name == filename:
+            exact.append(path)
+        elif path.name.endswith(marker):
+            prefixed.append(path)
+    exact.sort()
+    prefixed.sort()
+    if exact:
+        return exact[0]
+    if prefixed:
+        return prefixed[0]
+    return None
+
+
+def _path_is_dir(path: Path, cache: Path) -> bool:
+    try:
+        return path.is_dir()
+    except OSError as exc:
+        raise _unreadable_jar(path, cache, exc) from None
+
+
+def _set_read_timeout(response: object, seconds: float) -> None:
+    """Set the body socket timeout to the stall limit."""
+    fp = getattr(response, "fp", None)
+    raw = getattr(fp, "raw", None)
+    sock = getattr(raw, "_sock", None)
+    if sock is None:
+        return
+    try:
+        sock.settimeout(seconds)
+    except OSError:
+        return
+
+
+def _stall_timeout() -> TimeoutError:
+    return TimeoutError(f"no bytes received for {JAR_DOWNLOAD_STALL_TIMEOUT_SECONDS} seconds")
+
+
+def _too_slow() -> TimeoutError:
+    return TimeoutError(
+        f"fewer than {JAR_DOWNLOAD_MIN_SPEED_BYTES} bytes arrived "
+        f"in {JAR_DOWNLOAD_MIN_SPEED_WINDOW_SECONDS} seconds"
+    )
+
+
+def _touch_download(path: Path) -> None:
+    """Refresh ``path`` so a sweep does not treat a live download as stale."""
+    try:
+        os.utime(path, None)
+    except OSError:
+        return
+
+
+def _is_download_temp(filename: str, name: str) -> bool:
+    """True for this jar's private temp file, not for another jar's temp file."""
+    prefix = f".{filename}."
+    suffix = ".download"
+    if not name.startswith(prefix) or not name.endswith(suffix):
+        return False
+    middle = name[len(prefix) : -len(suffix)]
+    return bool(middle) and "." not in middle
+
+
+def _sweep_stale_downloads(jar_dir: Path, filename: str) -> None:
+    """Delete this jar's temp files that have not been touched within the stall timeout.
+
+    A live download touches its temp file as bytes arrive, so its mtime stays
+    newer than the stall timeout. A file left by a killed run is older than
+    that and is removed. A temp file for a different jar is left alone.
+    """
+    if not jar_dir.is_dir():
+        return
+    cutoff = time.time() - JAR_DOWNLOAD_STALL_TIMEOUT_SECONDS
+    for path in jar_dir.iterdir():
+        if not path.is_file() or not _is_download_temp(filename, path.name):
+            continue
+        try:
+            if path.stat().st_mtime > cutoff:
+                continue
+            path.unlink()
+        except OSError:
+            continue
+
+
+def _copy_download(url: str, handle, temp_path: Path) -> None:
+    """Write ``url`` to ``handle`` and keep ``temp_path`` marked as live.
+
+    The TCP handshake and response headers use
+    ``JAR_DOWNLOAD_CONNECT_TIMEOUT_SECONDS``. After that, each read is at
+    most ``JAR_DOWNLOAD_CHUNK_BYTES`` and returns as soon as some bytes are
+    available. The download fails when no bytes arrive for
+    ``JAR_DOWNLOAD_STALL_TIMEOUT_SECONDS``, or when a stretch of
+    ``JAR_DOWNLOAD_MIN_SPEED_WINDOW_SECONDS`` delivers fewer than
+    ``JAR_DOWNLOAD_MIN_SPEED_BYTES``. A transfer that finishes before that
+    window ends is not failed for speed. There is no short cap on the total
+    time.
+    """
+    request = urllib.request.Request(url, headers={"User-Agent": "qa-core-recon"})
+    try:
+        response = urllib.request.urlopen(request, timeout=JAR_DOWNLOAD_CONNECT_TIMEOUT_SECONDS)
+    except urllib.error.HTTPError as exc:
+        exc.close()
+        raise
+    try:
+        _set_read_timeout(response, JAR_DOWNLOAD_STALL_TIMEOUT_SECONDS)
+        last_byte = time.monotonic()
+        window_started = last_byte
+        window_bytes = 0
+        while True:
+            if time.monotonic() - last_byte > JAR_DOWNLOAD_STALL_TIMEOUT_SECONDS:
+                raise _stall_timeout()
+            _touch_download(temp_path)
+            try:
+                chunk = response.read1(JAR_DOWNLOAD_CHUNK_BYTES)
+            except TimeoutError as exc:
+                raise _stall_timeout() from exc
+            if not chunk:
+                return
+            handle.write(chunk)
+            now = time.monotonic()
+            last_byte = now
+            window_bytes += len(chunk)
+            if now - window_started >= JAR_DOWNLOAD_MIN_SPEED_WINDOW_SECONDS:
+                if window_bytes < JAR_DOWNLOAD_MIN_SPEED_BYTES:
+                    raise _too_slow()
+                window_started = now
+                window_bytes = 0
+    finally:
+        response.close()
+
+
+def _download_and_publish(cache: Path, pin: PinnedJar, destination: Path) -> None:
+    """Download ``pin`` to a private temp file and publish it only if it matches.
+
+    The temp file is created with ``tempfile.mkstemp`` in the jars directory,
+    fsynced, and hashed before ``os.replace``. A mismatch or a network error
+    deletes that temp file and does not delete ``destination``. Another run
+    can publish the same final name at the same time. This run leaves that
+    file alone.
+    """
+    jar_dir = destination.parent
+    try:
+        jar_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise _cache_not_writable(cache, exc) from None
+    _sweep_stale_downloads(jar_dir, destination.name)
+    try:
+        fd, name = tempfile.mkstemp(
+            prefix=f".{destination.name}.",
+            suffix=".download",
+            dir=jar_dir,
+        )
+    except OSError as exc:
+        raise _cache_not_writable(cache, exc) from None
+    temp_path = Path(name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            try:
+                _copy_download(pin.maven_url(), handle, temp_path)
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                raise _could_not_download(cache, pin, exc) from None
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            actual = _file_sha256(temp_path)
+        except OSError as exc:
+            raise _unreadable_jar(temp_path, cache, exc) from None
+        if actual != pin.sha256:
+            raise _download_mismatch(cache, pin, actual)
+        try:
+            os.replace(temp_path, destination)
+        except OSError as exc:
+            if _path_is_dir(destination, cache):
+                raise _jar_path_is_directory(destination, cache) from None
+            raise _cache_not_writable(cache, exc) from None
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+def _ready_jar(cache: Path, pin: PinnedJar) -> Path | None:
+    """Return the cached jar when it matches ``pin``.
+
+    A missing jar returns None. A directory, an unreadable file, or a hash
+    mismatch raises :class:`SessionStartError` and does not delete the path.
+    """
+    preferred = cache / "jars" / pin.filename
+    if preferred.exists() and _path_is_dir(preferred, cache):
+        raise _jar_path_is_directory(preferred, cache)
+    cached = _cached_jar(cache, pin.filename)
+    if cached is None:
+        return None
+    if _path_is_dir(cached, cache):
+        raise _jar_path_is_directory(cached, cache)
+    try:
+        actual = _file_sha256(cached)
+    except OSError as exc:
+        raise _unreadable_jar(cached, cache, exc) from None
+    if actual != pin.sha256:
+        raise _cached_mismatch(cache, cached, pin.sha256, actual)
+    return cached
+
+
+def _resolve_one(cache: Path, pin: PinnedJar) -> Path:
+    """Return a cached jar whose SHA-256 matches ``pin``.
+
+    A file already in the cache is hashed and kept when it matches. A mismatch
+    stops the run. The bad file is left in place, and it is not replaced by a
+    new download. A missing file is downloaded to a private temp file, hashed,
+    and moved into place only when the hash matches. If another run publishes
+    a     valid file while this download is in progress, that file is used.
+    A warm cache still drops this jar's stale temp files. A temp file for
+    another jar is left alone.
+    """
+    _sweep_stale_downloads(cache / "jars", pin.filename)
+    ready = _ready_jar(cache, pin)
+    if ready is not None:
+        return ready
+    destination = cache / "jars" / pin.filename
+    try:
+        _download_and_publish(cache, pin, destination)
+    except SessionStartError:
+        raced = _ready_jar(cache, pin)
+        if raced is not None:
+            return raced
+        raise
+    ready = _ready_jar(cache, pin)
+    if ready is None:
+        raise SessionStartError(
+            f"jar {pin.filename} is missing from the cache at {cache} after download. Run again."
+        )
+    return ready
+
+
+def resolve_verified_jars(
+    cache: Path, *, iceberg: bool = False, s3: bool = False
+) -> tuple[Path, ...]:
+    """Download any missing pinned jar, hash every jar, and return local paths.
+
+    Nothing is returned for a jar that fails the pin. The caller must not
+    start Spark with a path this function did not return.
+    """
+    cache.mkdir(parents=True, exist_ok=True)
+    return tuple(_resolve_one(cache, pin) for pin in required_jars(iceberg=iceberg, s3=s3))
 
 
 def resolve_s3_region() -> str | None:
@@ -341,7 +733,8 @@ def local_session(
     """Return the process-wide local session, creating it on the first call.
 
     ``iceberg`` loads the Iceberg runtime. ``s3`` loads the Hadoop AWS client
-    and the AWS SDK bundle. Spark accepts jars only while the session is
+    and the AWS SDK bundle. Each required jar is hashed against its pin
+    before the session starts. Spark accepts jars only while the session is
     created, so a session that was started without one of them cannot gain
     it later.
     """
@@ -392,11 +785,17 @@ def local_session(
     ivy: Path | None = None
     if iceberg or s3:
         ivy = ivy_cache_dir()
-        ivy.mkdir(parents=True, exist_ok=True)
-        builder = (
-            builder.config("spark.jars.packages", jars_packages(iceberg=iceberg, s3=s3))
-            .config("spark.jars.ivy", str(ivy))
-            .config("spark.jars.repositories", MAVEN_CENTRAL)
+        try:
+            ivy.mkdir(parents=True, exist_ok=True)
+            jar_paths = resolve_verified_jars(ivy, iceberg=iceberg, s3=s3)
+        except OSError as exc:
+            shutil.rmtree(root, ignore_errors=True)
+            raise _cache_not_writable(ivy, exc) from None
+        except SessionStartError:
+            shutil.rmtree(root, ignore_errors=True)
+            raise
+        builder = builder.config("spark.jars", ",".join(str(path) for path in jar_paths)).config(
+            "spark.jars.ivy", str(ivy)
         )
     if s3:
         for key, value in s3_hadoop_settings().items():
@@ -432,13 +831,13 @@ def _quiet_s3_logs(session: SparkSession) -> None:
 
 
 def _start_quietly(builder: SparkSession.Builder) -> SparkSession:
-    """Create the session and drop Spark and Ivy startup lines.
+    """Create the session and drop Spark startup lines.
 
-    The JVM writes its banner to file descriptor 2, and Ivy writes a settings
-    line to file descriptor 1. Redirecting Python's ``sys`` streams does not
-    catch either, so both descriptors are pointed at a temporary file for the
-    duration of startup and then restored. On failure the captured text is
-    kept on the raised error for classification. It is not part of the message.
+    The JVM writes its banner to file descriptor 2. Redirecting Python's
+    ``sys`` streams does not catch that, so both descriptors are pointed at a
+    temporary file for the duration of startup and then restored. On failure
+    the captured text is kept on the raised error for classification. It is
+    not part of the message.
     """
     captured = tempfile.NamedTemporaryFile(prefix="qa-core-recon-spark-log-", delete=False)
     saved_out = os.dup(1)

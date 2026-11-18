@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### CI
+
+- The test job runs on Python 3.11, 3.12, and 3.13 with Java 17. The check names are `test (3.11)`, `test (3.12)`, and `test (3.13)`. Publish still builds on Python 3.11.
+- GitHub Actions in `ci.yml` and `publish.yml` are pinned to a full commit SHA. The version tag is a comment on the same line.
+
+### Readers
+
+- A symlink loop is still a read error on Python 3.13. That version's `Path.resolve` does not raise for the cycle, so the tool checks the resolved path and keeps the message `Symlink loop from ...`.
+
+### Supply Chain
+
+- The Iceberg runtime, `hadoop-aws`, and `aws-java-sdk-bundle` jars are hashed before the Spark session starts. The SHA-256 must match the pin in `src/qa_core_recon/spark.py`. A mismatch or a failed download is a read error and exits 2. A warm cache is checked again and does not need Maven Central.
+- Each download uses its own temp file. The file is moved into the cache only after the hash matches, and a failed download does not delete a jar that is already there. A network error names the URL, the cache, and the cause. The connect timeout is 10 seconds. If no bytes arrive for 30 seconds, the download fails. If fewer than 64 KiB arrive in any 60 second stretch, the download fails. A steady 0.5 MB/s link stays above that rate. There is no short cap on the total time. The body is read in 64 KiB pieces. Every run, including one that already has the jar cached, deletes a leftover temp file for that jar when its timestamp is older than the 30 second stall. A temp file for a different jar is left alone.
+
 ## 0.1.0
 
 First release.
